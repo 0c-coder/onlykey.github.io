@@ -1,113 +1,57 @@
 <!DOCTYPE html>
 <html>
-
 <head>
-  <title>OnlyKey Apps - Tools for encrypting messages, files, and searching for users</title>
-  <meta name="viewport" content="width=device-width,initial-scale=0.75">
+  <title>OnlyAgent Apps — Encrypt, decrypt &amp; sign with your OnlyKey</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
   <link href="<%= htmlWebpackPlugin.options.dir_name %>/css/bootstrap.min.css" rel="stylesheet">
   <link href="<%= htmlWebpackPlugin.options.dir_name %>/css/ShareTechMono.css" rel="stylesheet">
   <link href="<%= htmlWebpackPlugin.options.dir_name %>/css/font-awesome.min.css" rel="stylesheet">
-  <style>
-  </style>
+  <link href="<%= htmlWebpackPlugin.options.dir_name %>/css/onlyagent-theme.css" rel="stylesheet">
 </head>
-
 <body data-page="index">
-  <nav class="navbar navbar-dark bg-dark">
-    <div class="mr-auto text-center">
-      <a class="">&nbsp;Apps&nbsp;&nbsp;</a>
-      <!--<a class="navbar-brand" href="/app/encrypt"><i class="fa fa-lock" aria-hidden="true"></i></a>
-      <a class="navbar-brand" href="/app/decrypt"><i class="fa fa-unlock" aria-hidden="true"></i></a>
-      <a class="navbar-brand" href="/app/decrypt-file"><i class="fa fa-file-text" aria-hidden="true"></i></a>
-      <a class="navbar-brand" href="/app/encrypt-file"><i class="fa fa-file-archive-o" aria-hidden="true"></i></a>
-      <a class="navbar-brand" href="/app/search"><i class="fa fa-search" aria-hidden="true"></i></a>
-      <a class="navbar-brand" href="/app/password-generator"><i class="fa fa-key" aria-hidden="true"></i></a>
-      -->
-      <% if(htmlWebpackPlugin.options.app_pages)
-        for(var i in htmlWebpackPlugin.options.app_pages) { 
-          var ap = htmlWebpackPlugin.options.app_pages[i];
-          if(ap.icon){ %>
-            <a class="navbar-brand" href="/app/<%= ap.name %>"><i class="fa <%= ap.icon %>" aria-hidden="true"></i></a>
-       <% }else if(ap.title){ %>
-            <a class="navbar-brand" href="/app/<%= ap.name %>"><%= ap.title %></a>
-       <% } } %>
-       
-      <br class="d-block d-sm-none" />
-      <a class="">&nbsp;Links&nbsp;</a>
-      <a class="navbar-brand" href="/"><i class="fa fa-home" aria-hidden="true"></i></a>
-      <a class="navbar-brand" href="https://docs.crp.to/webcrypt.html"><i class="fa fa-question" aria-hidden="true"></i></a>
-      <a class="navbar-brand" href="https://docs.crp.to/"><i class="fa fa-book" aria-hidden="true"></i></a>
-      <a class="navbar-brand" href="https://onlykey.io"><i class="fa fa-shopping-cart" aria-hidden="true"></i></a>
-    </div>
-  </nav>
-  <div class="container text-center pt-4">
-    <p><img src="<%= htmlWebpackPlugin.options.dir_name %>/ok0.jpg" alt="logo" align="middle"></p>
-    <h1><i class="fa fa-rocket"></i> OnlyKey Apps</h1>
-  </div>
   <input id="onlykey_start" value="Encrypt and Sign" type="hidden" />
-  <div class="container">
 
-    <div class="row pt-4">
-      <div class="col-sm text-center">
-        <a id="setTime" class="btn btn-success ShareTechMono">Set Time for OTP 2FA Authentications</a>
+  <header class="oa-nav"><div class="inner">
+    <a class="oa-brand" href="/"><img src="<%= htmlWebpackPlugin.options.dir_name %>/onlyagent-logo.svg" alt="OnlyAgent"></a>
+    <nav class="oa-navlinks">
+      <a href="<%= htmlWebpackPlugin.options.dir_name %>/encrypt"><i class="fa fa-lock"></i><span>Encrypt</span></a>
+      <a href="<%= htmlWebpackPlugin.options.dir_name %>/decrypt"><i class="fa fa-unlock"></i><span>Decrypt</span></a>
+      <a href="<%= htmlWebpackPlugin.options.dir_name %>/search"><i class="fa fa-search"></i><span>Search</span></a>
+      <span class="sep"></span>
+      <a href="https://docs.crp.to/"><i class="fa fa-book"></i><span>Docs</span></a>
+      <a href="https://onlykey.io"><i class="fa fa-shopping-cart"></i><span>Get OnlyKey</span></a>
+    </nav>
+  </div></header>
+
+  <main class="oa-main">
+    <section class="oa-hero">
+      <h1>Encrypt anything with <span class="g">your hardware key</span>.</h1>
+      <p>Securely encrypt, sign, decrypt and verify messages and files right in your browser. Your private keys never leave your OnlyKey.</p>
+      <div class="oa-cta-row" style="margin-top:26px">
+        <a class="btn oa-btn-primary" style="max-width:260px" href="<%= htmlWebpackPlugin.options.dir_name %>/encrypt">Encrypt a message</a>
+        <a id="setTime" class="btn btn-secondary">Set Time for OTP 2FA</a>
       </div>
+    </section>
+
+    <section class="oa-tools">
+      <a class="oa-tool" href="<%= htmlWebpackPlugin.options.dir_name %>/encrypt"><div class="ic"><i class="fa fa-lock"></i></div><h3>Encrypt &amp; Sign Messages</h3><p>Compose an end-to-end encrypted, signed message for any Keybase or Protonmail user.</p></a>
+      <a class="oa-tool" href="<%= htmlWebpackPlugin.options.dir_name %>/encrypt-file"><div class="ic"><i class="fa fa-file-archive-o"></i></div><h3>Encrypt &amp; Sign Files</h3><p>Encrypt files for a recipient — or for yourself — with your OnlyKey.</p></a>
+      <a class="oa-tool" href="<%= htmlWebpackPlugin.options.dir_name %>/decrypt"><div class="ic"><i class="fa fa-unlock"></i></div><h3>Decrypt &amp; Verify Messages</h3><p>Decrypt incoming PGP messages and verify the sender's signature.</p></a>
+      <a class="oa-tool" href="<%= htmlWebpackPlugin.options.dir_name %>/decrypt-file"><div class="ic"><i class="fa fa-file-text"></i></div><h3>Decrypt &amp; Verify Files</h3><p>Decrypt .gpg files and confirm they came from who you expect.</p></a>
+      <a class="oa-tool" href="<%= htmlWebpackPlugin.options.dir_name %>/search"><div class="ic"><i class="fa fa-search"></i></div><h3>Find a Recipient</h3><p>Search Keybase and Protonmail for someone to send encrypted messages to.</p></a>
+      <a class="oa-tool" href="<%= htmlWebpackPlugin.options.dir_name %>/password-generator"><div class="ic"><i class="fa fa-key"></i></div><h3>Password Generator</h3><p>Derive strong, repeatable static passwords from your OnlyKey.</p></a>
+    </section>
+
+    <p style="text-align:center;color:var(--muted)"><a href="<%= htmlWebpackPlugin.options.dir_name %>/past_releases">Looking for older app releases?</a></p>
+  </main>
+
+  <footer class="oa-footer"><div class="inner">
+    <div>© 2026 OnlyKey · OnlyAgent</div>
+    <div style="display:flex;gap:20px;flex-wrap:wrap">
+      <a href="https://onlyagent.us">onlyagent.us</a>
+      <a href="https://docs.crp.to/webcrypt.html">Help</a>
+      <a href="https://crp.to/">CryptoTrust LLC</a>
     </div>
-
-    <div class="row pt-4">
-      <div class="col-sm text-center">
-        <h2><i class="fa fa-lock" aria-hidden="true"></i> Encryption</h2>
-        <p>Securely encrypt and sign text messages or files using
-          <a href="https://onlykey.io" target="_blank">OnlyKey</a>
-        </p>
-        <div class="pt-4">
-          <a href="<%= htmlWebpackPlugin.options.dir_name %>/encrypt" class="btn btn-success ShareTechMono">Encrypt & Sign Messages</a>
-        </div>
-        <div class="pt-4">
-          <a href="<%= htmlWebpackPlugin.options.dir_name %>/encrypt-file" class="btn btn-success ShareTechMono">Encrypt & Sign Files</a>
-        </div>
-      </div>
-    </div>
-
-    <div class="row pt-4">
-      <div class="col-sm text-center">
-        <h2><i class="fa fa-unlock" aria-hidden="true"></i> Decryption</h2>
-        <p>Securely decrypt and verify text messages or files using <a href="https://onlykey.io" target="_blank">OnlyKey</a>
-        </p>
-        <div class="pt-4">
-          <a href="<%= htmlWebpackPlugin.options.dir_name %>/decrypt" class="btn btn-success ShareTechMono">Decrypt & Verify Messages</a>
-        </div>
-        <div class="pt-4">
-          <a href="<%= htmlWebpackPlugin.options.dir_name %>/decrypt-file" class="btn btn-success ShareTechMono">Decrypt & Verify Files</a>
-        </div>
-      </div>
-    </div>
-
-    <div class="row pt-4">
-      <div class="col-sm text-center">
-        <h2><i class="fa fa-search" aria-hidden="true"></i> Keybase User Search</h2>
-        <p>Find <a href="https://keybase.io/kbpgp" target="_blank">Keybase</a> user or <a href="https://protonmail.com" target="_blank">Protonmail</a> user to send encrypted messages and files using
-          <a href="https://onlykey.io" target="_blank">OnlyKey</a>
-        </p>
-        <a href="<%= htmlWebpackPlugin.options.dir_name %>/search" class="btn btn-success ShareTechMono">User Search</a>
-      </div>
-    </div>
-
-    <hr>
-
-    <div class="row pt-4">
-      <div class="col-sm text-center">
-        <h3>Looking for the <a href="<%= htmlWebpackPlugin.options.dir_name %>/past_releases">old Webcrypt app releases?</a></h3>
-        <br>
-        <a href="<%= htmlWebpackPlugin.options.dir_name %>/past_releases?version=beta7" target="_blank">Click here for Beta7 firmware compatible Webcrypt app version</a></h3>
-      </div>
-    </div>
-
-    <div class="row pt-4">
-      <div class="col-sm text-center">
-        <a href="https://crp.to/">CryptoTrust LLC</a> &copy; 2021
-      </div>
-    </div>
-
-  </div>
+  </div></footer>
 </body>
-
 </html>
