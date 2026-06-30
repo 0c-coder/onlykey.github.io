@@ -86,3 +86,6 @@ mv ./build ./docs
 
 # exit 2
 
+
+echo onlyagent.app > ./docs/CNAME
+touch ./docs/.nojekyll
