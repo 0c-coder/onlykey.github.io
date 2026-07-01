@@ -20,13 +20,17 @@
     "build-release": "NODE_OPTIONS=\"--max-old-space-size=8192\" cross-env NODE_ENV=production OUT_DIR=./build webpack -p --config webpack.config.js",
     "build-site": "cross-env NODE_ENV=development OUT_DIR=./build webpack --devtool source-map --config webpack.config.js",
     "heroku-postbuild": "bash ./BUILD.sh 1",
-    "start": "node ./index.js"
+    "start": "node ./index.js",
+    "test:pqc": "node --test test/xwing-split.test.mjs"
   },
   "bugs": {
     "url": "https://github.com/onlykey/onlykey.github.io/issues"
   },
   "homepage": "https://github.com/onlykey/onlykey.github.io#readme",
   "devDependencies": {
+    "@noble/curves": "^2.2.0",
+    "@noble/hashes": "^2.2.0",
+    "@noble/post-quantum": "^0.6.1",
     "babel-minify-webpack-plugin": "^0.3.1",
     "bootstrap": "^4.5.0",
     "cross-env": "^7.0.2",
