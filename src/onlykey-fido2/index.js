@@ -3,6 +3,7 @@
 const crypto = require('node-webcrypto-shim');
 const atob = require("atob");
 const btoa = require("btoa");
+var xwing = require("./onlykey/xwing.js"); // split-custody X-Wing KEM core (validated in test/xwing-split.test.mjs)
 
 async function setTime(){
 
@@ -62,6 +63,8 @@ async function setTime(){
   //#define KEYTYPE_P256R1 1 
   //#define KEYTYPE_P256K1 2 
   //#define KEYTYPE_CURVE25519 3
+  //#define KEYTYPE_MLKEM768 5
+  //#define KEYTYPE_XWING 6
   // enc_resp
   //#define NO_ENCRYPT_RESP 0
   //#define ENCRYPT_RESP 1
@@ -409,4 +412,63 @@ async function ONLYKEY_ECDH_P256_to_EPUB(publicKeyRawBuffer, callback) {
         });
 
 
+}
+
+
+// ---------------------------------------------------------------------------
+// X-Wing (post-quantum, split custody) reference example.
+// Mirrors the ECC derive demo above with keytype 6. The MCU can't run ML-KEM,
+// so the device returns a 64-byte reply and the browser (xwing.js) does the
+// ML-KEM half. Reply layout is the 64 bytes after the 53-byte response header:
+//   DERIVE_PUBLIC_KEY(1)    -> [ pk_X(32) | mlkem_seed(32) ]
+//   DERIVE_SHARED_SECRET(2) -> [ ss_X(32) | mlkem_seed(32) ]
+// Not auto-run (setTime() above is the live demo); call deriveXWingExample() to try it.
+// NOTE(firmware): confirm the 64-byte reply layout against libraries#30.
+async function xwingDeviceDerive64(optype, additional_d, extra_input, timeout) {
+  const OKCONNECT = 228, keytype = 6, enc_resp = 0;
+  var nacl = require("tweetnacl");
+  var appKey = nacl.box.keyPair();
+
+  var message = [255, 255, 255, 255, OKCONNECT];
+  var currentEpochTime = Math.round(new Date().getTime() / 1000.0).toString(16);
+  Array.prototype.push.apply(message, currentEpochTime.match(/.{2}/g).map(hexStrToDec));
+  Array.prototype.push.apply(message, appKey.publicKey);
+  Array.prototype.push.apply(message, ["N".charCodeAt(0), "W".charCodeAt(0)]);
+  var dataHash = await digestArray(Uint8Array.from(additional_d || new Uint8Array(32)));
+  Array.prototype.push.apply(message, dataHash);
+  if (extra_input) Array.prototype.push.apply(message, Array.from(extra_input)); // ct_X for decaps
+
+  var keyhandle = encode_ctaphid_request_as_keyhandle(OKCONNECT, optype, keytype, enc_resp, Uint8Array.from(message));
+  var { FIDO2Client } = require("@vincss-public-projects/fido2-client");
+  var assertion = await new FIDO2Client().getAssertion({
+    publicKey: { challenge: Uint8Array.from(crypto.getRandomValues(new Uint8Array(32))),
+      allowCredentials: [{ id: keyhandle, type: 'public-key' }], timeout: timeout, userVerification: 'discouraged' }
+  }, "https://apps.crp.to");
+  var signature = new Uint8Array(assertion.response.signature);
+  var response = signature.slice(1);
+  // enc_resp = 0 here, so the 64-byte reply is the 64 bytes after the 53-byte header
+  return Uint8Array.from(response.slice(53, 53 + 64));
+}
+
+async function deriveXWingExample(additional_d) {
+  additional_d = additional_d || Array.from(new TextEncoder().encode("xwing:example"));
+
+  // 1. Derive the X-Wing recipient public key (device gives pk_X | mlkem_seed).
+  var pub = await xwingDeviceDerive64(1 /*DERIVE_PUBLIC_KEY*/, additional_d, null, 6000);
+  var pkX = pub.slice(0, 32), mlkemSeed = pub.slice(32, 64);
+  var recipientPk = xwing.buildRecipientPubkey(pkX, mlkemSeed); // 1216 bytes
+  console.log("X-Wing recipient (1216B):", toHexString(recipientPk.slice(0, 16)) + " ...");
+
+  // 2. Encapsulate to it (host side, no device).
+  var { ciphertext, sharedSecret } = xwing.xwingEncapsulate(recipientPk); // ct 1120, ss 32
+  console.log("encaps shared secret:", toHexString(sharedSecret));
+
+  // 3. Decapsulate: only ct_X goes to the device; browser does ML-KEM + combine.
+  var ctX = xwing.ctX(ciphertext);
+  var dec = await xwingDeviceDerive64(2 /*DERIVE_SHARED_SECRET*/, additional_d, ctX, 30000);
+  var ssX = dec.slice(0, 32), seed2 = dec.slice(32, 64);
+  var recovered = xwing.xwingSplitDecapsulate(ssX, ciphertext, pkX, seed2);
+  console.log("decaps shared secret:", toHexString(recovered),
+              toHexString(recovered) === toHexString(sharedSecret) ? "(MATCH)" : "(MISMATCH)");
+  return recovered;
 }
