@@ -2,6 +2,7 @@ module.exports = function(imports, onlykeyApi){
 /* global TextEncoder */
 // var $ = require("jquery");
 var nacl = require("./nacl.min.js");
+var xwing = require("./xwing.js"); // split-custody X-Wing KEM core (validated)
 var EventEmitter = require("events").EventEmitter;
 
 
@@ -351,6 +352,8 @@ async function ONLYKEY_ECDH_P256_to_EPUB(publicKeyRawBuffer, callback) {
 //#define KEYTYPE_P256R1 1 
 //#define KEYTYPE_P256K1 2 
 //#define KEYTYPE_CURVE25519 3
+//#define KEYTYPE_MLKEM768 5
+//#define KEYTYPE_XWING 6
 // enc_resp
 //#define NO_ENCRYPT_RESP 0
 //#define ENCRYPT_RESP 1
@@ -570,6 +573,64 @@ function onlykey(keytype, enc_resp) {
 
             });
         };
+    }
+
+    // ---- X-Wing (post-quantum, split custody), keytype 6 ------------------
+    // Same derive flow as the ECC keytypes. The MCU can't run ML-KEM, so the
+    // device returns a 64-byte reply and the browser (xwing.js) does the ML-KEM
+    // half. Identity is `additional_d` (SHA-256'd, like the ECC paths); no slots.
+    // Reply layout = the 64 bytes after the 53-byte response header:
+    //   DERIVE_PUBLIC_KEY(1)    -> [ pk_X(32) | mlkem_seed(32) ]
+    //   DERIVE_SHARED_SECRET(2) -> [ ss_X(32) | mlkem_seed(32) ]
+    // NOTE(firmware): confirm this 64-byte layout against libraries#30. The KEM
+    // math in xwing.js is unit-tested; only this transport framing needs a HW check.
+    if (keytype == 6) { // KEYTYPE_XWING
+
+        async function xwing_derive64(additional_d, optype, extra_input, timeout) {
+            var transit_key = nacl.box.keyPair();
+            var message = ctaphid_custom_message_header(transit_key.publicKey);
+            var dataHash = await digestArray(Uint8Array.from(additional_d || new Uint8Array(32)));
+            Array.prototype.push.apply(message, dataHash);
+            if (extra_input) Array.prototype.push.apply(message, Array.from(extra_input)); // ct_X for decaps
+            var out = null;
+            await ctaphid_via_webauthn(OKCONNECT, optype, keytype, enc_resp, Uint8Array.from(message), timeout).then(async (response) => {
+                if (!response || response == 1) return;
+                var okPub = response.slice(21, 53);
+                var transit_sharedsec = nacl.box.before(Uint8Array.from(okPub), app_transit.secretKey);
+                var payload = response.slice(53, response.length);
+                if (enc_resp == 1) payload = await aesgcm_decrypt(transit_sharedsec, payload);
+                out = Uint8Array.from(payload.slice(0, 64)); // [half(32) | mlkem_seed(32)]
+            });
+            return out;
+        }
+
+        // Derive the X-Wing recipient public key (1216 bytes) for an identity.
+        api.derive_xwing_public_key = async function (additional_d, cb) {
+            htmlLog("Requesting OnlyKey Derive X-Wing Public Key")();
+            var reply = await xwing_derive64(additional_d, 1 /*DERIVE_PUBLIC_KEY*/, null, 6000);
+            if (!reply) { if (typeof cb === 'function') cb(true); return; }
+            var pkX = reply.slice(0, 32), mlkemSeed = reply.slice(32, 64);
+            var recipientPk = xwing.buildRecipientPubkey(pkX, mlkemSeed); // pk_M(1184) || pk_X(32)
+            htmlLog("OnlyKey Derive X-Wing Public Key Complete")();
+            if (typeof cb === 'function') cb(null, { recipientPk: recipientPk, pkX: pkX });
+        };
+
+        // Decapsulate an X-Wing ciphertext (ct_M||ct_X, 1120B) for an identity.
+        // Only ct_X (32B) reaches the device; browser does ML-KEM decaps + combine.
+        // Requires a button press. `pkX` comes from derive_xwing_public_key.
+        api.xwing_decapsulate = async function (additional_d, ciphertext, pkX, cb) {
+            if (ciphertext.length !== xwing.SIZES.XWING.ct) { if (typeof cb === 'function') cb(new Error('X-Wing ct must be 1120 bytes')); return; }
+            htmlLog("Requesting OnlyKey X-Wing Decapsulate")();
+            var reply = await xwing_derive64(additional_d, 2 /*DERIVE_SHARED_SECRET*/, xwing.ctX(ciphertext), 30000);
+            if (!reply) { if (typeof cb === 'function') cb(true); return; }
+            var ssX = reply.slice(0, 32), mlkemSeed = reply.slice(32, 64);
+            var sharedSecret = xwing.xwingSplitDecapsulate(ssX, ciphertext, pkX, mlkemSeed); // 32B
+            htmlLog("OnlyKey X-Wing Decapsulate Complete")();
+            if (typeof cb === 'function') cb(null, sharedSecret);
+        };
+
+        // Host-side X-Wing encapsulation (no device) for encrypting TO a recipient.
+        api.xwing_encapsulate = function (recipientPk) { return xwing.xwingEncapsulate(recipientPk); };
     }
 
     function ctaphid_custom_message_header(publicKey) {
