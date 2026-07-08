@@ -48,30 +48,7 @@ cp -a ./src/assets/* ./build/app/.
 cp -a ./src/assets/*.ico ./build/.
 cp -a ./src/release.js ./build/.
 
-#cleanup possible bad folders
-rm -rf ./past_releases/${currentStage}
-rm -rf ./past_releases/${currentStage}_rc
-
-#temp copy current copy into past_releases
-cp -a ./build ./past_releases/${currentStage}
-echo "module.exports=['${currentStage}'];" > ./past_releases/last_build.js
-
-#build past_releases file
-node ./past_releases/build.past_releases.list.js
-
-
-#remove past_releases temp files
-rm ./past_releases/last_build.js
-rm -rf ./past_releases/${currentStage}
-
-#copy past_releases folder into build dir
-cp -a ./past_releases ./build/.
-
-#cleanup past_releases folder
-rm ./past_releases/past_releases.json
-
-#remove builder script for past_releases file
-rm ./build/past_releases/build.past_releases.list.js
+# past_releases removed — no longer shipped with the OnlyAgent app
 
 
 #complete by moving build dir to docs
