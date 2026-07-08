@@ -12,7 +12,7 @@
   --radius:16px; --radius-sm:11px; --max:980px;
   --grad:linear-gradient(135deg,var(--accent),var(--accent-2));
   --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
-  --mono:'Share Tech Mono',ui-monospace,SFMono-Regular,Menlo,monospace;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;
 }
 
 /* ---------- base ---------- */
@@ -40,7 +40,9 @@ font{font-size:inherit!important}
   background:rgba(7,11,16,.8);border-bottom:1px solid var(--line)}
 .oa-nav .inner{max-width:var(--max);margin:0 auto;height:62px;display:flex;
   align-items:center;justify-content:space-between;padding:0 22px;gap:16px}
-.oa-brand{display:flex;align-items:center;gap:10px;font-weight:700}
+.oa-brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:18px;letter-spacing:-.01em;color:var(--text)}
+.oa-brand:hover{color:var(--text)}
+.oa-brand .oa-dot{flex:none;width:22px;height:22px;border-radius:6px;background:var(--grad)}
 .oa-brand img{height:30px;width:auto;display:block}
 .oa-navlinks{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
 .oa-navlinks a{color:var(--muted);font-size:14px;font-weight:500;padding:8px 12px;border-radius:9px}

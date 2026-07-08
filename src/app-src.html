@@ -5,7 +5,6 @@
   <title>OnlyAgent — Encrypt &amp; sign in your browser</title>
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <link href="css/bootstrap.min.css" rel="stylesheet">
-  <link href="css/ShareTechMono.css" rel="stylesheet">
   <link href="css/font-awesome.min.css" rel="stylesheet">
   <link href="css/onlyagent-theme.css" rel="stylesheet">
   <link href="css/tokenizer.css" rel="stylesheet">
@@ -13,7 +12,7 @@
 
 <body data-page="<%= htmlWebpackPlugin.options.page %>">
   <header class="oa-nav"><div class="inner">
-    <a class="oa-brand" href="/"><img src="onlyagent-logo.svg" alt="OnlyAgent"></a>
+    <a class="oa-brand" href="/"><span class="oa-dot"></span> OnlyAgent</a>
     <nav class="oa-navlinks">
       <% if(htmlWebpackPlugin.options.app_pages)
         for(var i in htmlWebpackPlugin.options.app_pages) {
@@ -26,7 +25,7 @@
       <span class="sep"></span>
       <a href="/"><i class="fa fa-home" aria-hidden="true"></i><span>Home</span></a>
       <a href="https://docs.crp.to/webcrypt.html"><i class="fa fa-question" aria-hidden="true"></i><span>Help</span></a>
-      <a href="https://onlykey.io"><i class="fa fa-shopping-cart" aria-hidden="true"></i><span>Get OnlyKey</span></a>
+      <a href="https://onlyagent.us"><i class="fa fa-shopping-cart" aria-hidden="true"></i><span>Get OnlyAgent</span></a>
     </nav>
   </div></header>
 
