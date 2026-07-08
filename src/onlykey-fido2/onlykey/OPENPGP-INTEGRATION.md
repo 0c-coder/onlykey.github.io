@@ -110,3 +110,34 @@ npm run build -- --config-build-only=dist   # -> dist/openpgp.js (window.openpgp
 ```
 (The committed `openpgp.js` here is the non-minified IIFE build; swap in
 `dist/openpgp.min.js` for production once you run a full `npm run build`.)
+
+
+---
+
+## Composite PQC PGP (IETF OpenPGP-PQC, algo 105/107)
+
+This branch upgrades `openpgp.js` to the composite PQC build (OpenPGP.js v6 with
+`draft-ietf-openpgp-pqc`) and adds `onlykey-openpgp-pqc.js`, which delegates the
+IETF composite keys loaded on the device (firmware `feature/pqc-pgp-slots`,
+`KEYTYPE_PQC_PGP = 7`):
+
+- **Sign** `pqc_mldsa_ed25519` (107): the `signer` hook returns
+  `{ eccSignature: Ed25519(64), mldsaSignature: ML-DSA-65(3309) }`. Device does
+  each half; `openpgp.js` serializes the composite signature.
+- **Decrypt** `pqc_mlkem_x25519` (105): the `ecdh` hook returns the X25519 shared
+  secret and the `mlkemDecaps` hook returns the ML-KEM key share; `openpgp.js`
+  does the `KMAC256("OpenPGPCompositeKDFv1")` combine + AES key-unwrap.
+
+Device callbacks map to the firmware wire protocol (okpqc.cpp):
+
+    signEcc(digest)  -> OKSIGN  [0x00]+digest  -> 64 B   Ed25519 sig
+    signPqc(digest)  -> OKSIGN  [0x01]+digest  -> 3309 B ML-DSA-65 sig
+    x25519(point)    -> OKDECRYPT 32-B point   -> 32 B   shared secret
+    mlkemDecaps(ct)  -> OKDECRYPT 1088-B ct    -> 32 B   ML-KEM key share
+
+Key loading (160-byte composite seed blob into an RSA slot via `OKSETPRIV 0x67`)
+is done by the host CLI (`python-onlykey` `feature/pqc-composite`), not the browser.
+
+**Host stack note:** this is the IETF OpenPGP-PQC format (matches Sequoia /
+openpgp.js), NOT GnuPG's LibrePGP hybrid — GnuPG will not interoperate with these
+keys. UNTESTED end-to-end; validate against a flashed device.
