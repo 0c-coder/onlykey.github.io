@@ -1,80 +1,70 @@
-<!DOCTYPE html><html><head><meta http-equiv="Content-Security-Policy" content="base-uri 'none'; object-src 'none'; script-src 'self' 'unsafe-eval' 'nonce-Mwd4L6ii2o0pSAIeoez1Wg=='; style-src 'self' 'unsafe-eval' 'nonce-bmVlwkylIVqXUcbHnzQi/A==' 'nonce-UzjmLOiNTDC29YEr1L5zmA==' 'nonce-keVP1X82SPYqbUAxNOTzLA==' 'nonce-5uygmt/5WYPyGYBuS6TsWw=='; default-src 'self'; img-src 'self' data: https://www.gravatar.com https://raw.githubusercontent.com/keybase/client/master/browser/images/icon-keybase-logo-128.png https://s3.amazonaws.com/keybase_processed_uploads/; connect-src 'self' https://keybase.io https://onlykey.herokuapp.com wss://onlykey.herokuapp.com">
-  <title>OnlyKey - Encrypt &amp; sign messages in your browser using OnlyKey</title>
-  <meta name="viewport" content="width=device-width,initial-scale=0.70">
-  <link href="css/bootstrap.min.css" rel="stylesheet" nonce="bmVlwkylIVqXUcbHnzQi/A==">
-  <link href="css/ShareTechMono.css" rel="stylesheet" nonce="UzjmLOiNTDC29YEr1L5zmA==">
-  <link href="css/font-awesome.min.css" rel="stylesheet" nonce="keVP1X82SPYqbUAxNOTzLA==">
-  <link href="css/tokenizer.css" rel="stylesheet" nonce="5uygmt/5WYPyGYBuS6TsWw==">
+<!DOCTYPE html><html><head><meta http-equiv="Content-Security-Policy" content="base-uri 'none'; object-src 'none'; script-src 'self' 'unsafe-eval' 'nonce-kShc3D59gLiZ9qTM8Q0i1A=='; style-src 'self' 'unsafe-eval' 'nonce-8rtCYSQkqyq/pNW7+r2uMg==' 'nonce-N8gNgf3cLdIE8WYjfKISRw==' 'nonce-GnyvDzQa/eHov3qsJdbx3g==' 'nonce-1+q5Hp+ppFfxt4M1cMW1fA==' 'nonce-QU9GPEDuu00SUC3O3tbqFw=='; default-src 'self'; img-src 'self' data: https://www.gravatar.com https://raw.githubusercontent.com/keybase/client/master/browser/images/icon-keybase-logo-128.png https://s3.amazonaws.com/keybase_processed_uploads/; connect-src 'self' https://keybase.io https://onlykey.herokuapp.com wss://onlykey.herokuapp.com">
+  <title>OnlyAgent — Encrypt &amp; sign in your browser using OnlyKey</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link href="css/bootstrap.min.css" rel="stylesheet" nonce="8rtCYSQkqyq/pNW7+r2uMg==">
+  <link href="css/ShareTechMono.css" rel="stylesheet" nonce="N8gNgf3cLdIE8WYjfKISRw==">
+  <link href="css/font-awesome.min.css" rel="stylesheet" nonce="GnyvDzQa/eHov3qsJdbx3g==">
+  <link href="css/onlyagent-theme.css" rel="stylesheet" nonce="1+q5Hp+ppFfxt4M1cMW1fA==">
+  <link href="css/tokenizer.css" rel="stylesheet" nonce="QU9GPEDuu00SUC3O3tbqFw==">
 </head>
 
 <body data-page="encrypt-file">
-  <nav class="navbar navbar-dark bg-dark">
-    <div class="mr-auto text-center">
-      <a class="">&nbsp;Apps&nbsp;</a>
-      <!--
-      <a class="navbar-brand" href="./encrypt"><i class="fa fa-lock" aria-hidden="true"></i></a>
-      <a class="navbar-brand" href="./decrypt"><i class="fa fa-unlock" aria-hidden="true"></i></a>
-      <a class="navbar-brand" href="./decrypt-file"><i class="fa fa-file-text" aria-hidden="true"></i></a>
-      <a class="navbar-brand" href="./encrypt-file"><i class="fa fa-file-archive-o" aria-hidden="true"></i></a>
-      <a class="navbar-brand" href="./search"><i class="fa fa-search" aria-hidden="true"></i></a>
-      <a class="navbar-brand" href="./password-generator"><i class="fa fa-key" aria-hidden="true"></i></a>
-      -->
-
+  <header class="oa-nav"><div class="inner">
+    <a class="oa-brand" href="/"><img src="onlyagent-logo.svg" alt="OnlyAgent"></a>
+    <nav class="oa-navlinks">
       
-        <a class="navbar-brand" href="./encrypt"><i class="fa fa-lock" aria-hidden="true"></i></a>
+        <a href="./encrypt"><i class="fa fa-lock" aria-hidden="true"></i><span>encrypt</span></a>
         
-        <a class="navbar-brand" href="./decrypt"><i class="fa fa-unlock" aria-hidden="true"></i></a>
+        <a href="./decrypt"><i class="fa fa-unlock" aria-hidden="true"></i><span>decrypt</span></a>
         
-        <a class="navbar-brand" href="./encrypt-file"><i class="fa fa-file-archive-o" aria-hidden="true"></i></a>
+        <a href="./encrypt-file" class="active"><i class="fa fa-file-archive-o" aria-hidden="true"></i><span>encrypt-file</span></a>
         
-        <a class="navbar-brand" href="./decrypt-file"><i class="fa fa-file-text" aria-hidden="true"></i></a>
+        <a href="./decrypt-file"><i class="fa fa-file-text" aria-hidden="true"></i><span>decrypt-file</span></a>
         
-        <a class="navbar-brand" href="./search"><i class="fa fa-search" aria-hidden="true"></i></a>
+        <a href="./search"><i class="fa fa-search" aria-hidden="true"></i><span>search</span></a>
         
-        <a class="navbar-brand" href="./password-generator"><i class="fa fa-key" aria-hidden="true"></i></a>
+        <a href="./password-generator"><i class="fa fa-key" aria-hidden="true"></i><span>password-generator</span></a>
         
-        <a class="navbar-brand" href="./chat"><i class="fa fa-comments-o" aria-hidden="true"></i></a>
+        <a href="./chat"><i class="fa fa-comments-o" aria-hidden="true"></i><span>chat</span></a>
         
+      <span class="sep"></span>
+      <a href="/"><i class="fa fa-home" aria-hidden="true"></i><span>Home</span></a>
+      <a href="https://docs.crp.to/webcrypt.html"><i class="fa fa-question" aria-hidden="true"></i><span>Help</span></a>
+      <a href="https://onlykey.io"><i class="fa fa-shopping-cart" aria-hidden="true"></i><span>Get OnlyKey</span></a>
+    </nav>
+  </div></header>
 
-
-            <br class="d-block d-sm-none">
-            <a class="">&nbsp;Links&nbsp;</a>
-            <a class="navbar-brand" href="/"><i class="fa fa-home" aria-hidden="true"></i></a>
-            <a class="navbar-brand" href="https://docs.crp.to/webcrypt.html"><i class="fa fa-question" aria-hidden="true"></i></a>
-            <a class="navbar-brand" href="https://docs.crp.to/"><i class="fa fa-book" aria-hidden="true"></i></a>
-            <a class="navbar-brand" href="https://onlykey.io"><i class="fa fa-shopping-cart" aria-hidden="true"></i></a>
+  <main class="oa-main">
+    <div class="oa-page-head">
+      <h1 id="fancy-icons">
+        <i class="fi-a fa fa-paper-plane" aria-hidden="true"></i>
+        <i class="fi-b fa fa-long-arrow-right" aria-hidden="true"></i>
+        <i class="fi-c fa fa-lock" aria-hidden="true"></i>
+      </h1>
+      <div id="header_messages"></div>
     </div>
-  </nav>
-  <div class="container text-center pt-1 app-head">
-    <p class="doOverflow-x">
-      <img src="ok-plugged4.png" alt="logo" align="middle">
-    </p>
-    <h1 id="fancy-icons">
-      <i class="fi-a fa fa-paper-plane fa-2x" aria-hidden="true"></i>
-      <i class="fi-b fa fa-long-arrow-right fa-2x" aria-hidden="true"></i>
-      <i class="fi-c fa fa-lock fa-2x" aria-hidden="true"></i>
-    </h1>
-    <h5><div id="header_messages"></div></h5>
-  </div>
-  <div id="container">
-    <div class="text-center">
-      <h1>Loading...</h1>
-      <noscript>
+
+    <div id="container" class="oa-content">
+      <div class="text-center">
+        <h1>Loading...</h1>
+        <noscript>
           <h2 class="text-danger">This App Requires JavaScript to work.</h2>
         </noscript>
-    </div>
-  </div>
-  <div id="container">
-    <div id="terminal_messages"></div>
-  </div>
-  <div class="container">
-    <div class="row pt-4">
-      <div class="col-sm text-center">
-        <a href="https://crp.to/">CryptoTrust LLC</a> © 2021
       </div>
     </div>
-  </div>
-<script src=".././app/bundle.efb1c9ee54932430c23f.js" nonce="Mwd4L6ii2o0pSAIeoez1Wg=="></script>
+    <div id="container">
+      <div id="terminal_messages"></div>
+    </div>
+  </main>
+
+  <footer class="oa-footer"><div class="inner">
+    <div><a href="https://crp.to/">CryptoTrust LLC</a> © 2026 · OnlyAgent</div>
+    <div style="display:flex;gap:20px;flex-wrap:wrap">
+      <a href="https://onlyagent.us">onlyagent.us</a>
+      <a href="https://docs.crp.to/webcrypt.html">Help</a>
+    </div>
+  </div></footer>
+<script src=".././app/bundle.4439e5d8674578fbb397.js" nonce="kShc3D59gLiZ9qTM8Q0i1A=="></script>
 
 
 </body></html>

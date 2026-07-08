@@ -1,118 +1,56 @@
-<!DOCTYPE html><html><head><meta http-equiv="Content-Security-Policy" content="base-uri 'none'; object-src 'none'; script-src 'self' 'unsafe-eval' 'nonce-AKPz74rKffrD2DXVBtaBeg=='; style-src 'self' 'unsafe-eval' 'sha256-NEG1aW1qvyvZWdGLyzHd6COaatgYW/plmvYLx2TCOKg=' 'nonce-uSPDs4yvzIw9zoGqpubeyg==' 'nonce-EM4e3NwcEqpI0K/NIH74Dw==' 'nonce-1a8eY+n1hLk9jUaPR1a7yQ=='; default-src 'self'; img-src 'self' data: https://www.gravatar.com https://raw.githubusercontent.com/keybase/client/master/browser/images/icon-keybase-logo-128.png https://s3.amazonaws.com/keybase_processed_uploads/; connect-src 'self' https://keybase.io https://onlykey.herokuapp.com wss://onlykey.herokuapp.com">
-  <title>OnlyKey Apps - Tools for encrypting messages, files, and searching for users</title>
-  <meta name="viewport" content="width=device-width,initial-scale=0.75">
-  <link href="./app/css/bootstrap.min.css" rel="stylesheet" nonce="uSPDs4yvzIw9zoGqpubeyg==">
-  <link href="./app/css/ShareTechMono.css" rel="stylesheet" nonce="EM4e3NwcEqpI0K/NIH74Dw==">
-  <link href="./app/css/font-awesome.min.css" rel="stylesheet" nonce="1a8eY+n1hLk9jUaPR1a7yQ==">
-  <style>
-  </style>
+<!DOCTYPE html><html><head><meta http-equiv="Content-Security-Policy" content="base-uri 'none'; object-src 'none'; script-src 'self' 'unsafe-eval' 'nonce-cidBkNsd4sVc2ocNUymgKg=='; style-src 'self' 'unsafe-eval' 'nonce-/yBdGshO/Hcx3ls5308+nw==' 'nonce-lj/ia2zDedAeiQ4aNw1N9Q==' 'nonce-I3JLqNevZJVLszYDJQeHvw==' 'nonce-Mz1xNPkQUtdVMko93bmS4g=='; default-src 'self'; img-src 'self' data: https://www.gravatar.com https://raw.githubusercontent.com/keybase/client/master/browser/images/icon-keybase-logo-128.png https://s3.amazonaws.com/keybase_processed_uploads/; connect-src 'self' https://keybase.io https://onlykey.herokuapp.com wss://onlykey.herokuapp.com">
+  <title>OnlyAgent Apps — Encrypt, decrypt &amp; sign with your OnlyKey</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link href="./app/css/bootstrap.min.css" rel="stylesheet" nonce="/yBdGshO/Hcx3ls5308+nw==">
+  <link href="./app/css/ShareTechMono.css" rel="stylesheet" nonce="lj/ia2zDedAeiQ4aNw1N9Q==">
+  <link href="./app/css/font-awesome.min.css" rel="stylesheet" nonce="I3JLqNevZJVLszYDJQeHvw==">
+  <link href="./app/css/onlyagent-theme.css" rel="stylesheet" nonce="Mz1xNPkQUtdVMko93bmS4g==">
 </head>
-
 <body data-page="index">
-  <nav class="navbar navbar-dark bg-dark">
-    <div class="mr-auto text-center">
-      <a class="">&nbsp;Apps&nbsp;</a>
-      <!--<a class="navbar-brand" href="/app/encrypt"><i class="fa fa-lock" aria-hidden="true"></i></a>
-      <a class="navbar-brand" href="/app/decrypt"><i class="fa fa-unlock" aria-hidden="true"></i></a>
-      <a class="navbar-brand" href="/app/decrypt-file"><i class="fa fa-file-text" aria-hidden="true"></i></a>
-      <a class="navbar-brand" href="/app/encrypt-file"><i class="fa fa-file-archive-o" aria-hidden="true"></i></a>
-      <a class="navbar-brand" href="/app/search"><i class="fa fa-search" aria-hidden="true"></i></a>
-      <a class="navbar-brand" href="/app/password-generator"><i class="fa fa-key" aria-hidden="true"></i></a>
-      -->
-      
-            <a class="navbar-brand" href="/app/encrypt"><i class="fa fa-lock" aria-hidden="true"></i></a>
-       
-            <a class="navbar-brand" href="/app/decrypt"><i class="fa fa-unlock" aria-hidden="true"></i></a>
-       
-            <a class="navbar-brand" href="/app/encrypt-file"><i class="fa fa-file-archive-o" aria-hidden="true"></i></a>
-       
-            <a class="navbar-brand" href="/app/decrypt-file"><i class="fa fa-file-text" aria-hidden="true"></i></a>
-       
-            <a class="navbar-brand" href="/app/search"><i class="fa fa-search" aria-hidden="true"></i></a>
-       
-            <a class="navbar-brand" href="/app/password-generator"><i class="fa fa-key" aria-hidden="true"></i></a>
-       
-            <a class="navbar-brand" href="/app/chat"><i class="fa fa-comments-o" aria-hidden="true"></i></a>
-       
-       
-      <br class="d-block d-sm-none">
-      <a class="">&nbsp;Links&nbsp;</a>
-      <a class="navbar-brand" href="/"><i class="fa fa-home" aria-hidden="true"></i></a>
-      <a class="navbar-brand" href="https://docs.crp.to/webcrypt.html"><i class="fa fa-question" aria-hidden="true"></i></a>
-      <a class="navbar-brand" href="https://docs.crp.to/"><i class="fa fa-book" aria-hidden="true"></i></a>
-      <a class="navbar-brand" href="https://onlykey.io"><i class="fa fa-shopping-cart" aria-hidden="true"></i></a>
-    </div>
-  </nav>
-  <div class="container text-center pt-4">
-    <p><img src="./app/ok0.jpg" alt="logo" align="middle"></p>
-    <h1><i class="fa fa-rocket"></i> OnlyKey Apps</h1>
-  </div>
   <input id="onlykey_start" value="Encrypt and Sign" type="hidden">
-  <div class="container">
 
-    <div class="row pt-4">
-      <div class="col-sm text-center">
-        <a id="setTime" class="btn btn-success ShareTechMono">Set Time for OTP 2FA Authentications</a>
+  <header class="oa-nav"><div class="inner">
+    <a class="oa-brand" href="/"><img src="./app/onlyagent-logo.svg" alt="OnlyAgent"></a>
+    <nav class="oa-navlinks">
+      <a href="./app/encrypt"><i class="fa fa-lock"></i><span>Encrypt</span></a>
+      <a href="./app/decrypt"><i class="fa fa-unlock"></i><span>Decrypt</span></a>
+      <a href="./app/search"><i class="fa fa-search"></i><span>Search</span></a>
+      <span class="sep"></span>
+      <a href="https://docs.crp.to/"><i class="fa fa-book"></i><span>Docs</span></a>
+      <a href="https://onlykey.io"><i class="fa fa-shopping-cart"></i><span>Get OnlyKey</span></a>
+    </nav>
+  </div></header>
+
+  <main class="oa-main">
+    <section class="oa-hero">
+      <h1>Encrypt anything with <span class="g">your hardware key</span>.</h1>
+      <p>Securely encrypt, sign, decrypt and verify messages and files right in your browser. Your private keys never leave your OnlyKey.</p>
+      <div class="oa-cta-row" style="margin-top:26px">
+        <a class="btn oa-btn-primary" style="max-width:260px" href="./app/encrypt">Encrypt a message</a>
+        <a id="setTime" class="btn btn-secondary">Set Time for OTP 2FA</a>
       </div>
+    </section>
+
+    <section class="oa-tools">
+      <a class="oa-tool" href="./app/encrypt"><div class="ic"><i class="fa fa-lock"></i></div><h3>Encrypt &amp; Sign Messages</h3><p>Compose an end-to-end encrypted, signed message for any Keybase or Protonmail user.</p></a>
+      <a class="oa-tool" href="./app/encrypt-file"><div class="ic"><i class="fa fa-file-archive-o"></i></div><h3>Encrypt &amp; Sign Files</h3><p>Encrypt files for a recipient — or for yourself — with your OnlyKey.</p></a>
+      <a class="oa-tool" href="./app/decrypt"><div class="ic"><i class="fa fa-unlock"></i></div><h3>Decrypt &amp; Verify Messages</h3><p>Decrypt incoming PGP messages and verify the sender's signature.</p></a>
+      <a class="oa-tool" href="./app/decrypt-file"><div class="ic"><i class="fa fa-file-text"></i></div><h3>Decrypt &amp; Verify Files</h3><p>Decrypt .gpg files and confirm they came from who you expect.</p></a>
+      <a class="oa-tool" href="./app/search"><div class="ic"><i class="fa fa-search"></i></div><h3>Find a Recipient</h3><p>Search Keybase and Protonmail for someone to send encrypted messages to.</p></a>
+      <a class="oa-tool" href="./app/password-generator"><div class="ic"><i class="fa fa-key"></i></div><h3>Password Generator</h3><p>Derive strong, repeatable static passwords from your OnlyKey.</p></a>
+    </section>
+
+    <p style="text-align:center;color:var(--muted)"><a href="./app/past_releases">Looking for older app releases?</a></p>
+  </main>
+
+  <footer class="oa-footer"><div class="inner">
+    <div>© 2026 OnlyKey · OnlyAgent</div>
+    <div style="display:flex;gap:20px;flex-wrap:wrap">
+      <a href="https://onlyagent.us">onlyagent.us</a>
+      <a href="https://docs.crp.to/webcrypt.html">Help</a>
+      <a href="https://crp.to/">CryptoTrust LLC</a>
     </div>
-
-    <div class="row pt-4">
-      <div class="col-sm text-center">
-        <h2><i class="fa fa-lock" aria-hidden="true"></i> Encryption</h2>
-        <p>Securely encrypt and sign text messages or files using
-          <a href="https://onlykey.io" target="_blank">OnlyKey</a>
-        </p>
-        <div class="pt-4">
-          <a href="./app/encrypt" class="btn btn-success ShareTechMono">Encrypt &amp; Sign Messages</a>
-        </div>
-        <div class="pt-4">
-          <a href="./app/encrypt-file" class="btn btn-success ShareTechMono">Encrypt &amp; Sign Files</a>
-        </div>
-      </div>
-    </div>
-
-    <div class="row pt-4">
-      <div class="col-sm text-center">
-        <h2><i class="fa fa-unlock" aria-hidden="true"></i> Decryption</h2>
-        <p>Securely decrypt and verify text messages or files using <a href="https://onlykey.io" target="_blank">OnlyKey</a>
-        </p>
-        <div class="pt-4">
-          <a href="./app/decrypt" class="btn btn-success ShareTechMono">Decrypt &amp; Verify Messages</a>
-        </div>
-        <div class="pt-4">
-          <a href="./app/decrypt-file" class="btn btn-success ShareTechMono">Decrypt &amp; Verify Files</a>
-        </div>
-      </div>
-    </div>
-
-    <div class="row pt-4">
-      <div class="col-sm text-center">
-        <h2><i class="fa fa-search" aria-hidden="true"></i> Keybase User Search</h2>
-        <p>Find <a href="https://keybase.io/kbpgp" target="_blank">Keybase</a> user or <a href="https://protonmail.com" target="_blank">Protonmail</a> user to send encrypted messages and files using
-          <a href="https://onlykey.io" target="_blank">OnlyKey</a>
-        </p>
-        <a href="./app/search" class="btn btn-success ShareTechMono">User Search</a>
-      </div>
-    </div>
-
-    <hr>
-
-    <div class="row pt-4">
-      <div class="col-sm text-center">
-        <h3>Looking for the <a href="./app/past_releases">old Webcrypt app releases?</a></h3>
-        <br>
-        <a href="./app/past_releases?version=beta7" target="_blank">Click here for Beta7 firmware compatible Webcrypt app version</a>
-      </div>
-    </div>
-
-    <div class="row pt-4">
-      <div class="col-sm text-center">
-        <a href="https://crp.to/">CryptoTrust LLC</a> © 2021
-      </div>
-    </div>
-
-  </div>
-<script src="./app/bundle.efb1c9ee54932430c23f.js" nonce="AKPz74rKffrD2DXVBtaBeg=="></script>
-
+  </div></footer>
+<script src="./app/bundle.4439e5d8674578fbb397.js" nonce="cidBkNsd4sVc2ocNUymgKg=="></script>
 
 </body></html>
