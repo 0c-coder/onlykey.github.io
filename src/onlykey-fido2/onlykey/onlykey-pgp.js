@@ -378,7 +378,60 @@ module.exports = function(imports) {
         return u2fSignBuffer(OKSIGN, typeof ct === 'string' ? ct.match(/.{2}/g) : ct, cb);
       };
 
+      // ===== Composite PQC PGP (IETF OpenPGP-PQC) device callbacks ==========
+      // The composite key is loaded in an RSA slot (1-4) with `onlykey-cli setpqc`.
+      // Firmware okpqc.cpp (KEYTYPE_PQC_PGP=7) dispatches by the slot's keytype:
+      //   SIGN    payload = [selector]+digest  (0=Ed25519 ->64B, 1=ML-DSA ->3309B)
+      //   DECRYPT payload = 32-B X25519 point OR 1088-B ML-KEM ct (selected by size)
+      // openpgp.js does the KMAC256("OpenPGPCompositeKDFv1") combine + AES unwrap.
+      // NOTE: RSA-slot addressing over the WebAuthn/CTAPHID transport and the PIN
+      // framing are best-effort here (mirrors auth_sign_ecc) and must be confirmed
+      // on hardware; set the slot with KB_ONLYKEY.registerPQCHooks(openpgp, slot).
+      KB_ONLYKEY.pqcMode = false;
+      KB_ONLYKEY.pqcSlot = 1;
+      function pqcSetPin(bytes) {
+        var h = sha256(bytes);
+        pin = [get_pin(h[0]), get_pin(h[15]), get_pin(h[31])];
+      }
+      KB_ONLYKEY.pqc_sign_ecc = function(digest, cb) {   // -> 64-byte Ed25519 sig
+        var payload = [0].concat(Array.from(digest));
+        pqcSetPin(payload); KB_ONLYKEY.pqcMode = true;
+        return u2fSignBuffer(OKSIGN, payload, cb);
+      };
+      KB_ONLYKEY.pqc_sign_pqc = function(digest, cb) {   // -> 3309-byte ML-DSA-65 sig
+        var payload = [1].concat(Array.from(digest));
+        pqcSetPin(payload); KB_ONLYKEY.pqcMode = true;
+        return u2fSignBuffer(OKSIGN, payload, cb);
+      };
+      KB_ONLYKEY.pqc_x25519 = function(point, cb) {      // 32-B point -> 32-B shared secret
+        var payload = Array.from(point);
+        pqcSetPin(payload); KB_ONLYKEY.pqcMode = true;
+        return u2fSignBuffer(OKDECRYPT, payload, cb);
+      };
+      KB_ONLYKEY.pqc_mlkem = function(ct, cb) {          // 1088-B ct -> 32-B key share
+        var payload = Array.from(ct);
+        pqcSetPin(payload); KB_ONLYKEY.pqcMode = true;
+        return u2fSignBuffer(OKDECRYPT, payload, cb);
+      };
+      // Register the composite openpgp.js hooks against these device callbacks.
+      // og = composite openpgp.js namespace (window.openpgp); needs window.onlykeyOpenPGPpqc.
+      KB_ONLYKEY.registerPQCHooks = function(og, pqcSlot) {
+        og = og || (typeof window !== 'undefined' && window.openpgp);
+        var glue = (typeof window !== 'undefined' && window.onlykeyOpenPGPpqc) ||
+                   (typeof onlykeyOpenPGPpqc !== 'undefined' && onlykeyOpenPGPpqc);
+        if (!og || !glue) throw new Error('composite openpgp.js + onlykey-openpgp-pqc.js required');
+        if (pqcSlot) KB_ONLYKEY.pqcSlot = pqcSlot;
+        return glue.registerHooks({
+          openpgp: og,
+          signEcc:     KB_ONLYKEY.pqc_sign_ecc,
+          signPqc:     KB_ONLYKEY.pqc_sign_pqc,
+          x25519:      KB_ONLYKEY.pqc_x25519,
+          mlkemDecaps: KB_ONLYKEY.pqc_mlkem
+        });
+      };
+
       function slotid(slot) {
+        if (KB_ONLYKEY.pqcMode) return KB_ONLYKEY.pqcSlot; // composite key in RSA slot 1-4
         var ret = (slot == OKSIGN ? 2 : 1);
         
         if(KB_ONLYKEY.is_ecc){
