@@ -47,26 +47,50 @@ HPKE (unchanged, from #90): KEM_ID 0x647A | KDF_ID 0x0001 | AEAD_ID 0x0003
 `okcrypto_derive_key(KEYTYPE_CURVE25519, additional_data, RESERVED_KEY_WEB_DERIVATION)`).
 Derive the ML-KEM seed **one-way from `sk_X`** so it can never leak `sk_X`:
 
+**PINNED CONSTRUCTION** (matches the firmware exactly — `okcrypto_xwing_web_derive()` in
+`onlykey/okcrypto.cpp` and the X-Wing branch in `fido2/ok_extension.cpp`):
+
 ```
 mlkem_seed = HKDF-SHA256(
+    salt = [0x03] || label32,          # 0x03 = domain: ML-KEM seed
     IKM  = sk_X,                       # the label-derived X25519 private
-    salt = "",                         # (empty)
-    info = "onlykey/xwing/mlkem768-seed/v1",
+    info = SHA256(RPID),               # RPID = "onlyagent.app"
     L    = 32
 )
 ```
+
+This is `okcrypto_hkdf(seed_salt, ecc_private_key, out, 32)` — RFC 5869. The `info` is not a
+free parameter: `okcrypto_hkdf()` always uses `SHA256(RPID)` read from `ctap_buffer`, so the
+domain separator lives in the **salt** instead of an `info` string.
+
+**Salt flag byte allocation** — `salt[0]` separates derivation families that share a label.
+Keep these disjoint; a new family takes the next free value:
+
+| flag | derives | IKM |
+|------|---------|-----|
+| 0 | `sk_X` — web/age derive, non-REQ_PRESS | web_derivation_key |
+| 1 | `sk_X` — web/age derive, REQ_PRESS | web_derivation_key |
+| 2 | OnlyAgent FDE X-Wing seed (full on-device) | web_derivation_key |
+| 3 | `mlkem_seed` (this one) | `sk_X` |
 
 Properties:
 - `mlkem_seed` depends only on `sk_X`, i.e. only on `(web_derivation_key, label)`
   — **constant per label**, independent of the per-message `ct_X`. So `pk_M`
   (and the recipient string) is stable.
 - HKDF is one-way, so a browser holding `mlkem_seed` learns nothing about `sk_X`.
-- `mlkem_seed != sk_X` by construction (distinct `info`), so returning it never
+- `mlkem_seed != sk_X` by construction (distinct salt), so returning it never
   discloses the X25519 private.
 
-> Alternative (equivalent): derive both independently from
-> `web_derivation_key` with `info="…/x25519/v1"` and `info="…/mlkem768-seed/v1"`.
-> Either is fine; pick one and pin it.
+> **History:** this document previously specified `HKDF(IKM=sk_X, salt="",
+> info="onlykey/xwing/mlkem768-seed/v1")`, but the firmware actually implemented
+> `SHA256(sk_X || "onlykey/xwing/mlkem768-seed/v1")` — a raw-hash construction that did not match
+> this spec. The firmware now performs the real HKDF above. **This changes every derived X-Wing
+> `mlkem_seed`, hence `pk_M` and the recipient string.** Safe to do because the derived X-Wing age
+> path was never released (it exists only on the fork, marked UNTESTED, and is absent from
+> `trustcrypto/libraries` master) — no user data was encrypted under the old seeds.
+>
+> Note the host never computes `mlkem_seed`; it receives it from the device. So no JS change is
+> required — `xwing.js`/`derived_xwing.py` expand whatever seed the device returns.
 
 ## 4. Firmware change (`fido2/ok_extension.cpp`, `bridge_to_onlykey`)
 
@@ -77,7 +101,7 @@ Add an X-Wing branch to the derive dispatch (the `opt2 == KEYTYPE_*` block,
 ```
 [ pk_X (32) ][ mlkem_seed (32) ]
    pk_X       = Curve25519 public of the label-derived sk_X   (existing)
-   mlkem_seed = HKDF(sk_X, "onlykey/xwing/mlkem768-seed/v1")
+   mlkem_seed = HKDF(salt=[3|label32], IKM=sk_X, info=SHA256(RPID))   # see §3
 ```
 (No user presence required — public material only.)
 
@@ -86,7 +110,7 @@ from the age stanza), return 64 bytes:
 ```
 [ ss_X (32) ][ mlkem_seed (32) ]
    ss_X       = okcrypto_shared_secret(ct_X, sk_X)   (existing ECDH)
-   mlkem_seed = HKDF(sk_X, "onlykey/xwing/mlkem768-seed/v1")
+   mlkem_seed = HKDF(salt=[3|label32], IKM=sk_X, info=SHA256(RPID))   # see §3
 ```
 Use `DERIVE_SHAREDSEC_REQ_PRESS` (button) for actual decryption.
 
@@ -135,8 +159,9 @@ file_key = HPKE-open(ss, ct, aead_body)               # KEM 0x647A/KDF 0x0001/AE
 
 ## 7. Pinned — must match byte-exactly (firmware ⇄ browser)
 
-1. `mlkem_seed = HKDF-SHA256(sk_X, info="onlykey/xwing/mlkem768-seed/v1", L=32)`.
-2. `sk_X` = the existing `RESERVED_KEY_WEB_DERIVATION` Curve25519 derivation.
+1. `mlkem_seed = HKDF-SHA256(salt=[0x03]||label32, IKM=sk_X, info=SHA256(RPID), L=32)` — see §3.
+   (Firmware-side only: the browser receives this seed, it never recomputes it.)
+2. `sk_X` = the existing `RESERVED_KEY_WEB_DERIVATION` Curve25519 derivation (salt flag 0/1).
 3. ML-KEM seed expansion: `SHAKE256(mlkem_seed, 64)` → ML-KEM `keygen_internal`.
 4. X-Wing combiner: `SHA3-256(ss_M||ss_X||ct_X||pk_X||0x5c2e2f2f5e5c)` (draft-09).
 5. HPKE suite `0x647A / 0x0001 / 0x0003`; stanza tag `mlkem768x25519`.
