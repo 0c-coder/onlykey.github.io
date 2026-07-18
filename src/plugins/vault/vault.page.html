@@ -1,0 +1,43 @@
+<h4>
+    <font size="+2">Hardware-encrypted credential vault with
+        <a href="https://onlykey.io" target="_blank">OnlyKey</a></font>
+</h4>
+<p class="text-muted">Store API keys and secrets encrypted by your OnlyKey. Encryption keys are
+    derived on the device — first use requires a physical touch, and plaintext never touches disk.</p>
+
+<fieldset>
+    <input type="text" id="vault_service" placeholder="Service name (e.g. openai, github, stripe)" autocomplete="off" />
+    <input type="password" id="vault_secret" placeholder="Secret / API key to encrypt" autocomplete="off" />
+    <select id="vault_policy">
+        <option value="always">Touch required every use</option>
+        <option value="session:30m" selected>Session: 30 minutes</option>
+        <option value="session:8h">Session: 8 hours</option>
+        <option value="startup">Session: until page closes</option>
+    </select>
+    <button type="submit" id="vault_add_btn">Encrypt &amp; Store with OnlyKey</button>
+    <textarea readonly id="vault_add_result" class="startHidden" rows="3"
+        placeholder="Encrypted blob appears here — safe to copy, commit, share"></textarea>
+</fieldset>
+
+<h3>Stored credentials</h3>
+<div id="vault_list"></div>
+
+<h3>Active sessions</h3>
+<div id="vault_sessions"></div>
+<fieldset>
+    <button type="button" id="vault_lock_all" class="btn-danger">Lock all sessions</button>
+    <button type="button" id="vault_export" class="btn-secondary">Export vault (JSON)</button>
+    <button type="button" id="vault_import_btn" class="btn-secondary">Import vault</button>
+    <input type="file" id="vault_import_file" accept="application/json" class="startHidden" />
+</fieldset>
+
+<div>
+    <h3>Console Messages Appear Below</h3>
+    <pre>
+        <code data-language="javascript">
+            <font color="008700">
+                <div id="messages"></div>
+            </font>
+        </code>
+    </pre>
+</div>

@@ -35,6 +35,8 @@ module.exports.push(require("./plugins/decrypt/decrypt.js"));
 
 module.exports.push(require("./plugins/search/search.js"));
 
+module.exports.push(require("./plugins/vault/vault.js"));
+
 module.exports.push(require("./plugins/ok-status-icon/ok-status-icon.js"));
 
 if (!!(process.env.NODE_ENV === "production")) {//is production
