@@ -479,7 +479,20 @@ function onlykey(keytype, enc_resp) {
                         sharedPub = response.slice(response.length - 65, response.length - 33);
                     }
                     else {
-                        sharedPub = response.slice(53, response.length);
+                        // The [0x04|X|Y] point is the last 65 bytes of the
+                        // response, not a fixed offset - firmware inserts a
+                        // 21-byte "UNLOCKED"+version string ahead of it
+                        // (ok_extension.cpp's temp[32:53) before the pubkey
+                        // at temp[53:118)), so a hardcoded slice(53, ...)
+                        // grabbed that version string plus a truncated/
+                        // misaligned key instead of the real point - confirmed
+                        // live (fresh CTAP1_SUCCESS response, "Unknown Key
+                        // Type to Encode" from encode_key() since neither the
+                        // length nor the 0x04 prefix landed correctly).
+                        // Matches the NACL/CURVE25519 branch's own end-
+                        // anchored pattern above, and the last known-working
+                        // build's equivalent slice.
+                        sharedPub = response.slice(response.length - 65, response.length);
                     }
 
                     htmlLog("OnlyKey Derive Public Key Complete")();

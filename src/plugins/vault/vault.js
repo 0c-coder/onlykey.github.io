@@ -277,7 +277,13 @@ module.exports = {
 
                 var $ = app.$;
                 var onlykey3rd = app.onlykey3rd;
-                var ok = onlykey3rd();
+                // node-onlykey's onlykey3rd() constructor takes no
+                // arguments in the currently-bundled library version -
+                // keytype/press_required are per-call arguments on
+                // derive_public_key/derive_shared_secret themselves, not
+                // bound at construction. `onlykey3rd(1, 0)` is a harmless
+                // no-op, kept to match history.js's still-working call.
+                var ok = onlykey3rd(1, 0);
 
                 ok.on("status", function(msg) { log(msg); });
                 ok.on("error", function(err) { log("OnlyKey error: " + err); });
@@ -321,10 +327,21 @@ module.exports = {
                     var phrase = "vault:" + serviceId;
                     log("Touch your OnlyKey to authorize \"" + serviceId + "\"...");
 
+                    // KEYTYPE.P256R1 = 1 - the only keytype for which
+                    // derive_public_key()/derive_shared_secret() do a real
+                    // ECDH derivation. press_required=false on the public
+                    // key step (no touch needed just to fetch the pubkey),
+                    // press_required=true on the shared-secret step (the
+                    // actual sensitive ECDH computation) - matches this
+                    // function's own "Touch your OnlyKey to authorize" log
+                    // message above and the device setting bit each maps to
+                    // (derived_key_challenge_mode bit 3 vs. REQ_PRESS/
+                    // ctap_user_presence_test in ok_extension.cpp).
+                    var KEYTYPE_P256R1 = 1;
                     return new Promise(function(resolve, reject) {
-                        ok.derive_public_key(phrase, 1, false, function(err, pubkey) {
+                        ok.derive_public_key(phrase, KEYTYPE_P256R1, false, function(err, pubkey) {
                             if (err) return reject(new Error("derive_public_key: " + err));
-                            ok.derive_shared_secret(phrase, pubkey, 1, true, function(err2, secret) {
+                            ok.derive_shared_secret(phrase, pubkey, KEYTYPE_P256R1, true, function(err2, secret) {
                                 if (err2) return reject(new Error("derive_shared_secret: " + err2));
                                 resolve(secret);
                             });
