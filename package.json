@@ -20,7 +20,8 @@
     "build-release": "NODE_OPTIONS=\"--max-old-space-size=8192\" cross-env NODE_ENV=production OUT_DIR=./build webpack -p --config webpack.config.js",
     "build-site": "cross-env NODE_ENV=development OUT_DIR=./build webpack --devtool source-map --config webpack.config.js",
     "heroku-postbuild": "bash ./BUILD.sh 1",
-    "start": "node ./index.js"
+    "start": "node ./index.js",
+    "test:pqc": "webpack --config webpack.config.js --entry ./test/pqc.test.js --output-path ./test/.build --output-filename pqc-bundle.js --mode development --target node && node ./test/.build/pqc-bundle.js"
   },
   "bugs": {
     "url": "https://github.com/onlykey/onlykey.github.io/issues"
