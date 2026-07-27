@@ -117,8 +117,42 @@ module.exports = {
         crossOriginLoading: 'anonymous'
     },
     plugins: plugins,
+    resolve: {
+        alias: {
+            // Vendored, not npm-installed - see
+            // src/onlykey-fido2/onlykey/vendor/@noble/VENDORED.md. Needed
+            // because @noble/post-quantum imports @noble/hashes (and,
+            // transitively via _crystals.js, @noble/curves/abstract/fft.js)
+            // via bare specifiers internally - this alias is the only thing
+            // that lets those resolve without modifying the vendored files
+            // themselves.
+            '@noble/hashes': path.resolve(__dirname, 'src/onlykey-fido2/onlykey/vendor/@noble/hashes'),
+            '@noble/post-quantum': path.resolve(__dirname, 'src/onlykey-fido2/onlykey/vendor/@noble/post-quantum'),
+            '@noble/ciphers': path.resolve(__dirname, 'src/onlykey-fido2/onlykey/vendor/@noble/ciphers'),
+            '@noble/curves': path.resolve(__dirname, 'src/onlykey-fido2/onlykey/vendor/@noble/curves'),
+        }
+    },
     module: {
         rules: [{
+            // Scoped only to the vendored @noble packages - webpack 4's
+            // built-in parser can't handle the modern syntax they publish
+            // with (optional chaining, ES2022 class fields). Deliberately
+            // not applied project-wide: this transpiles at build time only,
+            // the committed files in vendor/ stay byte-for-byte unmodified/
+            // diffable against the real npm packages (see VENDORED.md).
+            test: /\.js$/,
+            include: path.resolve(__dirname, 'src/onlykey-fido2/onlykey/vendor/@noble'),
+            use: {
+                loader: 'babel-loader',
+                options: {
+                    // modules: false - leave import/export as-is so webpack
+                    // still does its own module resolution/tree-shaking;
+                    // only the newer syntax (optional chaining, class
+                    // fields) needs transpiling for webpack 4's parser.
+                    presets: [['@babel/preset-env', { targets: { esmodules: true }, modules: false }]],
+                },
+            },
+        }, {
             test: /\.page\.html$/i,
             use: 'raw-loader',
         }, {

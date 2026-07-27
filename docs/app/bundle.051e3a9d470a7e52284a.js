@@ -126169,7 +126169,13 @@ module.exports = function(imports, onlykeyApi) {
         NACL: 0,
         P256R1: 1, //encrypt/decrypt
         P256K1: 2, //sign/verify
-        CURVE25519: 3
+        CURVE25519: 3,
+        // Wire value 5 -> firmware's opt2++ makes it KEYTYPE_XWING(6)
+        // (okcore.h) - see ok_extension.cpp's "Wire keytype 5 ->
+        // opt2==KEYTYPE_XWING(6)" comment. Same +1 offset every other
+        // KEYTYPE here already relies on (NACL 0->1, P256R1 1->2,
+        // P256K1 2->3, CURVE25519 3->4).
+        XWING: 5
     };
 
     var KEYACTION = {
@@ -126622,6 +126628,127 @@ module.exports = function(imports, onlykeyApi) {
             });
         };
         
+        // X-Wing (derived, label-based) recipient derivation - mirrors
+        // derive_public_key exactly (same message-building, same
+        // ctaphid_via_webauthn call, same REQ_PRESS KEYACTION constants),
+        // but the device returns 64 raw bytes ([pk_X(32)|mlkem_seed(32)] -
+        // see ok_extension.cpp's KEYTYPE_XWING branch) instead of a single
+        // EC point, so this can't reuse derive_public_key's encode_key()
+        // formatting - the callback gets both pieces back as-is.
+        //
+        // label is UTF-8 encoded here (TextEncoder), NOT passed as a raw
+        // JS string like derive_public_key's callers do for "additional_d"
+        // elsewhere in this app - Uint8Array.from(aString) does NOT UTF-8
+        // encode (it iterates code points and numeric-converts each one,
+        // silently producing all-zero bytes for a non-numeric string;
+        // confirmed empirically). The device must receive
+        // SHA256(utf8(label)) - the same derived_label_tag() the CLI
+        // computes (onlykey_hid.py) - or the two won't derive the same key.
+        api.derive_xwing_recipient = async function(label, press_required, cb) {
+            console.log("-------------------------------------------");
+            api.emit("status", "OnlyKey: Requesting Derived X-Wing Recipient");
+
+            var cmd = OKCMD.OKCONNECT;
+            var message = [255, 255, 255, 255, OKCMD.OKCONNECT];
+
+            var currentEpochTime = Math.round(new Date().getTime() / 1000.0).toString(16);
+            var timePart = currentEpochTime.match(/.{2}/g).map(hexStrToDec);
+            Array.prototype.push.apply(message, timePart);
+
+            appKey = nacl.box.keyPair();
+            Array.prototype.push.apply(message, appKey.publicKey);
+
+            var env = [onlykeyApi.browser.charCodeAt(0), onlykeyApi.os.charCodeAt(0)];
+            Array.prototype.push.apply(message, env);
+
+            var labelBytes = new TextEncoder().encode(label);
+            var dataHash = await digestArray(labelBytes);
+            Array.prototype.push.apply(message, dataHash);
+
+            var keyAction = press_required ? KEYACTION.DERIVE_PUBLIC_KEY_REQ_PRESS : KEYACTION.DERIVE_PUBLIC_KEY;
+
+            var enc_resp = 1;
+            await onlykeyApi.ctaphid_via_webauthn(cmd, keyAction, KEYTYPE.XWING, enc_resp, message, 60000).then(async(response) => {
+                if (!response.data || response.error) {
+                    api.emit("status", "OnlyKey: Problem Requesting Derived X-Wing Recipient" + (response.error ? ": " + response.error : ""));
+                    if (typeof cb === 'function') cb(response.error || "Problem Requesting Derived X-Wing Recipient");
+                    return;
+                }
+                response = response.data;
+
+                var okPub = response.slice(0, 32);
+                var transit_key = nacl.box.before(Uint8Array.from(okPub), appKey.secretKey);
+                var encrypted = response.slice(32, response.length);
+                var encrypted_response = await aesgcm_decrypt(encrypted, Uint8Array.from(transit_key));
+
+                // [pk_X(32) | mlkem_seed(32)] at the tail, matching the
+                // 32+32 tail shape derive_public_key already uses for
+                // NACL/CURVE25519 (just with different semantic content).
+                var pkX = encrypted_response.slice(encrypted_response.length - 64, encrypted_response.length - 32);
+                var mlkemSeed = encrypted_response.slice(encrypted_response.length - 32, encrypted_response.length);
+
+                api.emit("status", "OnlyKey: Requested Derived X-Wing Recipient Complete");
+
+                if (typeof cb === 'function') cb(null, Uint8Array.from(pkX), Uint8Array.from(mlkemSeed));
+            });
+        };
+
+        // X-Wing decapsulation half (ss_X for a given ct_X) - mirrors
+        // derive_shared_secret, but ctX is passed straight through as the
+        // "input public key" field (no EPUB_TO_ONLYKEY_ECDH_P256/decode_key
+        // conversion - those are EC-point-specific; ct_X is already the
+        // raw 32 bytes the firmware's KEYTYPE_XWING branch reads from that
+        // same wire position). Returns [ss_X(32)|mlkem_seed(32)] - the
+        // caller combines this with the label's pk_X (from
+        // derive_xwing_recipient) via age_pqc.js's splitDecapsulate().
+        api.derive_xwing_decap = async function(label, ctX, press_required, cb) {
+            console.log("-------------------------------------------");
+            api.emit("status", "OnlyKey: Requesting X-Wing Decapsulation");
+
+            var cmd = OKCMD.OKCONNECT;
+            var message = [255, 255, 255, 255, OKCMD.OKCONNECT];
+
+            var currentEpochTime = Math.round(new Date().getTime() / 1000.0).toString(16);
+            var timePart = currentEpochTime.match(/.{2}/g).map(hexStrToDec);
+            Array.prototype.push.apply(message, timePart);
+
+            appKey = nacl.box.keyPair();
+            Array.prototype.push.apply(message, appKey.publicKey);
+
+            var env = [onlykeyApi.browser.charCodeAt(0), onlykeyApi.os.charCodeAt(0)];
+            Array.prototype.push.apply(message, env);
+
+            var labelBytes = new TextEncoder().encode(label);
+            var dataHash = await digestArray(labelBytes);
+            Array.prototype.push.apply(message, dataHash);
+
+            Array.prototype.push.apply(message, ctX);
+
+            var keyAction = press_required ? KEYACTION.DERIVE_SHARED_SECRET_REQ_PRESS : KEYACTION.DERIVE_SHARED_SECRET;
+
+            var enc_resp = 1;
+            await onlykeyApi.ctaphid_via_webauthn(cmd, keyAction, KEYTYPE.XWING, enc_resp, message, 60000).then(async(response) => {
+                if (!response.data || response.error) {
+                    api.emit("status", "OnlyKey: Problem Requesting X-Wing Decapsulation" + (response.error ? ": " + response.error : ""));
+                    if (typeof cb === 'function') cb(response.error || "Problem Requesting X-Wing Decapsulation");
+                    return;
+                }
+                response = response.data;
+
+                var okPub = response.slice(0, 32);
+                var transit_key = nacl.box.before(Uint8Array.from(okPub), appKey.secretKey);
+                var encrypted = response.slice(32, response.length);
+                var encrypted_response = await aesgcm_decrypt(encrypted, Uint8Array.from(transit_key));
+
+                var ssX = encrypted_response.slice(encrypted_response.length - 64, encrypted_response.length - 32);
+                var mlkemSeed = encrypted_response.slice(encrypted_response.length - 32, encrypted_response.length);
+
+                api.emit("status", "OnlyKey: X-Wing Decapsulation Complete");
+
+                if (typeof cb === 'function') cb(null, Uint8Array.from(ssX), Uint8Array.from(mlkemSeed));
+            });
+        };
+
         api.encode_key = encode_key;
         api.decode_key = decode_key;
         api.build_AESGCM = build_AESGCM;
@@ -150346,6 +150473,12229 @@ module.exports = tokenizer;
 
 /***/ }),
 
+/***/ "./src/onlykey-fido2/onlykey/age_file.js":
+/*!***********************************************!*\
+  !*** ./src/onlykey-fido2/onlykey/age_file.js ***!
+  \***********************************************/
+/*! no static exports found */
+/***/ (function(module, exports, __webpack_require__) {
+
+/* WEBPACK VAR INJECTION */(function(Buffer) {// age v1 file format (age-encryption.org/v1), scoped to exactly one
+// recipient stanza type: "mlkem768x25519" (the derived X-Wing feature this
+// app implements). Not a general age library - matches derived_xwing.py's
+// scope note.
+//
+// HPKE cipher suite for the mlkem768x25519 stanza (see xwing.py's
+// seal_file_key/open_file_key, ported here byte-for-byte):
+//   KEM: X-Wing (0x647a), KDF: HKDF-SHA256 (0x0001), AEAD: ChaCha20-Poly1305 (0x0003)
+//
+// STREAM body encryption follows the age spec directly (not project-
+// specific): 64KiB chunks, ChaCha20-Poly1305 with an 11-byte big-endian
+// counter + 1-byte "last chunk" flag as the 12-byte nonce, a payload key
+// derived via HKDF-SHA256(file_key, salt=16-byte random stream nonce,
+// info="payload"), and a header HMAC keyed by
+// HKDF-SHA256(file_key, salt="", info="header") covering everything from
+// the magic line through the literal "---" (no trailing space/MAC/newline).
+
+const { extract: hkdfExtract, expand: hkdfExpand } = __webpack_require__(/*! @noble/hashes/hkdf.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/hashes/hkdf.js");
+const { sha256 } = __webpack_require__(/*! @noble/hashes/sha2.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/hashes/sha2.js");
+const { hmac } = __webpack_require__(/*! @noble/hashes/hmac.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/hashes/hmac.js");
+const { chacha20poly1305 } = __webpack_require__(/*! @noble/ciphers/chacha.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/ciphers/chacha.js");
+const { randomBytes } = __webpack_require__(/*! @noble/ciphers/utils.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/ciphers/utils.js");
+
+const CHUNK_SIZE = 64 * 1024;
+const TAG_LEN = 16;
+const FILE_KEY_LEN = 16;
+const MAGIC_LINE = 'age-encryption.org/v1';
+const STANZA_TYPE = 'mlkem768x25519';
+
+// ---- HPKE (RFC 9180) for the X-Wing cipher suite, ported from xwing.py ---
+const HPKE_MODE_BASE = 0x00;
+const KEM_ID = 0x647a; // X-Wing
+const KDF_ID = 0x0001; // HKDF-SHA256
+const AEAD_ID = 0x0003; // ChaCha20-Poly1305
+const N_SECRET = 32;
+const N_K = 32;
+const N_N = 12;
+
+function utf8(s) {
+    return new Uint8Array(Buffer.from(s, 'utf8'));
+}
+
+function concatBytes(...arrays) {
+    const out = new Uint8Array(arrays.reduce((n, a) => n + a.length, 0));
+    let offset = 0;
+    for (const a of arrays) {
+        out.set(a, offset);
+        offset += a.length;
+    }
+    return out;
+}
+
+function i2osp(n, length) {
+    const out = new Uint8Array(length);
+    for (let i = length - 1; i >= 0; i--) {
+        out[i] = n & 0xff;
+        n = Math.floor(n / 256);
+    }
+    return out;
+}
+
+const SUITE_ID_HPKE = concatBytes(utf8('HPKE'), i2osp(KEM_ID, 2), i2osp(KDF_ID, 2), i2osp(AEAD_ID, 2));
+const SUITE_ID_KEM = concatBytes(utf8('KEM'), i2osp(KEM_ID, 2));
+const EMPTY = new Uint8Array(0);
+
+function labeledExtract(salt, label, ikm, suiteId) {
+    const labeledIkm = concatBytes(utf8('HPKE-v1'), suiteId, label, ikm);
+    return hkdfExtract(sha256, labeledIkm, salt);
+}
+
+function labeledExpand(prk, label, info, length, suiteId) {
+    const labeledInfo = concatBytes(i2osp(length, 2), utf8('HPKE-v1'), suiteId, label, info);
+    return hkdfExpand(sha256, prk, labeledInfo, length);
+}
+
+function hpkeExtractAndExpand(sharedSecret, kemContext) {
+    const prk = labeledExtract(EMPTY, utf8('shared_secret'), sharedSecret, SUITE_ID_KEM);
+    return labeledExpand(prk, utf8('context'), kemContext, N_SECRET, SUITE_ID_KEM);
+}
+
+function hpkeKeyScheduleBase(sharedSecret, info) {
+    const pskIdHash = labeledExtract(EMPTY, utf8('psk_id_hash'), EMPTY, SUITE_ID_HPKE);
+    const infoHash = labeledExtract(EMPTY, utf8('info_hash'), info, SUITE_ID_HPKE);
+    const ksContext = concatBytes(Uint8Array.of(HPKE_MODE_BASE), pskIdHash, infoHash);
+    const secret = labeledExtract(sharedSecret, utf8('secret'), EMPTY, SUITE_ID_HPKE);
+    const key = labeledExpand(secret, utf8('key'), ksContext, N_K, SUITE_ID_HPKE);
+    const baseNonce = labeledExpand(secret, utf8('base_nonce'), ksContext, N_N, SUITE_ID_HPKE);
+    return { key, baseNonce };
+}
+
+// enc: 1120-byte X-Wing ciphertext (kem_context). fileKey: 16 bytes.
+// Returns the 32-byte sealed file key (16 plaintext + 16 tag).
+function sealFileKey(sharedSecret, enc, fileKey) {
+    const hpkeSs = hpkeExtractAndExpand(sharedSecret, enc);
+    const { key, baseNonce } = hpkeKeyScheduleBase(hpkeSs, EMPTY);
+    return chacha20poly1305(key, baseNonce).encrypt(fileKey);
+}
+
+// Returns the 16-byte file key, or throws on a bad tag (wrong shared secret).
+function openFileKey(sharedSecret, enc, sealedFileKey) {
+    const hpkeSs = hpkeExtractAndExpand(sharedSecret, enc);
+    const { key, baseNonce } = hpkeKeyScheduleBase(hpkeSs, EMPTY);
+    return chacha20poly1305(key, baseNonce).decrypt(sealedFileKey);
+}
+
+// ---- base64 (standard alphabet, unpadded, per the age spec) --------------
+function b64NoPad(bytes) {
+    return Buffer.from(bytes).toString('base64').replace(/=+$/, '');
+}
+
+function b64Decode(str) {
+    return new Uint8Array(Buffer.from(str, 'base64'));
+}
+
+function wrapBase64Lines(b64) {
+    let out = '';
+    for (let i = 0; i < b64.length; i += 64) {
+        out += b64.slice(i, i + 64) + '\n';
+    }
+    // Disambiguating empty line when the body is an exact multiple of 64
+    // base64 chars (including zero-length) - same rule as the STREAM
+    // last-chunk case below, so a truncated body can't be mistaken for a
+    // complete one.
+    if (b64.length === 0 || b64.length % 64 === 0) {
+        out += '\n';
+    }
+    return out;
+}
+
+// ---- STREAM (age spec, not project-specific) ------------------------------
+function chunkNonce(counter, isLast) {
+    const nonce = new Uint8Array(12);
+    for (let i = 10; i >= 0; i--) {
+        nonce[i] = counter & 0xff;
+        counter = Math.floor(counter / 256);
+    }
+    nonce[11] = isLast ? 1 : 0;
+    return nonce;
+}
+
+function streamEncrypt(payloadKey, plaintext) {
+    const parts = [];
+    if (plaintext.length === 0) {
+        const cipher = chacha20poly1305(payloadKey, chunkNonce(0, true));
+        parts.push(cipher.encrypt(EMPTY));
+    } else {
+        let offset = 0;
+        let counter = 0;
+        while (offset < plaintext.length) {
+            const remaining = plaintext.length - offset;
+            const takeLen = Math.min(remaining, CHUNK_SIZE);
+            const chunk = plaintext.subarray(offset, offset + takeLen);
+            offset += takeLen;
+            const isLast = offset >= plaintext.length && takeLen < CHUNK_SIZE;
+            const cipher = chacha20poly1305(payloadKey, chunkNonce(counter, isLast));
+            parts.push(cipher.encrypt(chunk));
+            counter++;
+        }
+        if (plaintext.length % CHUNK_SIZE === 0) {
+            // Exact multiple of the chunk size - an extra empty final
+            // chunk (flag=1) is required so a truncation can't look like
+            // a clean end-of-stream.
+            const cipher = chacha20poly1305(payloadKey, chunkNonce(counter, true));
+            parts.push(cipher.encrypt(EMPTY));
+        }
+    }
+    return concatBytes(...parts);
+}
+
+function streamDecrypt(payloadKey, data) {
+    if (data.length === 0) {
+        throw new Error('malformed age payload: empty STREAM body');
+    }
+    const parts = [];
+    let offset = 0;
+    let counter = 0;
+    while (offset < data.length) {
+        const remaining = data.length - offset;
+        const isLast = remaining <= CHUNK_SIZE + TAG_LEN;
+        const takeLen = isLast ? remaining : CHUNK_SIZE + TAG_LEN;
+        if (takeLen < TAG_LEN) {
+            throw new Error('malformed age payload: truncated STREAM chunk');
+        }
+        const chunkCt = data.subarray(offset, offset + takeLen);
+        offset += takeLen;
+        const cipher = chacha20poly1305(payloadKey, chunkNonce(counter, isLast));
+        parts.push(cipher.decrypt(chunkCt)); // throws 'invalid tag' on failure
+        counter++;
+    }
+    return concatBytes(...parts);
+}
+
+// ---- header parsing ---------------------------------------------------
+function findHeaderLines(bytes) {
+    const lines = [];
+    let offset = 0;
+    for (;;) {
+        const nl = bytes.indexOf(0x0a, offset);
+        if (nl === -1) throw new Error('malformed age header: missing newline');
+        const text = String.fromCharCode(...bytes.subarray(offset, nl));
+        lines.push({ text, start: offset });
+        offset = nl + 1;
+        if (text.startsWith('--- ')) {
+            return { headerEndOffset: offset, lines };
+        }
+    }
+}
+
+function parseHeader(bytes) {
+    const { headerEndOffset, lines } = findHeaderLines(bytes);
+    if (lines.length === 0 || lines[0].text !== MAGIC_LINE) {
+        throw new Error('not an age file: bad magic line');
+    }
+    const stanzas = [];
+    let i = 1;
+    while (i < lines.length && !lines[i].text.startsWith('--- ')) {
+        const line = lines[i];
+        if (!line.text.startsWith('-> ')) {
+            throw new Error(`malformed age header: expected a stanza line, got: ${line.text}`);
+        }
+        const args = line.text.slice(3).split(' ');
+        const type = args[0];
+        const typeArgs = args.slice(1);
+        i++;
+        let bodyB64 = '';
+        while (i < lines.length && !lines[i].text.startsWith('-> ') && !lines[i].text.startsWith('--- ')) {
+            bodyB64 += lines[i].text;
+            i++;
+        }
+        stanzas.push({ type, args: typeArgs, body: b64Decode(bodyB64) });
+    }
+    if (i >= lines.length) throw new Error('malformed age header: missing MAC line');
+    const macLine = lines[i];
+    const headerNoMac = bytes.subarray(0, macLine.start + 3); // up to and including the literal "---"
+    const mac = b64Decode(macLine.text.slice(4));
+    return { stanzas, headerNoMac, mac, headerEndOffset };
+}
+
+function computeHeaderMac(fileKey, headerNoMac) {
+    const key = hkdfExpand(sha256, hkdfExtract(sha256, fileKey, EMPTY), utf8('header'), 32);
+    return hmac(sha256, key, headerNoMac);
+}
+
+function timingSafeEqual(a, b) {
+    if (a.length !== b.length) return false;
+    let diff = 0;
+    for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+    return diff === 0;
+}
+
+// Builds a full age v1 file for a single mlkem768x25519 recipient.
+// ciphertext: 1120-byte X-Wing ciphertext (from xwingEncapsHost). sharedSecret:
+// its matching 32-byte X-Wing shared secret. Returns a Uint8Array.
+function encryptAgeFile(plaintext, { ciphertext, sharedSecret }) {
+    const fileKey = randomBytes(FILE_KEY_LEN);
+    const sealedFileKey = sealFileKey(sharedSecret, ciphertext, fileKey);
+
+    const recipientLine = `-> ${STANZA_TYPE} ${b64NoPad(ciphertext)}\n`;
+    const bodyLines = wrapBase64Lines(b64NoPad(sealedFileKey));
+    const headerNoMacText = MAGIC_LINE + '\n' + recipientLine + bodyLines + '---';
+    const headerNoMac = utf8(headerNoMacText);
+
+    const mac = computeHeaderMac(fileKey, headerNoMac);
+    const header = concatBytes(headerNoMac, utf8(' ' + b64NoPad(mac) + '\n'));
+
+    const streamNonce = randomBytes(16);
+    const payloadKey = hkdfExpand(sha256, hkdfExtract(sha256, fileKey, streamNonce), utf8('payload'), 32);
+    const body = streamEncrypt(payloadKey, plaintext);
+
+    return concatBytes(header, streamNonce, body);
+}
+
+// Decrypts a full age v1 file containing (at least) one mlkem768x25519
+// stanza. deriveSharedSecret(ciphertext) is called with the full 1120-byte
+// X-Wing ciphertext from the stanza and must return (sync or async) the
+// 32-byte combined X-Wing shared secret for this file's recipient - the
+// caller already knows pk_X/mlkem_seed for the label and is expected to
+// use ctXOf(ciphertext) to get the 32 bytes the device's
+// DERIVE_SHARED_SECRET call needs, then call splitDecapsulate() itself
+// (it needs the *full* ciphertext too, for the ML-KEM half - not just
+// ct_X). Returns the decrypted plaintext as a Uint8Array.
+async function decryptAgeFile(fileBytes, deriveSharedSecret) {
+    const bytes = fileBytes instanceof Uint8Array ? fileBytes : new Uint8Array(fileBytes);
+    const { stanzas, headerNoMac, mac, headerEndOffset } = parseHeader(bytes);
+
+    const stanza = stanzas.find((s) => s.type === STANZA_TYPE);
+    if (!stanza) {
+        throw new Error(`no ${STANZA_TYPE} recipient stanza in this age file`);
+    }
+    const ciphertext = b64Decode(stanza.args[0]);
+    const sealedFileKey = stanza.body;
+
+    const sharedSecret = await deriveSharedSecret(ciphertext);
+    const fileKey = openFileKey(sharedSecret, ciphertext, sealedFileKey);
+
+    const expectedMac = computeHeaderMac(fileKey, headerNoMac);
+    if (!timingSafeEqual(expectedMac, mac)) {
+        throw new Error('age header MAC verification failed');
+    }
+
+    const streamNonce = bytes.subarray(headerEndOffset, headerEndOffset + 16);
+    const body = bytes.subarray(headerEndOffset + 16);
+    const payloadKey = hkdfExpand(sha256, hkdfExtract(sha256, fileKey, streamNonce), utf8('payload'), 32);
+    return streamDecrypt(payloadKey, body);
+}
+
+module.exports = {
+    sealFileKey,
+    openFileKey,
+    encryptAgeFile,
+    decryptAgeFile,
+};
+
+/* WEBPACK VAR INJECTION */}.call(this, __webpack_require__(/*! ./../../../node_modules/node-libs-browser/node_modules/buffer/index.js */ "./node_modules/node-libs-browser/node_modules/buffer/index.js").Buffer))
+
+/***/ }),
+
+/***/ "./src/onlykey-fido2/onlykey/age_pqc.js":
+/*!**********************************************!*\
+  !*** ./src/onlykey-fido2/onlykey/age_pqc.js ***!
+  \**********************************************/
+/*! no static exports found */
+/***/ (function(module, exports, __webpack_require__) {
+
+/* WEBPACK VAR INJECTION */(function(Buffer) {// JS port of python-onlykey's onlykey/age_plugin/derived_xwing.py - the
+// browser-side twin of the derived (label-based) X-Wing split-custody math.
+// Ported from onlykey-testing/lib/age_pqc.js (proven byte-for-byte against
+// the Python reference there via test/fixtures/derived-xwing-vector.json
+// and test/05-age-pqc-derived.test.js), with encodeIdentity/decodeIdentity
+// replaced by the real bech32 scheme (see derived_xwing.py/bech32.py) - the
+// old scheme here was stale/superseded and `age` rejects it outright.
+//
+// Wire contract this mirrors (see okcrypto.cpp's okcrypto_xwing_web_derive,
+// RESERVED_KEY_WEB_DERIVATION + KEYTYPE_XWING dispatch):
+//   DERIVE_PUBLIC_KEY -> [ pk_X(32) | mlkem_seed(32) ]
+//   DERIVE_SHAREDSEC  -> [ ss_X(32) | mlkem_seed(32) ]
+// The device never returns sk_X or the ML-KEM secret key - only a one-way
+// SHA256(sk_X || tag)-derived seed the host expands locally.
+
+const { ml_kem768 } = __webpack_require__(/*! @noble/post-quantum/ml-kem.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/post-quantum/ml-kem.js");
+const { shake256, sha3_256 } = __webpack_require__(/*! @noble/hashes/sha3.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/hashes/sha3.js");
+const { sha256 } = __webpack_require__(/*! @noble/hashes/sha2.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/hashes/sha2.js");
+const { x25519 } = __webpack_require__(/*! @noble/curves/ed25519.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/ed25519.js");
+
+const MLKEM_PK = 1184;
+const MLKEM_CT = 1088;
+const XWING_PK = 1216;
+const XWING_CT = 1120;
+const SEED = 32;
+
+// draft-connolly-cfrg-xwing-kem-09 combiner label "\.//^\"
+const XWING_LABEL = Uint8Array.from([0x5c, 0x2e, 0x2f, 0x2f, 0x5e, 0x5c]);
+
+function concatBytes(...arrays) {
+    const out = new Uint8Array(arrays.reduce((n, a) => n + a.length, 0));
+    let offset = 0;
+    for (const a of arrays) {
+        out.set(a, offset);
+        offset += a.length;
+    }
+    return out;
+}
+
+// 32-byte derivation tag for a derived-identity label - the value folded
+// into the firmware's HKDF as additional_data. MUST match
+// onlykey_hid.py's derived_label_tag() exactly: SHA256(utf8(label)).
+function deriveLabelTag(label) {
+    return sha256(Buffer.from(label, 'utf8'));
+}
+
+// Expands the 32-byte device-derived seed (SHAKE256 -> 64-byte d||z) into an
+// ML-KEM-768 keypair. Matches the firmware (xwing_shake256/keypair_derand)
+// and python-onlykey's mlkem_keypair_from_seed() (kyber_py's
+// _keygen_internal(d, z)) - @noble/post-quantum's ml_kem768.keygen(seed64)
+// splits the same way internally (seed[:32]=d, seed[32:]=z; see
+// createKyber() in @noble/post-quantum's ml-kem.ts).
+function mlkemKeypairFromSeed(mlkemSeed) {
+    if (mlkemSeed.length !== SEED) {
+        throw new Error(`mlkem_seed must be ${SEED} bytes, got ${mlkemSeed.length}`);
+    }
+    const seed64 = shake256(mlkemSeed, { dkLen: 64 });
+    return ml_kem768.keygen(seed64); // { publicKey, secretKey }
+}
+
+// Builds the 1216-byte X-Wing recipient public key (pk_M || pk_X).
+function buildRecipient(pkX, mlkemSeed) {
+    if (pkX.length !== 32) {
+        throw new Error(`pk_X must be 32 bytes, got ${pkX.length}`);
+    }
+    const { publicKey: pkM } = mlkemKeypairFromSeed(mlkemSeed);
+    return concatBytes(pkM, pkX);
+}
+
+// X-Wing Combiner (draft-connolly-cfrg-xwing-kem-09 Section 5.3):
+// SHA3-256(ss_M || ss_X || ct_X || pk_X || XWingLabel)
+function xwingCombiner(ssM, ssX, ctX, pkX) {
+    return sha3_256(concatBytes(ssM, ssX, ctX, pkX, XWING_LABEL));
+}
+
+// Finishes X-Wing decapsulation given the device's ss_X and the seed.
+// ssX: 32-byte X25519 shared secret from the device (sk_X stays there)
+// ciphertext: 1120-byte X-Wing ct (ct_M || ct_X) from the age stanza
+// pkX: recipient X25519 public key
+// mlkemSeed: 32-byte ML-KEM seed from the device
+// Returns the 32-byte X-Wing shared secret. ct_M never leaves the host.
+function splitDecapsulate(ssX, ciphertext, pkX, mlkemSeed) {
+    if (ssX.length !== 32) throw new Error('ss_X must be 32 bytes');
+    if (ciphertext.length !== XWING_CT) {
+        throw new Error(`X-Wing ct must be ${XWING_CT} bytes, got ${ciphertext.length}`);
+    }
+    const ctM = ciphertext.subarray(0, MLKEM_CT);
+    const ctX = ciphertext.subarray(MLKEM_CT, XWING_CT);
+    const { secretKey: skM } = mlkemKeypairFromSeed(mlkemSeed);
+    const ssM = ml_kem768.decapsulate(ctM, skM);
+    return xwingCombiner(ssM, ssX, ctX, pkX);
+}
+
+// Returns ct_X (the 32 bytes the device needs) from a stanza ciphertext.
+function ctXOf(ciphertext) {
+    return ciphertext.subarray(MLKEM_CT, XWING_CT);
+}
+
+// Standard X-Wing Encapsulation (host/sender side, for encrypt). Mirrors
+// xwing.py's xwing_encaps_host() exactly. Note: x25519 here comes from the
+// vendored @noble/curves (already an unavoidable transitive dependency of
+// @noble/post-quantum - see vendor/@noble/VENDORED.md) rather than nacl.js,
+// so this matches onlykey-testing/lib/age_pqc.js's already-proven-correct
+// call sites exactly.
+function xwingEncapsHost(pk) {
+    if (pk.length !== XWING_PK) {
+        throw new Error(`X-Wing pk must be ${XWING_PK} bytes, got ${pk.length}`);
+    }
+    const pkM = pk.subarray(0, MLKEM_PK);
+    const pkX = pk.subarray(MLKEM_PK, XWING_PK);
+
+    const ekX = x25519.utils.randomSecretKey();
+    const ctX = x25519.getPublicKey(ekX);
+    const ssX = x25519.getSharedSecret(ekX, pkX);
+
+    const { cipherText: ctM, sharedSecret: ssM } = ml_kem768.encapsulate(pkM);
+
+    const ss = xwingCombiner(ssM, ssX, ctX, pkX);
+    const ct = concatBytes(ctM, ctX);
+    return { sharedSecret: ss, ciphertext: ct };
+}
+
+// ---- bech32 (real, BIP-173 checksum algorithm, no 90-char length cap) ----
+// Ported directly from python-onlykey's bech32.py - a 1216-byte X-Wing
+// recipient encodes to something far longer than the standard's 90-char
+// cap, so that cap is deliberately not enforced here either, matching the
+// Python side exactly.
+const BECH32_CHARSET = 'qpzry9x8gf2tvdw0s3jn54khce6mua7l';
+const BECH32_GEN = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
+
+function bech32Polymod(values) {
+    let chk = 1;
+    for (const v of values) {
+        const b = chk >>> 25;
+        chk = ((chk & 0x1ffffff) << 5) ^ v;
+        for (let i = 0; i < 5; i++) {
+            if ((b >>> i) & 1) chk ^= BECH32_GEN[i];
+        }
+    }
+    return chk >>> 0;
+}
+
+function bech32HrpExpand(hrp) {
+    const out = [];
+    for (const ch of hrp) out.push(ch.charCodeAt(0) >>> 5);
+    out.push(0);
+    for (const ch of hrp) out.push(ch.charCodeAt(0) & 31);
+    return out;
+}
+
+function bech32CreateChecksum(hrp, data) {
+    const values = bech32HrpExpand(hrp).concat(data);
+    const polymod = bech32Polymod(values.concat([0, 0, 0, 0, 0, 0])) ^ 1;
+    const out = [];
+    for (let i = 0; i < 6; i++) out.push((polymod >>> (5 * (5 - i))) & 31);
+    return out;
+}
+
+function bech32VerifyChecksum(hrp, data) {
+    return bech32Polymod(bech32HrpExpand(hrp).concat(data)) === 1;
+}
+
+// General power-of-2 base conversion (8-bit bytes <-> 5-bit bech32 groups).
+function convertBits(data, fromBits, toBits, pad) {
+    let acc = 0;
+    let bits = 0;
+    const ret = [];
+    const maxv = (1 << toBits) - 1;
+    for (const value of data) {
+        if (value < 0 || (value >> fromBits) !== 0) return null;
+        acc = (acc << fromBits) | value;
+        bits += fromBits;
+        while (bits >= toBits) {
+            bits -= toBits;
+            ret.push((acc >>> bits) & maxv);
+        }
+    }
+    if (pad) {
+        if (bits > 0) ret.push((acc << (toBits - bits)) & maxv);
+    } else if (bits >= fromBits || ((acc << (toBits - bits)) & maxv) !== 0) {
+        return null;
+    }
+    return ret;
+}
+
+function bech32Encode(hrp, data) {
+    const values = convertBits(Array.from(data), 8, 5, true);
+    const checksum = bech32CreateChecksum(hrp, values);
+    return hrp + '1' + values.concat(checksum).map((d) => BECH32_CHARSET[d]).join('');
+}
+
+// Returns { hrp, data: Uint8Array } or { hrp: null, data: null } if invalid.
+function bech32Decode(bech) {
+    for (const ch of bech) {
+        const code = ch.charCodeAt(0);
+        if (code < 33 || code > 126) return { hrp: null, data: null };
+    }
+    bech = bech.toLowerCase();
+    const pos = bech.lastIndexOf('1');
+    if (pos < 1 || pos + 7 > bech.length) return { hrp: null, data: null };
+    const hrp = bech.slice(0, pos);
+    const data = [];
+    for (const ch of bech.slice(pos + 1)) {
+        const idx = BECH32_CHARSET.indexOf(ch);
+        if (idx === -1) return { hrp: null, data: null };
+        data.push(idx);
+    }
+    if (!bech32VerifyChecksum(hrp, data)) return { hrp: null, data: null };
+    const decoded = convertBits(data.slice(0, -6), 5, 8, false);
+    if (decoded === null) return { hrp: null, data: null };
+    return { hrp, data: Uint8Array.from(decoded) };
+}
+
+// ---- age1onlykey... recipient encoding (slot-based, ported for parity) ---
+const RECIPIENT_HRP = 'age1onlykey';
+
+function encodeRecipient(pubkey) {
+    return bech32Encode(RECIPIENT_HRP, pubkey);
+}
+
+function decodeRecipient(recipient) {
+    const { hrp, data } = bech32Decode(String(recipient).trim().toLowerCase());
+    if (hrp !== RECIPIENT_HRP || data === null) {
+        throw new Error(`not a valid ${RECIPIENT_HRP} recipient: ${recipient}`);
+    }
+    return data;
+}
+
+// ---- derived age identity encoding (label-based, no slot) ----------------
+// Mirrors derived_xwing.py's encode_identity/decode_identity exactly: real
+// bech32, HRP == the SAME "age-plugin-onlykey-" slot-identity HRP (age
+// picks which plugin binary to exec from this literal prefix text - a
+// distinct HRP breaks dispatch entirely), disambiguated from a slot
+// identity by a 0xFF marker byte as the first payload byte.
+const IDENTITY_HRP = 'age-plugin-onlykey-'; // MUST match cli.py's IDENTITY_HRP
+const DERIVED_MARKER = 0xff;
+
+function encodeIdentity(label) {
+    if (typeof label !== 'string' || !label) {
+        throw new Error('derived identity needs a non-empty label');
+    }
+    const payload = concatBytes(Uint8Array.of(DERIVED_MARKER), Buffer.from(label, 'utf8'));
+    return bech32Encode(IDENTITY_HRP, payload).toUpperCase();
+}
+
+function decodeIdentity(s) {
+    const { hrp, data } = bech32Decode(String(s).trim().toLowerCase());
+    if (hrp !== IDENTITY_HRP || !data || data.length < 1 || data[0] !== DERIVED_MARKER) {
+        return null;
+    }
+    return { derived: true, label: Buffer.from(data.subarray(1)).toString('utf8') };
+}
+
+module.exports = {
+    mlkemKeypairFromSeed,
+    buildRecipient,
+    xwingCombiner,
+    splitDecapsulate,
+    ctXOf,
+    xwingEncapsHost,
+    deriveLabelTag,
+    encodeRecipient,
+    decodeRecipient,
+    encodeIdentity,
+    decodeIdentity,
+    XWING_LABEL,
+    MLKEM_PK,
+    MLKEM_CT,
+    XWING_PK,
+    XWING_CT,
+    SEED,
+};
+
+/* WEBPACK VAR INJECTION */}.call(this, __webpack_require__(/*! ./../../../node_modules/node-libs-browser/node_modules/buffer/index.js */ "./node_modules/node-libs-browser/node_modules/buffer/index.js").Buffer))
+
+/***/ }),
+
+/***/ "./src/onlykey-fido2/onlykey/vendor/@noble/ciphers/_arx.js":
+/*!*****************************************************************!*\
+  !*** ./src/onlykey-fido2/onlykey/vendor/@noble/ciphers/_arx.js ***!
+  \*****************************************************************/
+/*! exports provided: rotl, createCipher, _XorStreamPRG, createPRG */
+/***/ (function(module, __webpack_exports__, __webpack_require__) {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "rotl", function() { return rotl; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "createCipher", function() { return createCipher; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "_XorStreamPRG", function() { return _XorStreamPRG; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "createPRG", function() { return createPRG; });
+/* harmony import */ var _utils_js__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! ./utils.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/ciphers/utils.js");
+function _defineProperty(e, r, t) { return (r = _toPropertyKey(r)) in e ? Object.defineProperty(e, r, { value: t, enumerable: !0, configurable: !0, writable: !0 }) : e[r] = t, e; }
+function _toPropertyKey(t) { var i = _toPrimitive(t, "string"); return "symbol" == typeof i ? i : i + ""; }
+function _toPrimitive(t, r) { if ("object" != typeof t || !t) return t; var e = t[Symbol.toPrimitive]; if (void 0 !== e) { var i = e.call(t, r || "default"); if ("object" != typeof i) return i; throw new TypeError("@@toPrimitive must return a primitive value."); } return ("string" === r ? String : Number)(t); }
+/**
+ * Basic utils for ARX (add-rotate-xor) salsa and chacha ciphers.
+
+RFC8439 requires multi-step cipher stream, where
+authKey starts with counter: 0, actual msg with counter: 1.
+
+For this, we need a way to re-use nonce / counter:
+
+    const counter = new Uint8Array(4);
+    chacha(..., counter, ...); // counter is now 1
+    chacha(..., counter, ...); // counter is now 2
+
+This is complicated:
+
+- 32-bit counters are enough, no need for 64-bit: max ArrayBuffer size in JS is 4GB
+- Original papers don't allow mutating counters
+- Counter overflow is undefined [^1]
+- Idea A: allow providing (nonce | counter) instead of just nonce, re-use it
+- Caveat: Cannot be re-used through all cases:
+- * chacha has (counter | nonce)
+- * xchacha has (nonce16 | counter | nonce16)
+- Idea B: separate nonce / counter and provide separate API for counter re-use
+- Caveat: there are different counter sizes depending on an algorithm.
+- salsa & chacha also differ in structures of key & sigma:
+  salsa20:      s[0] | k(4) | s[1] | nonce(2) | cnt(2) | s[2] | k(4) | s[3]
+  chacha:       s(4) | k(8) | cnt(1) | nonce(3)
+  chacha20orig: s(4) | k(8) | cnt(2) | nonce(2)
+- Idea C: helper method such as `setSalsaState(key, nonce, sigma, data)`
+- Caveat: we can't re-use counter array
+
+xchacha uses the subkey and remaining 8 byte nonce with ChaCha20 as normal
+(prefixed by 4 NUL bytes, since RFC8439 specifies a 12-byte nonce).
+Counter overflow is undefined; see {@link https://mailarchive.ietf.org/arch/msg/cfrg/gsOnTJzcbgG6OqD8Sc0GO5aR_tU/ | the CFRG thread}.
+Current noble policy is strict non-wrap for the shared 32-bit counter path:
+exported ARX ciphers reject initial `0xffffffff` and stop before any implicit
+wrap back to zero.
+See {@link https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-xchacha#appendix-A.2 | the XChaCha appendix} for the extended-nonce construction.
+
+ * @module
+ */
+
+// Replaces `TextEncoder` for ASCII literals, which is enough for sigma constants.
+// Non-ASCII input would not match UTF-8 `TextEncoder` output.
+var encodeStr = str => Uint8Array.from(str.split(''), c => c.charCodeAt(0));
+// Raw `createCipher(...)` exports consume these native-endian `u32(...)` views directly.
+// Public `wrapCipher(...)` APIs reject non-little-endian platforms before reaching this path.
+// RFC 8439 §2.3 / RFC 7539 §2.3 only define the 256-bit-key constants; this 16-byte sigma is
+// kept for legacy allowShortKeys Salsa/ChaCha variants.
+var sigma16_32 = /* @__PURE__ */(() => Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["swap32IfBE"])(Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["u32"])(encodeStr('expand 16-byte k'))))();
+// RFC 8439 §2.3 / RFC 7539 §2.3 define words 0-3 as
+// `0x61707865 0x3320646e 0x79622d32 0x6b206574`, i.e. `expand 32-byte k`.
+var sigma32_32 = /* @__PURE__ */(() => Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["swap32IfBE"])(Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["u32"])(encodeStr('expand 32-byte k'))))();
+/**
+ * Rotates a 32-bit word left.
+ * @param a - Input word.
+ * @param b - Rotation count in bits.
+ * @returns Rotated 32-bit word.
+ * @example
+ * Moves the top byte of `0x12345678` into the low byte position.
+ * ```ts
+ * rotl(0x12345678, 8);
+ * ```
+ */
+function rotl(a, b) {
+  return a << b | a >>> 32 - b;
+}
+// Salsa and Chacha block length is always 512-bit
+var BLOCK_LEN = 64;
+// RFC 8439 §2.2 / RFC 7539 §2.2: the ChaCha state has 16 32-bit words.
+var BLOCK_LEN32 = 16;
+// Counter policy for the shared public `counter` argument:
+// - RFC/IETF ChaCha20 uses a 32-bit counter.
+// - OpenSSL/Node `chacha20` instead treat the full 16-byte IV as a 128-bit
+//   counter state and carry into the next word.
+// - Raw `chacha20orig`, `salsa20`, `xsalsa20`, and `xchacha20` use 64-bit counters in libsodium
+//   and libtomcrypt, while some libs (for example libtomcrypt's RFC/IETF path) reject the max
+//   boundary instead of carrying.
+// - AEAD wrappers diverge too: libsodium `xchacha20poly1305` uses the IETF payload counter from
+//   block 1, while `secretstream_xchacha20poly1305` is a different protocol with rekey/reset.
+// Noble intentionally throws instead of silently picking one wrap model for users. In the default
+// path, even a 32-bit boundary would take 2^32 blocks * 64 bytes = 256 GiB, which is practically
+// unreachable for normal JS callers; advanced users who pass `counter` explicitly can implement
+// whatever wider carry / wrap policy they need on top.
+var MAX_COUNTER = /* @__PURE__ */(() => 2 ** 32 - 1)();
+var U32_EMPTY = /* @__PURE__ */Uint32Array.of();
+function runCipher(core, sigma, key, nonce, data, output, counter, rounds) {
+  var len = data.length;
+  var block = new Uint8Array(BLOCK_LEN);
+  var b32 = Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["u32"])(block);
+  // Make sure that buffers aligned to 4 bytes
+  var isAligned = _utils_js__WEBPACK_IMPORTED_MODULE_0__["isLE"] && Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["isAligned32"])(data) && Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["isAligned32"])(output);
+  var d32 = isAligned ? Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["u32"])(data) : U32_EMPTY;
+  var o32 = isAligned ? Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["u32"])(output) : U32_EMPTY;
+  // RFC 8439 §2.4.1 / RFC 7539 §2.4.1 allow XORing one keystream block at a time and
+  // truncating the final partial block instead of materializing the whole keystream.
+  if (!_utils_js__WEBPACK_IMPORTED_MODULE_0__["isLE"]) {
+    for (var pos = 0; pos < len; counter++) {
+      core(sigma, key, nonce, b32, counter, rounds);
+      // RFC 8439 §2.4 / RFC 7539 §2.4 serialize keystream words in little-endian order.
+      Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["swap32IfBE"])(b32);
+      if (counter >= MAX_COUNTER) throw new Error('arx: counter overflow');
+      var take = Math.min(BLOCK_LEN, len - pos);
+      for (var j = 0, posj; j < take; j++) {
+        posj = pos + j;
+        output[posj] = data[posj] ^ block[j];
+      }
+      pos += take;
+    }
+    return;
+  }
+  for (var _pos = 0; _pos < len; counter++) {
+    core(sigma, key, nonce, b32, counter, rounds);
+    // See MAX_COUNTER policy note above: never silently wrap the shared public counter.
+    if (counter >= MAX_COUNTER) throw new Error('arx: counter overflow');
+    var _take = Math.min(BLOCK_LEN, len - _pos);
+    // aligned to 4 bytes
+    if (isAligned && _take === BLOCK_LEN) {
+      var pos32 = _pos / 4;
+      if (_pos % 4 !== 0) throw new Error('arx: invalid block position');
+      for (var _j = 0, _posj; _j < BLOCK_LEN32; _j++) {
+        _posj = pos32 + _j;
+        o32[_posj] = d32[_posj] ^ b32[_j];
+      }
+      _pos += BLOCK_LEN;
+      continue;
+    }
+    for (var _j2 = 0, _posj2; _j2 < _take; _j2++) {
+      _posj2 = _pos + _j2;
+      output[_posj2] = data[_posj2] ^ block[_j2];
+    }
+    _pos += _take;
+  }
+}
+/**
+ * Creates an ARX stream cipher from a 32-bit core permutation.
+ * Used internally to build the exported Salsa and ChaCha stream ciphers.
+ * @param core - Core function that fills one keystream block.
+ * @param opts - Cipher layout and nonce-extension options. See {@link CipherOpts}.
+ * @returns Stream cipher function over byte arrays.
+ * @throws If the core callback, key size, counter, or output sizing is invalid. {@link Error}
+ */
+function createCipher(core, opts) {
+  var _checkOpts = Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["checkOpts"])({
+      allowShortKeys: false,
+      counterLength: 8,
+      counterRight: false,
+      rounds: 20
+    }, opts),
+    allowShortKeys = _checkOpts.allowShortKeys,
+    extendNonceFn = _checkOpts.extendNonceFn,
+    counterLength = _checkOpts.counterLength,
+    counterRight = _checkOpts.counterRight,
+    rounds = _checkOpts.rounds;
+  if (typeof core !== 'function') throw new Error('core must be a function');
+  Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["anumber"])(counterLength);
+  Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["anumber"])(rounds);
+  Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abool"])(counterRight);
+  Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abool"])(allowShortKeys);
+  return function (key, nonce, data, output) {
+    var counter = arguments.length > 4 && arguments[4] !== undefined ? arguments[4] : 0;
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(key, undefined, 'key');
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(nonce, undefined, 'nonce');
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(data, undefined, 'data');
+    var len = data.length;
+    // Raw XorStream APIs return ciphertext/plaintext bytes directly, so caller-provided outputs
+    // must match the logical result length exactly instead of returning an oversized workspace.
+    output = Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["getOutput"])(len, output, false);
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["anumber"])(counter);
+    // See MAX_COUNTER policy note above: reject advanced explicit-counter requests before any wrap.
+    if (counter < 0 || counter >= MAX_COUNTER) throw new Error('arx: counter overflow');
+    var toClean = [];
+    // Key & sigma
+    // key=16 -> sigma16, k=key|key
+    // key=32 -> sigma32, k=key
+    var l = key.length;
+    var k;
+    var sigma;
+    if (l === 32) {
+      // Copy caller keys too: big-endian normalization, extended-nonce subkey derivation, and
+      // final clean(...) all mutate or wipe the temporary buffer in place.
+      toClean.push(k = Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["copyBytes"])(key));
+      sigma = sigma32_32;
+    } else if (l === 16 && allowShortKeys) {
+      k = new Uint8Array(32);
+      k.set(key);
+      k.set(key, 16);
+      sigma = sigma16_32;
+      toClean.push(k);
+    } else {
+      Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(key, 32, 'arx key');
+      throw new Error('invalid key size');
+      // throw new Error(`"arx key" expected Uint8Array of length 32, got length=${l}`);
+    }
+    // Nonce
+    // salsa20:      8   (8-byte counter)
+    // chacha20orig: 8   (8-byte counter)
+    // chacha20:     12  (4-byte counter)
+    // xsalsa20:     24  (16 -> hsalsa,  8 -> old nonce)
+    // xchacha20:    24  (16 -> hchacha, 8 -> old nonce)
+    // Copy before taking u32(...) views on misaligned inputs, and on big-endian so later
+    // swap32IfBE(...) never mutates caller nonce bytes in place.
+    if (!_utils_js__WEBPACK_IMPORTED_MODULE_0__["isLE"] || !Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["isAligned32"])(nonce)) toClean.push(nonce = Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["copyBytes"])(nonce));
+    var k32 = Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["u32"])(k);
+    // hsalsa & hchacha: handle extended nonce
+    if (extendNonceFn) {
+      if (nonce.length !== 24) throw new Error("arx: extended nonce must be 24 bytes");
+      var n16 = nonce.subarray(0, 16);
+      if (_utils_js__WEBPACK_IMPORTED_MODULE_0__["isLE"]) extendNonceFn(sigma, k32, Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["u32"])(n16), k32);else {
+        var sigmaRaw = Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["swap32IfBE"])(Uint32Array.from(sigma));
+        extendNonceFn(sigmaRaw, k32, Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["u32"])(n16), k32);
+        Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["clean"])(sigmaRaw);
+        Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["swap32IfBE"])(k32);
+      }
+      nonce = nonce.subarray(16);
+    } else if (!_utils_js__WEBPACK_IMPORTED_MODULE_0__["isLE"]) Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["swap32IfBE"])(k32);
+    // Handle nonce counter
+    var nonceNcLen = 16 - counterLength;
+    if (nonceNcLen !== nonce.length) throw new Error("arx: nonce must be ".concat(nonceNcLen, " or 16 bytes"));
+    // Normalize 64-bit-nonce layouts to the 12-byte core input: ChaCha/XChaCha prefix 4 zero
+    // counter bytes, while Salsa/XSalsa append them after the nonce words.
+    if (nonceNcLen !== 12) {
+      var nc = new Uint8Array(12);
+      nc.set(nonce, counterRight ? 0 : 12 - nonce.length);
+      nonce = nc;
+      toClean.push(nonce);
+    }
+    var n32 = Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["swap32IfBE"])(Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["u32"])(nonce));
+    // Ensure temporary key/nonce copies are wiped even if the remaining
+    // runtime guard in runCipher(...) throws on counter overflow.
+    try {
+      runCipher(core, sigma, k32, n32, data, output, counter, rounds);
+      return output;
+    } finally {
+      Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["clean"])(...toClean);
+    }
+  };
+}
+/** Internal class which wraps chacha20 or chacha8 to create CSPRNG. */
+class _XorStreamPRG {
+  constructor(cipher, blockLen, keyLen, nonceLen, seed) {
+    _defineProperty(this, "blockLen", void 0);
+    _defineProperty(this, "keyLen", void 0);
+    _defineProperty(this, "nonceLen", void 0);
+    _defineProperty(this, "state", void 0);
+    _defineProperty(this, "buf", void 0);
+    _defineProperty(this, "key", void 0);
+    _defineProperty(this, "nonce", void 0);
+    _defineProperty(this, "pos", void 0);
+    _defineProperty(this, "ctr", void 0);
+    _defineProperty(this, "cipher", void 0);
+    this.cipher = cipher;
+    this.blockLen = blockLen;
+    this.keyLen = keyLen;
+    this.nonceLen = nonceLen;
+    this.state = new Uint8Array(this.keyLen + this.nonceLen);
+    this.reseed(seed);
+    this.ctr = 0;
+    this.pos = this.blockLen;
+    this.buf = new Uint8Array(this.blockLen);
+    // Keep a single key||nonce backing buffer so reseed/addEntropy/clean update the live cipher
+    // inputs in place through these subarray views.
+    this.key = this.state.subarray(0, this.keyLen);
+    this.nonce = this.state.subarray(this.keyLen);
+  }
+  reseed(seed) {
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(seed);
+    if (!seed || seed.length === 0) throw new Error('entropy required');
+    // Mix variable-length entropy cyclically across the whole key||nonce state, then restart the
+    // keystream so buffered leftovers from the previous state are never reused.
+    for (var i = 0; i < seed.length; i++) this.state[i % this.state.length] ^= seed[i];
+    this.ctr = 0;
+    this.pos = this.blockLen;
+  }
+  addEntropy(seed) {
+    // Reject empty entropy before re-keying, otherwise a throwing call would still advance state.
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(seed);
+    if (seed.length === 0) throw new Error('entropy required');
+    // Re-key from the current stream first, then mix external entropy into the fresh key||nonce
+    // state through reseed() so stale buffered bytes are discarded.
+    this.state.set(this.randomBytes(this.state.length));
+    this.reseed(seed);
+  }
+  randomBytes(len) {
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["anumber"])(len);
+    if (len === 0) return new Uint8Array(0);
+    var avail = this.pos < this.blockLen ? this.blockLen - this.pos : 0;
+    var blocks = Math.ceil(Math.max(0, len - avail) / this.blockLen);
+    // Preflight overflow so failed reads don't partially consume keystream
+    // and leave the PRG repeating blocks.
+    if (blocks > 0 && this.ctr > MAX_COUNTER - blocks) throw new Error('arx: counter overflow');
+    var out = new Uint8Array(len);
+    var outPos = 0;
+    // `out` starts zero-filled, and `buf.fill(0)` below does the same for leftovers: XOR-stream
+    // ciphers then emit raw keystream bytes directly into those buffers.
+    // Serve buffered leftovers first so split reads stay identical to one larger read.
+    if (this.pos < this.blockLen) {
+      var take = Math.min(len, this.blockLen - this.pos);
+      out.set(this.buf.subarray(this.pos, this.pos + take), 0);
+      this.pos += take;
+      outPos += take;
+      if (outPos === len) return out; // fast path
+    }
+    // Full blocks directly to out
+    var full = Math.floor((len - outPos) / this.blockLen);
+    if (full > 0) {
+      var blockBytes = full * this.blockLen;
+      var b = out.subarray(outPos, outPos + blockBytes);
+      this.cipher(this.key, this.nonce, b, b, this.ctr);
+      this.ctr += full;
+      outPos += blockBytes;
+    }
+    // Save leftovers
+    var left = len - outPos;
+    if (left > 0) {
+      this.buf.fill(0);
+      // NOTE: cipher will handle overflow
+      this.cipher(this.key, this.nonce, this.buf, this.buf, this.ctr++);
+      out.set(this.buf.subarray(0, left), outPos);
+      this.pos = left;
+    }
+    return out;
+  }
+  // Clone seeds the new instance from this stream, so the source PRG advances too.
+  clone() {
+    return new _XorStreamPRG(this.cipher, this.blockLen, this.keyLen, this.nonceLen, this.randomBytes(this.state.length));
+  }
+  // Zeroes the current state and leftover buffer, but does not make the instance unusable:
+  // Later reads first drain zeros from the cleared buffer and then continue
+  // from zero key||nonce state.
+  clean() {
+    this.pos = 0;
+    this.ctr = 0;
+    this.buf.fill(0);
+    this.state.fill(0);
+  }
+}
+/**
+ * Creates a PRG constructor from a stream cipher.
+ * @param cipher - Stream cipher used to fill output blocks.
+ * @param blockLen - Keystream block length in bytes.
+ * @param keyLen - Internal key length in bytes.
+ * @param nonceLen - Internal nonce length in bytes.
+ * @returns PRG factory for seeded concrete `_XorStreamPRG` instances.
+ * @example
+ * Builds a PRG from XChaCha20 and reads bytes from a randomly seeded instance.
+ * ```ts
+ * import { xchacha20 } from '@noble/ciphers/chacha.js';
+ * import { createPRG } from '@noble/ciphers/_arx.js';
+ * import { randomBytes } from '@noble/ciphers/utils.js';
+ * const seed = randomBytes(32);
+ * const init = createPRG(xchacha20, 64, 32, 24);
+ * const prg = init(seed);
+ * prg.randomBytes(8);
+ * ```
+ */
+var createPRG = (cipher, blockLen, keyLen, nonceLen) => {
+  return function () {
+    var seed = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["randomBytes"])(32);
+    return new _XorStreamPRG(cipher, blockLen, keyLen, nonceLen, seed);
+  };
+};
+
+/***/ }),
+
+/***/ "./src/onlykey-fido2/onlykey/vendor/@noble/ciphers/_poly1305.js":
+/*!**********************************************************************!*\
+  !*** ./src/onlykey-fido2/onlykey/vendor/@noble/ciphers/_poly1305.js ***!
+  \**********************************************************************/
+/*! exports provided: Poly1305, poly1305 */
+/***/ (function(module, __webpack_exports__, __webpack_require__) {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "Poly1305", function() { return Poly1305; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "poly1305", function() { return poly1305; });
+/* harmony import */ var _utils_js__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! ./utils.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/ciphers/utils.js");
+function _defineProperty(e, r, t) { return (r = _toPropertyKey(r)) in e ? Object.defineProperty(e, r, { value: t, enumerable: !0, configurable: !0, writable: !0 }) : e[r] = t, e; }
+function _toPropertyKey(t) { var i = _toPrimitive(t, "string"); return "symbol" == typeof i ? i : i + ""; }
+function _toPrimitive(t, r) { if ("object" != typeof t || !t) return t; var e = t[Symbol.toPrimitive]; if (void 0 !== e) { var i = e.call(t, r || "default"); if ("object" != typeof i) return i; throw new TypeError("@@toPrimitive must return a primitive value."); } return ("string" === r ? String : Number)(t); }
+/**
+ * Poly1305 ({@link https://cr.yp.to/mac/poly1305-20050329.pdf | PDF},
+ * {@link https://en.wikipedia.org/wiki/Poly1305 | wiki})
+ * is a fast and parallel secret-key message-authentication code suitable for
+ * a wide variety of applications. It was standardized in
+ * {@link https://www.rfc-editor.org/rfc/rfc8439 | RFC 8439} and is now used in TLS 1.3.
+ *
+ * Polynomial MACs are not perfect for every situation:
+ * they lack Random Key Robustness: the MAC can be forged, and can't be used in PAKE schemes.
+ * See {@link https://keymaterial.net/2020/09/07/invisible-salamanders-in-aes-gcm-siv/ | the invisible salamanders attack writeup}.
+ * To combat invisible salamanders, `hash(key)` can be included in ciphertext,
+ * however, this would violate ciphertext indistinguishability:
+ * an attacker would know which key was used - so `HKDF(key, i)`
+ * could be used instead.
+ *
+ * Check out the {@link https://cr.yp.to/mac.html | original website}.
+ * Based on public-domain {@link https://github.com/floodyberry/poly1305-donna | poly1305-donna}.
+ * @module
+ */
+// prettier-ignore
+
+// Little-endian 2-byte load used by the Poly1305 limb decomposition.
+function u8to16(a, i) {
+  return a[i++] & 0xff | (a[i++] & 0xff) << 8;
+}
+function bytesToNumberLE(bytes) {
+  return Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["hexToNumber"])(Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["bytesToHex"])(Uint8Array.from(bytes).reverse()));
+}
+/** Small version of `poly1305` without loop unrolling. Unused, provided for auditability. */
+function poly1305_small(msg, key) {
+  Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(msg);
+  Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(key, 32, 'key');
+  var POW_2_130_5 = BigInt(2) ** BigInt(130) - BigInt(5); // 2^130-5
+  var POW_2_128_1 = BigInt(2) ** BigInt(128) - BigInt(1); // 2^128-1
+  var CLAMP_R = BigInt('0x0ffffffc0ffffffc0ffffffc0fffffff');
+  var r = bytesToNumberLE(key.subarray(0, 16)) & CLAMP_R;
+  var s = bytesToNumberLE(key.subarray(16));
+  // Process by 16 byte chunks
+  var acc = BigInt(0);
+  for (var i = 0; i < msg.length; i += 16) {
+    var m = msg.subarray(i, i + 16);
+    // RFC 8439 §2.5.1 / RFC 7539 §2.5.1 append [0x01] to each chunk before multiplying by r.
+    var n = bytesToNumberLE(m) | BigInt(1) << BigInt(8 * m.length);
+    acc = (acc + n) * r % POW_2_130_5;
+  }
+  var res = acc + s & POW_2_128_1;
+  // RFC 8439 §2.5 / RFC 7539 §2.5 serialize the low 128 bits in little-endian order.
+  return Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["numberToBytesBE"])(res, 16).reverse(); // LE
+}
+// Can be used to replace `computeTag` in chacha.ts. Unused, provided for auditability.
+// @ts-expect-error
+function poly1305_computeTag_small(authKey,
+// AEAD trailer must already be the 16-byte length block:
+// 8-byte little-endian AAD length || 8-byte little-endian ciphertext length.
+lengths, ciphertext, AAD) {
+  // RFC 8439 §2.8.1 / RFC 7539 §2.8.1 MAC input is
+  // AAD || pad16(AAD) || ciphertext || pad16(ciphertext) || lengths.
+  var res = [];
+  var updatePadded2 = msg => {
+    res.push(msg);
+    var leftover = msg.length % 16;
+    // RFC 8439 §2.8.1 / RFC 7539 §2.8.1: pad16(x) is empty for aligned
+    // inputs, else 16-(len%16) zero bytes.
+    if (leftover) res.push(new Uint8Array(16).slice(leftover));
+  };
+  if (AAD) updatePadded2(AAD);
+  updatePadded2(ciphertext);
+  res.push(lengths);
+  return poly1305_small(Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["concatBytes"])(...res), authKey);
+}
+/**
+ * Incremental Poly1305 MAC state.
+ * Prefer `poly1305()` for one-shot use.
+ * @param key - 32-byte Poly1305 one-time key.
+ * @example
+ * Feeds one chunk into an incremental Poly1305 state with a fresh one-time key.
+ *
+ * ```ts
+ * import { Poly1305 } from '@noble/ciphers/_poly1305.js';
+ * import { randomBytes } from '@noble/ciphers/utils.js';
+ * const key = randomBytes(32);
+ * const mac = new Poly1305(key);
+ * mac.update(new Uint8Array([1, 2, 3]));
+ * mac.digest();
+ * ```
+ */
+class Poly1305 {
+  // Can be speed-up using BigUint64Array, at the cost of complexity
+  constructor(key) {
+    _defineProperty(this, "blockLen", 16);
+    _defineProperty(this, "outputLen", 16);
+    _defineProperty(this, "buffer", new Uint8Array(16));
+    _defineProperty(this, "r", new Uint16Array(10));
+    // Allocating 1 array with .subarray() here is slower than 3
+    _defineProperty(this, "h", new Uint16Array(10));
+    _defineProperty(this, "pad", new Uint16Array(8));
+    _defineProperty(this, "pos", 0);
+    _defineProperty(this, "finished", false);
+    _defineProperty(this, "destroyed", false);
+    key = Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["copyBytes"])(Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(key, 32, 'key'));
+    var t0 = u8to16(key, 0);
+    var t1 = u8to16(key, 2);
+    var t2 = u8to16(key, 4);
+    var t3 = u8to16(key, 6);
+    var t4 = u8to16(key, 8);
+    var t5 = u8to16(key, 10);
+    var t6 = u8to16(key, 12);
+    var t7 = u8to16(key, 14);
+    // RFC 8439 §2.5.1 / RFC 7539 §2.5.1 clamp r before multiplication.
+    // These masks unpack that clamped value into 13-bit limbs, while pad
+    // keeps the raw s half for finalize().
+    // {@link https://github.com/floodyberry/poly1305-donna/blob/e6ad6e091d30d7f4ec2d4f978be1fcfcbce72781/poly1305-donna-16.h#L47 | poly1305-donna reference}
+    this.r[0] = t0 & 0x1fff;
+    this.r[1] = (t0 >>> 13 | t1 << 3) & 0x1fff;
+    this.r[2] = (t1 >>> 10 | t2 << 6) & 0x1f03;
+    this.r[3] = (t2 >>> 7 | t3 << 9) & 0x1fff;
+    this.r[4] = (t3 >>> 4 | t4 << 12) & 0x00ff;
+    this.r[5] = t4 >>> 1 & 0x1ffe;
+    this.r[6] = (t4 >>> 14 | t5 << 2) & 0x1fff;
+    this.r[7] = (t5 >>> 11 | t6 << 5) & 0x1f81;
+    this.r[8] = (t6 >>> 8 | t7 << 8) & 0x1fff;
+    this.r[9] = t7 >>> 5 & 0x007f;
+    for (var i = 0; i < 8; i++) this.pad[i] = u8to16(key, 16 + 2 * i);
+  }
+  process(data, offset) {
+    var isLast = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : false;
+    // RFC 8439 §2.5 / §2.5.1 and RFC 7539 §2.5 / §2.5.1 add an extra high
+    // bit to every full 16-byte block. The final partial block gets its
+    // explicit `1` byte during digestInto(), so `hibit` stays zero there.
+    var hibit = isLast ? 0 : 1 << 11;
+    var h = this.h,
+      r = this.r;
+    var r0 = r[0];
+    var r1 = r[1];
+    var r2 = r[2];
+    var r3 = r[3];
+    var r4 = r[4];
+    var r5 = r[5];
+    var r6 = r[6];
+    var r7 = r[7];
+    var r8 = r[8];
+    var r9 = r[9];
+    var t0 = u8to16(data, offset + 0);
+    var t1 = u8to16(data, offset + 2);
+    var t2 = u8to16(data, offset + 4);
+    var t3 = u8to16(data, offset + 6);
+    var t4 = u8to16(data, offset + 8);
+    var t5 = u8to16(data, offset + 10);
+    var t6 = u8to16(data, offset + 12);
+    var t7 = u8to16(data, offset + 14);
+    var h0 = h[0] + (t0 & 0x1fff);
+    var h1 = h[1] + ((t0 >>> 13 | t1 << 3) & 0x1fff);
+    var h2 = h[2] + ((t1 >>> 10 | t2 << 6) & 0x1fff);
+    var h3 = h[3] + ((t2 >>> 7 | t3 << 9) & 0x1fff);
+    var h4 = h[4] + ((t3 >>> 4 | t4 << 12) & 0x1fff);
+    var h5 = h[5] + (t4 >>> 1 & 0x1fff);
+    var h6 = h[6] + ((t4 >>> 14 | t5 << 2) & 0x1fff);
+    var h7 = h[7] + ((t5 >>> 11 | t6 << 5) & 0x1fff);
+    var h8 = h[8] + ((t6 >>> 8 | t7 << 8) & 0x1fff);
+    var h9 = h[9] + (t7 >>> 5 | hibit);
+    var c = 0;
+    var d0 = c + h0 * r0 + h1 * (5 * r9) + h2 * (5 * r8) + h3 * (5 * r7) + h4 * (5 * r6);
+    c = d0 >>> 13;
+    d0 &= 0x1fff;
+    d0 += h5 * (5 * r5) + h6 * (5 * r4) + h7 * (5 * r3) + h8 * (5 * r2) + h9 * (5 * r1);
+    c += d0 >>> 13;
+    d0 &= 0x1fff;
+    var d1 = c + h0 * r1 + h1 * r0 + h2 * (5 * r9) + h3 * (5 * r8) + h4 * (5 * r7);
+    c = d1 >>> 13;
+    d1 &= 0x1fff;
+    d1 += h5 * (5 * r6) + h6 * (5 * r5) + h7 * (5 * r4) + h8 * (5 * r3) + h9 * (5 * r2);
+    c += d1 >>> 13;
+    d1 &= 0x1fff;
+    var d2 = c + h0 * r2 + h1 * r1 + h2 * r0 + h3 * (5 * r9) + h4 * (5 * r8);
+    c = d2 >>> 13;
+    d2 &= 0x1fff;
+    d2 += h5 * (5 * r7) + h6 * (5 * r6) + h7 * (5 * r5) + h8 * (5 * r4) + h9 * (5 * r3);
+    c += d2 >>> 13;
+    d2 &= 0x1fff;
+    var d3 = c + h0 * r3 + h1 * r2 + h2 * r1 + h3 * r0 + h4 * (5 * r9);
+    c = d3 >>> 13;
+    d3 &= 0x1fff;
+    d3 += h5 * (5 * r8) + h6 * (5 * r7) + h7 * (5 * r6) + h8 * (5 * r5) + h9 * (5 * r4);
+    c += d3 >>> 13;
+    d3 &= 0x1fff;
+    var d4 = c + h0 * r4 + h1 * r3 + h2 * r2 + h3 * r1 + h4 * r0;
+    c = d4 >>> 13;
+    d4 &= 0x1fff;
+    d4 += h5 * (5 * r9) + h6 * (5 * r8) + h7 * (5 * r7) + h8 * (5 * r6) + h9 * (5 * r5);
+    c += d4 >>> 13;
+    d4 &= 0x1fff;
+    var d5 = c + h0 * r5 + h1 * r4 + h2 * r3 + h3 * r2 + h4 * r1;
+    c = d5 >>> 13;
+    d5 &= 0x1fff;
+    d5 += h5 * r0 + h6 * (5 * r9) + h7 * (5 * r8) + h8 * (5 * r7) + h9 * (5 * r6);
+    c += d5 >>> 13;
+    d5 &= 0x1fff;
+    var d6 = c + h0 * r6 + h1 * r5 + h2 * r4 + h3 * r3 + h4 * r2;
+    c = d6 >>> 13;
+    d6 &= 0x1fff;
+    d6 += h5 * r1 + h6 * r0 + h7 * (5 * r9) + h8 * (5 * r8) + h9 * (5 * r7);
+    c += d6 >>> 13;
+    d6 &= 0x1fff;
+    var d7 = c + h0 * r7 + h1 * r6 + h2 * r5 + h3 * r4 + h4 * r3;
+    c = d7 >>> 13;
+    d7 &= 0x1fff;
+    d7 += h5 * r2 + h6 * r1 + h7 * r0 + h8 * (5 * r9) + h9 * (5 * r8);
+    c += d7 >>> 13;
+    d7 &= 0x1fff;
+    var d8 = c + h0 * r8 + h1 * r7 + h2 * r6 + h3 * r5 + h4 * r4;
+    c = d8 >>> 13;
+    d8 &= 0x1fff;
+    d8 += h5 * r3 + h6 * r2 + h7 * r1 + h8 * r0 + h9 * (5 * r9);
+    c += d8 >>> 13;
+    d8 &= 0x1fff;
+    var d9 = c + h0 * r9 + h1 * r8 + h2 * r7 + h3 * r6 + h4 * r5;
+    c = d9 >>> 13;
+    d9 &= 0x1fff;
+    d9 += h5 * r4 + h6 * r3 + h7 * r2 + h8 * r1 + h9 * r0;
+    c += d9 >>> 13;
+    d9 &= 0x1fff;
+    c = (c << 2) + c | 0;
+    c = c + d0 | 0;
+    d0 = c & 0x1fff;
+    c = c >>> 13;
+    d1 += c;
+    h[0] = d0;
+    h[1] = d1;
+    h[2] = d2;
+    h[3] = d3;
+    h[4] = d4;
+    h[5] = d5;
+    h[6] = d6;
+    h[7] = d7;
+    h[8] = d8;
+    h[9] = d9;
+  }
+  finalize() {
+    var h = this.h,
+      pad = this.pad;
+    var g = new Uint16Array(10);
+    var c = h[1] >>> 13;
+    h[1] &= 0x1fff;
+    for (var i = 2; i < 10; i++) {
+      h[i] += c;
+      c = h[i] >>> 13;
+      h[i] &= 0x1fff;
+    }
+    h[0] += c * 5;
+    c = h[0] >>> 13;
+    h[0] &= 0x1fff;
+    h[1] += c;
+    c = h[1] >>> 13;
+    h[1] &= 0x1fff;
+    h[2] += c;
+    // RFC 8439 §2.5 / RFC 7539 §2.5 reduce modulo 2^130-5 before repacking
+    // to 16-bit words and adding the raw s half.
+    g[0] = h[0] + 5;
+    c = g[0] >>> 13;
+    g[0] &= 0x1fff;
+    for (var _i = 1; _i < 10; _i++) {
+      g[_i] = h[_i] + c;
+      c = g[_i] >>> 13;
+      g[_i] &= 0x1fff;
+    }
+    g[9] -= 1 << 13;
+    var mask = (c ^ 1) - 1;
+    for (var _i2 = 0; _i2 < 10; _i2++) g[_i2] &= mask;
+    mask = ~mask;
+    for (var _i3 = 0; _i3 < 10; _i3++) h[_i3] = h[_i3] & mask | g[_i3];
+    h[0] = (h[0] | h[1] << 13) & 0xffff;
+    h[1] = (h[1] >>> 3 | h[2] << 10) & 0xffff;
+    h[2] = (h[2] >>> 6 | h[3] << 7) & 0xffff;
+    h[3] = (h[3] >>> 9 | h[4] << 4) & 0xffff;
+    h[4] = (h[4] >>> 12 | h[5] << 1 | h[6] << 14) & 0xffff;
+    h[5] = (h[6] >>> 2 | h[7] << 11) & 0xffff;
+    h[6] = (h[7] >>> 5 | h[8] << 8) & 0xffff;
+    h[7] = (h[8] >>> 8 | h[9] << 5) & 0xffff;
+    var f = h[0] + pad[0];
+    h[0] = f & 0xffff;
+    for (var _i4 = 1; _i4 < 8; _i4++) {
+      f = (h[_i4] + pad[_i4] | 0) + (f >>> 16) | 0;
+      h[_i4] = f & 0xffff;
+    }
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["clean"])(g);
+  }
+  update(data) {
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["aexists"])(this);
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(data);
+    data = Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["copyBytes"])(data);
+    var buffer = this.buffer,
+      blockLen = this.blockLen;
+    var len = data.length;
+    for (var pos = 0; pos < len;) {
+      var take = Math.min(blockLen - this.pos, len - pos);
+      // Fast path: we have at least one block in input
+      if (take === blockLen) {
+        for (; blockLen <= len - pos; pos += blockLen) this.process(data, pos);
+        continue;
+      }
+      buffer.set(data.subarray(pos, pos + take), this.pos);
+      this.pos += take;
+      pos += take;
+      if (this.pos === blockLen) {
+        this.process(buffer, 0, false);
+        this.pos = 0;
+      }
+    }
+    return this;
+  }
+  destroy() {
+    // `aexists(this)` guards update/digest paths, so destroy must mark the instance unusable too.
+    this.destroyed = true;
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["clean"])(this.h, this.r, this.buffer, this.pad);
+  }
+  digestInto(out) {
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["aexists"])(this);
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["aoutput"])(out, this);
+    this.finished = true;
+    var buffer = this.buffer,
+      h = this.h;
+    var pos = this.pos;
+    if (pos) {
+      // RFC 8439 §2.5 / RFC 7539 §2.5: the final short block appends a
+      // single `0x01` byte and zero-fills the remaining bytes before the
+      // last multiplication step.
+      buffer[pos++] = 1;
+      for (; pos < 16; pos++) buffer[pos] = 0;
+      this.process(buffer, 0, true);
+    }
+    this.finalize();
+    var opos = 0;
+    for (var i = 0; i < 8; i++) {
+      out[opos++] = h[i] >>> 0;
+      out[opos++] = h[i] >>> 8;
+    }
+  }
+  digest() {
+    var buffer = this.buffer,
+      outputLen = this.outputLen;
+    this.digestInto(buffer);
+    // Copy out before destroy() zeroes the internal buffer.
+    var res = buffer.slice(0, outputLen);
+    this.destroy();
+    return res;
+  }
+}
+/**
+ * Poly1305 MAC from RFC 8439.
+ * @param msg - Message bytes to authenticate.
+ * @param key - 32-byte Poly1305 one-time key.
+ * @returns 16-byte authentication tag.
+ * @example
+ * Authenticates one message with a one-shot Poly1305 call and a fresh key.
+ *
+ * ```ts
+ * import { poly1305 } from '@noble/ciphers/_poly1305.js';
+ * import { randomBytes } from '@noble/ciphers/utils.js';
+ * const key = randomBytes(32);
+ * poly1305(new Uint8Array(), key);
+ * ```
+ */
+var poly1305 = /* @__PURE__ */Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["wrapMacConstructor"])(32, key => new Poly1305(key));
+
+/***/ }),
+
+/***/ "./src/onlykey-fido2/onlykey/vendor/@noble/ciphers/chacha.js":
+/*!*******************************************************************!*\
+  !*** ./src/onlykey-fido2/onlykey/vendor/@noble/ciphers/chacha.js ***!
+  \*******************************************************************/
+/*! exports provided: hchacha, chacha20orig, chacha20, xchacha20, chacha8, chacha12, __TESTS, _poly1305_aead, chacha20poly1305, xchacha20poly1305, rngChacha20, rngChacha8 */
+/***/ (function(module, __webpack_exports__, __webpack_require__) {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "hchacha", function() { return hchacha; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "chacha20orig", function() { return chacha20orig; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "chacha20", function() { return chacha20; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "xchacha20", function() { return xchacha20; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "chacha8", function() { return chacha8; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "chacha12", function() { return chacha12; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "__TESTS", function() { return __TESTS; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "_poly1305_aead", function() { return _poly1305_aead; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "chacha20poly1305", function() { return chacha20poly1305; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "xchacha20poly1305", function() { return xchacha20poly1305; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "rngChacha20", function() { return rngChacha20; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "rngChacha8", function() { return rngChacha8; });
+/* harmony import */ var _arx_js__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! ./_arx.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/ciphers/_arx.js");
+/* harmony import */ var _poly1305_js__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(/*! ./_poly1305.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/ciphers/_poly1305.js");
+/* harmony import */ var _utils_js__WEBPACK_IMPORTED_MODULE_2__ = __webpack_require__(/*! ./utils.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/ciphers/utils.js");
+/**
+ * ChaCha stream cipher, released
+ * in 2008. Developed after Salsa20, ChaCha aims to increase diffusion per round.
+ * It was standardized in
+ * {@link https://www.rfc-editor.org/rfc/rfc8439 | RFC 8439} and
+ * is now used in TLS 1.3.
+ *
+ * {@link https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-xchacha | XChaCha20}
+ * extended-nonce variant is also provided. Similar to XSalsa, it's safe to use with
+ * randomly-generated nonces.
+ *
+ * Check out
+ * {@link http://cr.yp.to/chacha/chacha-20080128.pdf | PDF},
+ * {@link https://en.wikipedia.org/wiki/Salsa20 | wiki}, and
+ * {@link https://cr.yp.to/chacha.html | website}.
+ *
+ * @module
+ */
+
+
+
+/**
+ * ChaCha core function. It is implemented twice:
+ * 1. Simple loop (chachaCore_small, hchacha_small)
+ * 2. Unrolled loop (chachaCore, hchacha) - 4x faster, but larger & harder to read
+ * The specific implementation is selected in `createCipher` below.
+ */
+/** RFC 8439 §2.1 quarter round on words a, b, c, d. */
+// prettier-ignore
+function chachaQR(x, a, b, c, d) {
+  x[a] = x[a] + x[b] | 0;
+  x[d] = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x[d] ^ x[a], 16);
+  x[c] = x[c] + x[d] | 0;
+  x[b] = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x[b] ^ x[c], 12);
+  x[a] = x[a] + x[b] | 0;
+  x[d] = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x[d] ^ x[a], 8);
+  x[c] = x[c] + x[d] | 0;
+  x[b] = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x[b] ^ x[c], 7);
+}
+/** Repeated ChaCha double rounds; callers are expected to pass an even round count. */
+function chachaRound(x) {
+  var rounds = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : 20;
+  for (var r = 0; r < rounds; r += 2) {
+    // RFC 8439 §2.3 / §2.3.1 inner_block: four column rounds, then four diagonal rounds.
+    chachaQR(x, 0, 4, 8, 12);
+    chachaQR(x, 1, 5, 9, 13);
+    chachaQR(x, 2, 6, 10, 14);
+    chachaQR(x, 3, 7, 11, 15);
+    chachaQR(x, 0, 5, 10, 15);
+    chachaQR(x, 1, 6, 11, 12);
+    chachaQR(x, 2, 7, 8, 13);
+    chachaQR(x, 3, 4, 9, 14);
+  }
+}
+// Shared scratch for the auditability-only helper below; only the test-only
+// __TESTS.chachaCore_small hook reaches it, so production exports stay reentrant.
+var ctmp = /* @__PURE__ */new Uint32Array(16);
+/** Small version of chacha without loop unrolling. Unused, provided for auditability. */
+// prettier-ignore
+function chacha(s, k, i, out) {
+  var isHChacha = arguments.length > 4 && arguments[4] !== undefined ? arguments[4] : true;
+  var rounds = arguments.length > 5 && arguments[5] !== undefined ? arguments[5] : 20;
+  // `i` is either `[counter, nonce0, nonce1, nonce2]` for the ChaCha block
+  // function or the full 128-bit nonce prefix for the HChaCha subkey path.
+  // Create initial array using common pattern
+  var y = Uint32Array.from([s[0], s[1], s[2], s[3],
+  // "expa"   "nd 3"  "2-by"  "te k"
+  k[0], k[1], k[2], k[3],
+  // Key      Key     Key     Key
+  k[4], k[5], k[6], k[7],
+  // Key      Key     Key     Key
+  i[0], i[1], i[2], i[3] // Counter  Counter Nonce   Nonce
+  ]);
+  var x = ctmp;
+  x.set(y);
+  chachaRound(x, rounds);
+  // HChaCha writes words 0..3 and 12..15 after the rounds; the ChaCha
+  // block path adds the original state word-by-word.
+  if (isHChacha) {
+    var xindexes = [0, 1, 2, 3, 12, 13, 14, 15];
+    for (var _i = 0; _i < 8; _i++) out[_i] = x[xindexes[_i]];
+  } else {
+    for (var _i2 = 0; _i2 < 16; _i2++) out[_i2] = y[_i2] + x[_i2] | 0;
+  }
+}
+/** Identical to `chachaCore`. Reached only through the test-only `__TESTS` export. */
+// @ts-ignore
+var chachaCore_small = (s, k, n, out, cnt, rounds) =>
+// Keep the reference wrapper on the same [counter, nonce0, nonce1, nonce2] layout as chacha().
+chacha(s, k, Uint32Array.from([cnt, n[0], n[1], n[2]]), out, false, rounds);
+/** Identical to `hchacha`. Unused. */
+// @ts-ignore
+var hchacha_small = chacha;
+/** RFC 8439 §2.3 block core for `state = constants | key | counter | nonce`. */
+// prettier-ignore
+function chachaCore(s, k, n, out, cnt) {
+  var rounds = arguments.length > 5 && arguments[5] !== undefined ? arguments[5] : 20;
+  var y00 = s[0],
+    y01 = s[1],
+    y02 = s[2],
+    y03 = s[3],
+    // "expa"   "nd 3"  "2-by"  "te k"
+    y04 = k[0],
+    y05 = k[1],
+    y06 = k[2],
+    y07 = k[3],
+    // Key      Key     Key     Key
+    y08 = k[4],
+    y09 = k[5],
+    y10 = k[6],
+    y11 = k[7],
+    // Key      Key     Key     Key
+    y12 = cnt,
+    y13 = n[0],
+    y14 = n[1],
+    y15 = n[2]; // Counter  Nonce   Nonce   Nonce
+  // Save state to temporary variables
+  var x00 = y00,
+    x01 = y01,
+    x02 = y02,
+    x03 = y03,
+    x04 = y04,
+    x05 = y05,
+    x06 = y06,
+    x07 = y07,
+    x08 = y08,
+    x09 = y09,
+    x10 = y10,
+    x11 = y11,
+    x12 = y12,
+    x13 = y13,
+    x14 = y14,
+    x15 = y15;
+  for (var r = 0; r < rounds; r += 2) {
+    x00 = x00 + x04 | 0;
+    x12 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x12 ^ x00, 16);
+    x08 = x08 + x12 | 0;
+    x04 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x04 ^ x08, 12);
+    x00 = x00 + x04 | 0;
+    x12 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x12 ^ x00, 8);
+    x08 = x08 + x12 | 0;
+    x04 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x04 ^ x08, 7);
+    x01 = x01 + x05 | 0;
+    x13 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x13 ^ x01, 16);
+    x09 = x09 + x13 | 0;
+    x05 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x05 ^ x09, 12);
+    x01 = x01 + x05 | 0;
+    x13 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x13 ^ x01, 8);
+    x09 = x09 + x13 | 0;
+    x05 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x05 ^ x09, 7);
+    x02 = x02 + x06 | 0;
+    x14 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x14 ^ x02, 16);
+    x10 = x10 + x14 | 0;
+    x06 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x06 ^ x10, 12);
+    x02 = x02 + x06 | 0;
+    x14 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x14 ^ x02, 8);
+    x10 = x10 + x14 | 0;
+    x06 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x06 ^ x10, 7);
+    x03 = x03 + x07 | 0;
+    x15 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x15 ^ x03, 16);
+    x11 = x11 + x15 | 0;
+    x07 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x07 ^ x11, 12);
+    x03 = x03 + x07 | 0;
+    x15 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x15 ^ x03, 8);
+    x11 = x11 + x15 | 0;
+    x07 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x07 ^ x11, 7);
+    x00 = x00 + x05 | 0;
+    x15 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x15 ^ x00, 16);
+    x10 = x10 + x15 | 0;
+    x05 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x05 ^ x10, 12);
+    x00 = x00 + x05 | 0;
+    x15 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x15 ^ x00, 8);
+    x10 = x10 + x15 | 0;
+    x05 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x05 ^ x10, 7);
+    x01 = x01 + x06 | 0;
+    x12 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x12 ^ x01, 16);
+    x11 = x11 + x12 | 0;
+    x06 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x06 ^ x11, 12);
+    x01 = x01 + x06 | 0;
+    x12 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x12 ^ x01, 8);
+    x11 = x11 + x12 | 0;
+    x06 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x06 ^ x11, 7);
+    x02 = x02 + x07 | 0;
+    x13 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x13 ^ x02, 16);
+    x08 = x08 + x13 | 0;
+    x07 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x07 ^ x08, 12);
+    x02 = x02 + x07 | 0;
+    x13 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x13 ^ x02, 8);
+    x08 = x08 + x13 | 0;
+    x07 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x07 ^ x08, 7);
+    x03 = x03 + x04 | 0;
+    x14 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x14 ^ x03, 16);
+    x09 = x09 + x14 | 0;
+    x04 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x04 ^ x09, 12);
+    x03 = x03 + x04 | 0;
+    x14 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x14 ^ x03, 8);
+    x09 = x09 + x14 | 0;
+    x04 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x04 ^ x09, 7);
+  }
+  // RFC 8439 §2.3 / §2.3.1: add the original state words back in state order.
+  var oi = 0;
+  out[oi++] = y00 + x00 | 0;
+  out[oi++] = y01 + x01 | 0;
+  out[oi++] = y02 + x02 | 0;
+  out[oi++] = y03 + x03 | 0;
+  out[oi++] = y04 + x04 | 0;
+  out[oi++] = y05 + x05 | 0;
+  out[oi++] = y06 + x06 | 0;
+  out[oi++] = y07 + x07 | 0;
+  out[oi++] = y08 + x08 | 0;
+  out[oi++] = y09 + x09 | 0;
+  out[oi++] = y10 + x10 | 0;
+  out[oi++] = y11 + x11 | 0;
+  out[oi++] = y12 + x12 | 0;
+  out[oi++] = y13 + x13 | 0;
+  out[oi++] = y14 + x14 | 0;
+  out[oi++] = y15 + x15 | 0;
+}
+/**
+ * hchacha hashes key and nonce into key' and nonce' for xchacha20.
+ * Algorithmically identical to `hchacha_small`, but this exported path
+ * normalizes word order on big-endian hosts.
+ * Need to find a way to merge it with `chachaCore` without 25% performance hit.
+ * @param s - Sigma constants as 32-bit words.
+ * @param k - Key words.
+ * @param i - Nonce-prefix words.
+ * @param out - Output buffer for the derived subkey.
+ * @example
+ * Derives the XChaCha subkey from sigma, key, and nonce-prefix words.
+ *
+ * ```ts
+ * const sigma = new Uint32Array(4);
+ * const key = new Uint32Array(8);
+ * const nonce = new Uint32Array(4);
+ * const out = new Uint32Array(8);
+ * hchacha(sigma, key, nonce, out);
+ * ```
+ */
+// prettier-ignore
+function hchacha(s, k, i, out) {
+  var x00 = Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["swap8IfBE"])(s[0]),
+    x01 = Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["swap8IfBE"])(s[1]),
+    x02 = Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["swap8IfBE"])(s[2]),
+    x03 = Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["swap8IfBE"])(s[3]),
+    x04 = Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["swap8IfBE"])(k[0]),
+    x05 = Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["swap8IfBE"])(k[1]),
+    x06 = Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["swap8IfBE"])(k[2]),
+    x07 = Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["swap8IfBE"])(k[3]),
+    x08 = Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["swap8IfBE"])(k[4]),
+    x09 = Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["swap8IfBE"])(k[5]),
+    x10 = Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["swap8IfBE"])(k[6]),
+    x11 = Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["swap8IfBE"])(k[7]),
+    x12 = Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["swap8IfBE"])(i[0]),
+    x13 = Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["swap8IfBE"])(i[1]),
+    x14 = Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["swap8IfBE"])(i[2]),
+    x15 = Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["swap8IfBE"])(i[3]);
+  for (var r = 0; r < 20; r += 2) {
+    x00 = x00 + x04 | 0;
+    x12 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x12 ^ x00, 16);
+    x08 = x08 + x12 | 0;
+    x04 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x04 ^ x08, 12);
+    x00 = x00 + x04 | 0;
+    x12 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x12 ^ x00, 8);
+    x08 = x08 + x12 | 0;
+    x04 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x04 ^ x08, 7);
+    x01 = x01 + x05 | 0;
+    x13 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x13 ^ x01, 16);
+    x09 = x09 + x13 | 0;
+    x05 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x05 ^ x09, 12);
+    x01 = x01 + x05 | 0;
+    x13 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x13 ^ x01, 8);
+    x09 = x09 + x13 | 0;
+    x05 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x05 ^ x09, 7);
+    x02 = x02 + x06 | 0;
+    x14 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x14 ^ x02, 16);
+    x10 = x10 + x14 | 0;
+    x06 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x06 ^ x10, 12);
+    x02 = x02 + x06 | 0;
+    x14 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x14 ^ x02, 8);
+    x10 = x10 + x14 | 0;
+    x06 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x06 ^ x10, 7);
+    x03 = x03 + x07 | 0;
+    x15 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x15 ^ x03, 16);
+    x11 = x11 + x15 | 0;
+    x07 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x07 ^ x11, 12);
+    x03 = x03 + x07 | 0;
+    x15 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x15 ^ x03, 8);
+    x11 = x11 + x15 | 0;
+    x07 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x07 ^ x11, 7);
+    x00 = x00 + x05 | 0;
+    x15 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x15 ^ x00, 16);
+    x10 = x10 + x15 | 0;
+    x05 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x05 ^ x10, 12);
+    x00 = x00 + x05 | 0;
+    x15 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x15 ^ x00, 8);
+    x10 = x10 + x15 | 0;
+    x05 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x05 ^ x10, 7);
+    x01 = x01 + x06 | 0;
+    x12 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x12 ^ x01, 16);
+    x11 = x11 + x12 | 0;
+    x06 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x06 ^ x11, 12);
+    x01 = x01 + x06 | 0;
+    x12 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x12 ^ x01, 8);
+    x11 = x11 + x12 | 0;
+    x06 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x06 ^ x11, 7);
+    x02 = x02 + x07 | 0;
+    x13 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x13 ^ x02, 16);
+    x08 = x08 + x13 | 0;
+    x07 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x07 ^ x08, 12);
+    x02 = x02 + x07 | 0;
+    x13 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x13 ^ x02, 8);
+    x08 = x08 + x13 | 0;
+    x07 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x07 ^ x08, 7);
+    x03 = x03 + x04 | 0;
+    x14 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x14 ^ x03, 16);
+    x09 = x09 + x14 | 0;
+    x04 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x04 ^ x09, 12);
+    x03 = x03 + x04 | 0;
+    x14 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x14 ^ x03, 8);
+    x09 = x09 + x14 | 0;
+    x04 = Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["rotl"])(x04 ^ x09, 7);
+  }
+  // HChaCha derives the subkey from state words 0..3 and 12..15 after 20 rounds.
+  var oi = 0;
+  out[oi++] = x00;
+  out[oi++] = x01;
+  out[oi++] = x02;
+  out[oi++] = x03;
+  out[oi++] = x12;
+  out[oi++] = x13;
+  out[oi++] = x14;
+  out[oi++] = x15;
+  Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["swap32IfBE"])(out);
+}
+/**
+ * Original, non-RFC chacha20 from DJB. 8-byte nonce, 8-byte counter.
+ * The nonce/counter layout still reserves 8 counter bytes internally, but the shared public
+ * `counter` argument follows noble's strict non-wrapping 32-bit policy. See `src/_arx.ts`
+ * near `MAX_COUNTER` for the full counter-policy rationale.
+ * @param key - 16-byte or 32-byte key.
+ * @param nonce - 8-byte nonce.
+ * @param data - Input bytes to xor with the keystream.
+ * @param output - Optional destination buffer.
+ * @param counter - Initial block counter.
+ * @returns Encrypted or decrypted bytes.
+ * @example
+ * Encrypts bytes with the original 8-byte-nonce ChaCha variant and a fresh key/nonce.
+ *
+ * ```ts
+ * import { chacha20orig } from '@noble/ciphers/chacha.js';
+ * import { randomBytes } from '@noble/ciphers/utils.js';
+ * const key = randomBytes(32);
+ * const nonce = randomBytes(8);
+ * chacha20orig(key, nonce, new Uint8Array(4));
+ * ```
+ */
+var chacha20orig = /* @__PURE__ */Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["createCipher"])(chachaCore, {
+  counterRight: false,
+  counterLength: 8,
+  allowShortKeys: true
+});
+/**
+ * ChaCha stream cipher. Conforms to RFC 8439 (IETF, TLS). 12-byte nonce, 4-byte counter.
+ * With smaller nonce, it's not safe to make it random (CSPRNG), due to collision chance.
+ * @param key - 32-byte key.
+ * @param nonce - 12-byte nonce.
+ * @param data - Input bytes to xor with the keystream.
+ * @param output - Optional destination buffer.
+ * @param counter - Initial block counter.
+ * @returns Encrypted or decrypted bytes.
+ * @example
+ * Encrypts bytes with the RFC 8439 ChaCha20 stream cipher and a fresh key/nonce.
+ *
+ * ```ts
+ * import { chacha20 } from '@noble/ciphers/chacha.js';
+ * import { randomBytes } from '@noble/ciphers/utils.js';
+ * const key = randomBytes(32);
+ * const nonce = randomBytes(12);
+ * chacha20(key, nonce, new Uint8Array(4));
+ * ```
+ */
+var chacha20 = /* @__PURE__ */Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["createCipher"])(chachaCore, {
+  counterRight: false,
+  counterLength: 4,
+  allowShortKeys: false
+});
+/**
+ * XChaCha eXtended-nonce ChaCha. With 24-byte nonce, it's safe to make it random (CSPRNG).
+ * See {@link https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-xchacha | the IRTF draft}.
+ * The nonce/counter layout still reserves 8 counter bytes internally, but the shared public
+ * `counter` argument follows noble's strict non-wrapping 32-bit policy. See `src/_arx.ts`
+ * near `MAX_COUNTER` for the full counter-policy rationale.
+ * @param key - 32-byte key.
+ * @param nonce - 24-byte extended nonce.
+ * @param data - Input bytes to xor with the keystream.
+ * @param output - Optional destination buffer.
+ * @param counter - Initial block counter.
+ * @returns Encrypted or decrypted bytes.
+ * @example
+ * Encrypts bytes with XChaCha20 using a fresh key and random 24-byte nonce.
+ *
+ * ```ts
+ * import { xchacha20 } from '@noble/ciphers/chacha.js';
+ * import { randomBytes } from '@noble/ciphers/utils.js';
+ * const key = randomBytes(32);
+ * const nonce = randomBytes(24);
+ * xchacha20(key, nonce, new Uint8Array(4));
+ * ```
+ */
+var xchacha20 = /* @__PURE__ */Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["createCipher"])(chachaCore, {
+  counterRight: false,
+  counterLength: 8,
+  extendNonceFn: hchacha,
+  allowShortKeys: false
+});
+/**
+ * Reduced 8-round chacha, described in original paper.
+ * @param key - 32-byte key.
+ * @param nonce - 12-byte nonce.
+ * @param data - Input bytes to xor with the keystream.
+ * @param output - Optional destination buffer.
+ * @param counter - Initial block counter.
+ * @returns Encrypted or decrypted bytes.
+ * @example
+ * Uses the reduced 8-round variant for non-critical workloads with a fresh key/nonce.
+ *
+ * ```ts
+ * import { chacha8 } from '@noble/ciphers/chacha.js';
+ * import { randomBytes } from '@noble/ciphers/utils.js';
+ * const key = randomBytes(32);
+ * const nonce = randomBytes(12);
+ * chacha8(key, nonce, new Uint8Array(4));
+ * ```
+ */
+var chacha8 = /* @__PURE__ */Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["createCipher"])(chachaCore, {
+  counterRight: false,
+  counterLength: 4,
+  rounds: 8
+});
+/**
+ * Reduced 12-round chacha, described in original paper.
+ * @param key - 32-byte key.
+ * @param nonce - 12-byte nonce.
+ * @param data - Input bytes to xor with the keystream.
+ * @param output - Optional destination buffer.
+ * @param counter - Initial block counter.
+ * @returns Encrypted or decrypted bytes.
+ * @example
+ * Uses the reduced 12-round variant for non-critical workloads with a fresh key/nonce.
+ *
+ * ```ts
+ * import { chacha12 } from '@noble/ciphers/chacha.js';
+ * import { randomBytes } from '@noble/ciphers/utils.js';
+ * const key = randomBytes(32);
+ * const nonce = randomBytes(12);
+ * chacha12(key, nonce, new Uint8Array(4));
+ * ```
+ */
+var chacha12 = /* @__PURE__ */Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["createCipher"])(chachaCore, {
+  counterRight: false,
+  counterLength: 4,
+  rounds: 12
+});
+// Test-only hooks for keeping the simple/reference core aligned with the unrolled production core.
+var __TESTS = /* @__PURE__ */Object.freeze({
+  chachaCore_small,
+  chachaCore
+});
+// RFC 8439 §2.8.1 pad16(x): shared zero block for AAD/ciphertext padding.
+var ZEROS16 = /* @__PURE__ */new Uint8Array(16);
+// RFC 8439 §2.8 / §2.8.1: aligned inputs add nothing, otherwise append 16-(len%16) zero bytes.
+var updatePadded = (h, msg) => {
+  h.update(msg);
+  var leftover = msg.length % 16;
+  if (leftover) h.update(ZEROS16.subarray(leftover));
+};
+// RFC 8439 §2.6.1 poly1305_key_gen returns `block[0..31]`, so AEAD key
+// generation only needs 32 zero bytes.
+var ZEROS32 = /* @__PURE__ */new Uint8Array(32);
+function computeTag(fn, key, nonce, ciphertext, AAD) {
+  if (AAD !== undefined) Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["abytes"])(AAD, undefined, 'AAD');
+  // RFC 8439 §2.6 / §2.8: derive the Poly1305 one-time key from counter 0,
+  // then MAC AAD || pad16(AAD) || ciphertext || pad16(ciphertext) || len(AAD) || len(ciphertext).
+  var authKey = fn(key, nonce, ZEROS32);
+  var lengths = Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["u64Lengths"])(ciphertext.length, AAD ? AAD.length : 0, true);
+  // Methods below can be replaced with
+  // return poly1305_computeTag_small(authKey, lengths, ciphertext, AAD)
+  var h = _poly1305_js__WEBPACK_IMPORTED_MODULE_1__["poly1305"].create(authKey);
+  if (AAD) updatePadded(h, AAD);
+  updatePadded(h, ciphertext);
+  h.update(lengths);
+  var res = h.digest();
+  Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["clean"])(authKey, lengths);
+  return res;
+}
+/**
+ * AEAD algorithm from RFC 8439.
+ * Salsa20 and chacha (RFC 8439) use poly1305 differently.
+ * We could have composed them, but it's hard because of authKey:
+ * In salsa20, authKey changes position in salsa stream.
+ * In chacha, authKey can't be computed inside computeTag, it modifies the counter.
+ */
+var _poly1305_aead = xorStream => (key, nonce, AAD) => {
+  // This borrows caller key/nonce/AAD buffers by reference; mutating them after construction
+  // changes future encrypt/decrypt results.
+  var tagLength = 16;
+  return {
+    encrypt(plaintext, output) {
+      var plength = plaintext.length;
+      output = Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["getOutput"])(plength + tagLength, output, false);
+      output.set(plaintext);
+      var oPlain = output.subarray(0, -tagLength);
+      // RFC 8439 §2.8: payload encryption starts at counter 1 because counter 0 produced the OTK.
+      xorStream(key, nonce, oPlain, oPlain, 1);
+      var tag = computeTag(xorStream, key, nonce, oPlain, AAD);
+      output.set(tag, plength); // append tag
+      Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["clean"])(tag);
+      return output;
+    },
+    decrypt(ciphertext, output) {
+      output = Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["getOutput"])(ciphertext.length - tagLength, output, false);
+      var data = ciphertext.subarray(0, -tagLength);
+      var passedTag = ciphertext.subarray(-tagLength);
+      var tag = computeTag(xorStream, key, nonce, data, AAD);
+      // RFC 8439 §2.8 / §4: authenticate ciphertext before decrypting it, and compare tags with
+      // the constant-time equalBytes() helper rather than decrypting speculative plaintext first.
+      if (!Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["equalBytes"])(passedTag, tag)) {
+        Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["clean"])(tag);
+        throw new Error('invalid tag');
+      }
+      output.set(ciphertext.subarray(0, -tagLength));
+      // Actual decryption
+      xorStream(key, nonce, output, output, 1); // start stream with i=1
+      Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["clean"])(tag);
+      return output;
+    }
+  };
+};
+/**
+ * ChaCha20-Poly1305 from RFC 8439.
+ *
+ * Unsafe to use random nonces under the same key, due to collision chance.
+ * Prefer XChaCha instead.
+ * @param key - 32-byte key.
+ * @param nonce - 12-byte nonce.
+ * @param AAD - Additional authenticated data.
+ * @returns AEAD cipher instance.
+ * @example
+ * Encrypts and authenticates plaintext with a fresh key and nonce.
+ *
+ * ```ts
+ * import { chacha20poly1305 } from '@noble/ciphers/chacha.js';
+ * import { randomBytes } from '@noble/ciphers/utils.js';
+ * const key = randomBytes(32);
+ * const nonce = randomBytes(12);
+ * const cipher = chacha20poly1305(key, nonce);
+ * cipher.encrypt(new Uint8Array([1, 2, 3]));
+ * ```
+ */
+var chacha20poly1305 = /* @__PURE__ */Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["wrapCipher"])({
+  blockSize: 64,
+  nonceLength: 12,
+  tagLength: 16
+}, /* @__PURE__ */_poly1305_aead(chacha20));
+/**
+ * XChaCha20-Poly1305 extended-nonce chacha.
+ *
+ * Can be safely used with random nonces (CSPRNG).
+ * See {@link https://datatracker.ietf.org/doc/html/draft-irtf-cfrg-xchacha | the IRTF draft}.
+ * @param key - 32-byte key.
+ * @param nonce - 24-byte nonce.
+ * @param AAD - Additional authenticated data.
+ * @returns AEAD cipher instance.
+ * @example
+ * Encrypts and authenticates plaintext with a fresh key and random 24-byte nonce.
+ *
+ * ```ts
+ * import { xchacha20poly1305 } from '@noble/ciphers/chacha.js';
+ * import { randomBytes } from '@noble/ciphers/utils.js';
+ * const key = randomBytes(32);
+ * const nonce = randomBytes(24);
+ * const cipher = xchacha20poly1305(key, nonce);
+ * cipher.encrypt(new Uint8Array([1, 2, 3]));
+ * ```
+ */
+var xchacha20poly1305 = /* @__PURE__ */Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["wrapCipher"])({
+  blockSize: 64,
+  nonceLength: 24,
+  tagLength: 16
+}, /* @__PURE__ */_poly1305_aead(xchacha20));
+/**
+ * Chacha20 CSPRNG (cryptographically secure pseudorandom number generator).
+ * It's best to limit usage to non-production, non-critical cases: for example, test-only.
+ * Compatible with libtomcrypt. It does not have a specification, so unclear how secure it is.
+ * @param seed - Optional seed bytes mixed into the internal `key || nonce` state. When omitted,
+ * only 32 random bytes are mixed into the 40-byte state.
+ * @returns Seeded concrete `_XorStreamPRG` instance, including `clone()`.
+ * @example
+ * Seeds the test-only ChaCha20 DRBG from fresh entropy.
+ *
+ * ```ts
+ * import { rngChacha20 } from '@noble/ciphers/chacha.js';
+ * import { randomBytes } from '@noble/ciphers/utils.js';
+ * const seed = randomBytes(32);
+ * const prg = rngChacha20(seed);
+ * prg.randomBytes(8);
+ * ```
+ */
+var rngChacha20 = /* @__PURE__ */Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["createPRG"])(chacha20orig, 64, 32, 8);
+/**
+ * Chacha20/8 CSPRNG (cryptographically secure pseudorandom number generator).
+ * It's best to limit usage to non-production, non-critical cases: for example, test-only.
+ * Faster than `rngChacha20`.
+ * @param seed - Optional seed bytes mixed into the internal `key || nonce` state. When omitted,
+ * only 32 random bytes are mixed into the 44-byte state.
+ * @returns Seeded concrete `_XorStreamPRG` instance, including `clone()`.
+ * @example
+ * Seeds the faster test-only ChaCha8 DRBG from fresh entropy.
+ *
+ * ```ts
+ * import { rngChacha8 } from '@noble/ciphers/chacha.js';
+ * import { randomBytes } from '@noble/ciphers/utils.js';
+ * const seed = randomBytes(32);
+ * const prg = rngChacha8(seed);
+ * prg.randomBytes(8);
+ * ```
+ */
+var rngChacha8 = /* @__PURE__ */Object(_arx_js__WEBPACK_IMPORTED_MODULE_0__["createPRG"])(chacha8, 64, 32, 12);
+
+/***/ }),
+
+/***/ "./src/onlykey-fido2/onlykey/vendor/@noble/ciphers/utils.js":
+/*!******************************************************************!*\
+  !*** ./src/onlykey-fido2/onlykey/vendor/@noble/ciphers/utils.js ***!
+  \******************************************************************/
+/*! exports provided: isBytes, abool, anumber, abytes, aexists, aoutput, u8, u32, clean, createView, isLE, byteSwap, swap8IfBE, byteSwap32, swap32IfBE, bytesToHex, hexToBytes, hexToNumber, bytesToNumberBE, numberToBytesBE, utf8ToBytes, bytesToUtf8, overlapBytes, complexOverlapBytes, concatBytes, checkOpts, equalBytes, wrapMacConstructor, wrapCipher, getOutput, u64Lengths, isAligned32, copyBytes, randomBytes, managedNonce */
+/***/ (function(module, __webpack_exports__, __webpack_require__) {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "isBytes", function() { return isBytes; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "abool", function() { return abool; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "anumber", function() { return anumber; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "abytes", function() { return abytes; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "aexists", function() { return aexists; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "aoutput", function() { return aoutput; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "u8", function() { return u8; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "u32", function() { return u32; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "clean", function() { return clean; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "createView", function() { return createView; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "isLE", function() { return isLE; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "byteSwap", function() { return byteSwap; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "swap8IfBE", function() { return swap8IfBE; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "byteSwap32", function() { return byteSwap32; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "swap32IfBE", function() { return swap32IfBE; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "bytesToHex", function() { return bytesToHex; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "hexToBytes", function() { return hexToBytes; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "hexToNumber", function() { return hexToNumber; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "bytesToNumberBE", function() { return bytesToNumberBE; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "numberToBytesBE", function() { return numberToBytesBE; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "utf8ToBytes", function() { return utf8ToBytes; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "bytesToUtf8", function() { return bytesToUtf8; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "overlapBytes", function() { return overlapBytes; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "complexOverlapBytes", function() { return complexOverlapBytes; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "concatBytes", function() { return concatBytes; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "checkOpts", function() { return checkOpts; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "equalBytes", function() { return equalBytes; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "wrapMacConstructor", function() { return wrapMacConstructor; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "wrapCipher", function() { return wrapCipher; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "getOutput", function() { return getOutput; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "u64Lengths", function() { return u64Lengths; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "isAligned32", function() { return isAligned32; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "copyBytes", function() { return copyBytes; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "randomBytes", function() { return randomBytes; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "managedNonce", function() { return managedNonce; });
+/**
+ * Utilities for hex, bytes, CSPRNG.
+ * @module
+ */
+/*! noble-ciphers - MIT License (c) 2023 Paul Miller (paulmillr.com) */
+/**
+ * Checks if something is Uint8Array. Be careful: nodejs Buffer will return true.
+ * @param a - Value to inspect.
+ * @returns `true` when the value is a Uint8Array view, including Node's `Buffer`.
+ * @example
+ * Guards a value before treating it as raw key material.
+ *
+ * ```ts
+ * isBytes(new Uint8Array());
+ * ```
+ */
+function isBytes(a) {
+  // Plain `instanceof Uint8Array` is too strict for some Buffer / proxy /
+  // cross-realm cases. The fallback still requires a real ArrayBuffer view
+  // so plain JSON-deserialized `{ constructor: ... }`
+  // spoofing is rejected, and `BYTES_PER_ELEMENT === 1` keeps the fallback on byte-oriented views.
+  return a instanceof Uint8Array || ArrayBuffer.isView(a) && a.constructor.name === 'Uint8Array' && 'BYTES_PER_ELEMENT' in a && a.BYTES_PER_ELEMENT === 1;
+}
+/**
+ * Asserts something is boolean.
+ * @param b - Value to validate.
+ * @throws On wrong argument types. {@link TypeError}
+ * @example
+ * Validates a boolean option before branching on it.
+ *
+ * ```ts
+ * abool(true);
+ * ```
+ */
+function abool(b) {
+  if (typeof b !== 'boolean') throw new TypeError("boolean expected, not ".concat(b));
+}
+/**
+ * Asserts something is a non-negative safe integer.
+ * @param n - Value to validate.
+ * @throws On wrong argument types. {@link TypeError}
+ * @throws On wrong argument ranges or values. {@link RangeError}
+ * @example
+ * Validates a non-negative length or counter.
+ *
+ * ```ts
+ * anumber(1);
+ * ```
+ */
+function anumber(n) {
+  if (typeof n !== 'number') throw new TypeError('number expected, got ' + typeof n);
+  if (!Number.isSafeInteger(n) || n < 0) throw new RangeError('positive integer expected, got ' + n);
+}
+/**
+ * Asserts something is Uint8Array.
+ * @param value - Value to validate.
+ * @param length - Expected byte length.
+ * @param title - Optional label used in error messages.
+ * @returns The validated byte array.
+ * On Node, `Buffer` is accepted too because it is a Uint8Array view.
+ * @throws On wrong argument types. {@link TypeError}
+ * @throws On wrong argument lengths. {@link RangeError}
+ * @example
+ * Validates a fixed-length nonce or key buffer.
+ *
+ * ```ts
+ * abytes(new Uint8Array([1, 2]), 2);
+ * ```
+ */
+function abytes(value, length) {
+  var title = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : '';
+  var bytes = isBytes(value);
+  var len = value === null || value === void 0 ? void 0 : value.length;
+  var needsLen = length !== undefined;
+  if (!bytes || needsLen && len !== length) {
+    var prefix = title && "\"".concat(title, "\" ");
+    var ofLen = needsLen ? " of length ".concat(length) : '';
+    var got = bytes ? "length=".concat(len) : "type=".concat(typeof value);
+    var message = prefix + 'expected Uint8Array' + ofLen + ', got ' + got;
+    if (!bytes) throw new TypeError(message);
+    throw new RangeError(message);
+  }
+  return value;
+}
+/**
+ * Asserts a hash- or MAC-like instance has not been destroyed or finished.
+ * @param instance - Stateful instance to validate.
+ * @param checkFinished - Whether to reject finished instances.
+ * When `false`, only `destroyed` is checked.
+ * @throws If the hash instance has already been destroyed or finalized. {@link Error}
+ * @example
+ * Guards against calling `update()` or `digest()` on a finished hash.
+ *
+ * ```ts
+ * aexists({ destroyed: false, finished: false });
+ * ```
+ */
+function aexists(instance) {
+  var checkFinished = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : true;
+  if (instance.destroyed) throw new Error('Hash instance has been destroyed');
+  if (checkFinished && instance.finished) throw new Error('Hash#digest() has already been called');
+}
+/**
+ * Asserts output is a properly-sized byte array.
+ * @param out - Output buffer to validate.
+ * @param instance - Hash-like instance providing `outputLen`.
+ * This is the relaxed `digestInto()`-style contract: output must be at least `outputLen`,
+ * unlike one-shot cipher helpers elsewhere in the repo that often require exact lengths.
+ * @throws On wrong argument types. {@link TypeError}
+ * @param onlyAligned - Whether `out` must be 4-byte aligned for zero-allocation word views.
+ * @throws On wrong output buffer lengths. {@link RangeError}
+ * @throws On wrong output buffer alignment. {@link Error}
+ * @example
+ * Verifies that a caller-provided output buffer is large enough.
+ *
+ * ```ts
+ * aoutput(new Uint8Array(16), { outputLen: 16 });
+ * ```
+ */
+function aoutput(out, instance) {
+  var onlyAligned = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : false;
+  abytes(out, undefined, 'output');
+  var min = instance.outputLen;
+  if (out.length < min) {
+    throw new RangeError('digestInto() expects output buffer of length at least ' + min);
+  }
+  if (onlyAligned && !isAligned32(out)) throw new Error('invalid output, must be aligned');
+}
+/**
+ * Casts a typed-array view to Uint8Array.
+ * @param arr - Typed-array view to reinterpret.
+ * @returns Uint8Array view over the same bytes.
+ * @example
+ * Views 32-bit words as raw bytes without copying.
+ *
+ * ```ts
+ * u8(new Uint32Array([1]));
+ * ```
+ */
+function u8(arr) {
+  return new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength);
+}
+/**
+ * Casts a typed-array view to Uint32Array.
+ * @param arr - Typed-array view to reinterpret.
+ * @returns Uint32Array view over the same bytes. Callers are expected to provide a
+ * 4-byte-aligned offset; trailing `1..3` bytes are silently dropped.
+ * @example
+ * Views a byte buffer as 32-bit words for block processing.
+ *
+ * ```ts
+ * u32(new Uint8Array(4));
+ * ```
+ */
+function u32(arr) {
+  return new Uint32Array(arr.buffer, arr.byteOffset, Math.floor(arr.byteLength / 4));
+}
+/**
+ * Zeroizes typed arrays in place.
+ * Warning: JS provides no guarantees.
+ * @param arrays - Arrays to wipe.
+ * @example
+ * Wipes a temporary key buffer after use.
+ *
+ * ```ts
+ * const bytes = new Uint8Array([1]);
+ * clean(bytes);
+ * ```
+ */
+function clean() {
+  for (var _len = arguments.length, arrays = new Array(_len), _key = 0; _key < _len; _key++) {
+    arrays[_key] = arguments[_key];
+  }
+  for (var i = 0; i < arrays.length; i++) {
+    arrays[i].fill(0);
+  }
+}
+/**
+ * Creates a DataView for byte-level manipulation.
+ * @param arr - Typed-array view to wrap.
+ * @returns DataView over the same bytes.
+ * @example
+ * Creates an endian-aware view for length encoding.
+ *
+ * ```ts
+ * createView(new Uint8Array(4));
+ * ```
+ */
+function createView(arr) {
+  return new DataView(arr.buffer, arr.byteOffset, arr.byteLength);
+}
+/**
+ * Whether the current platform is little-endian.
+ * Most are; some IBM systems are not.
+ */
+var isLE = /* @__PURE__ */(() => new Uint8Array(new Uint32Array([0x11223344]).buffer)[0] === 0x44)();
+/**
+ * Reverses byte order of one 32-bit word.
+ * @param word - Unsigned 32-bit word to swap.
+ * @returns The same word with bytes reversed.
+ * @example
+ * Swaps a big-endian word into little-endian byte order.
+ *
+ * ```ts
+ * byteSwap(0x11223344);
+ * ```
+ */
+var byteSwap = word => word << 24 & 0xff000000 | word << 8 & 0xff0000 | word >>> 8 & 0xff00 | word >>> 24 & 0xff;
+/**
+ * Normalizes one 32-bit word to the little-endian representation expected by cipher cores.
+ * @param n - Unsigned 32-bit word to normalize.
+ * @returns Little-endian normalized word on big-endian hosts, else the input word unchanged.
+ * @example
+ * Normalizes a host-endian word before passing it into an ARX/AES core.
+ *
+ * ```ts
+ * swap8IfBE(0x11223344);
+ * ```
+ */
+var swap8IfBE = isLE ? n => n : n => byteSwap(n) >>> 0;
+/**
+ * Byte-swaps every word of a Uint32Array in place.
+ * @param arr - Uint32Array whose words should be swapped.
+ * @returns The same array after in-place byte swapping.
+ * @example
+ * Swaps every 32-bit word in a word-view buffer.
+ *
+ * ```ts
+ * byteSwap32(new Uint32Array([0x11223344]));
+ * ```
+ */
+var byteSwap32 = arr => {
+  for (var i = 0; i < arr.length; i++) arr[i] = byteSwap(arr[i]);
+  return arr;
+};
+/**
+ * Normalizes a Uint32Array view to the little-endian representation expected by cipher cores.
+ * @param u - Word view to normalize in place.
+ * @returns Little-endian normalized word view.
+ * @example
+ * Normalizes a word-view buffer before block processing.
+ *
+ * ```ts
+ * swap32IfBE(new Uint32Array([0x11223344]));
+ * ```
+ */
+var swap32IfBE = isLE ? u => u : byteSwap32;
+// Built-in hex conversion:
+// {@link https://caniuse.com/mdn-javascript_builtins_uint8array_fromhex | caniuse entry}
+var hasHexBuiltin = /* @__PURE__ */(() =>
+// @ts-ignore
+typeof Uint8Array.from([]).toHex === 'function' && typeof Uint8Array.fromHex === 'function')();
+// Array where index 0xf0 (240) is mapped to string 'f0'
+var hexes = /* @__PURE__ */Array.from({
+  length: 256
+}, (_, i) => i.toString(16).padStart(2, '0'));
+/**
+ * Convert byte array to hex string. Uses built-in function, when available.
+ * @param bytes - Bytes to encode.
+ * @returns Lowercase hexadecimal string.
+ * @throws On wrong argument types. {@link TypeError}
+ * @example
+ * Formats ciphertext bytes for logs or test vectors.
+ *
+ * ```ts
+ * bytesToHex(Uint8Array.from([0xca, 0xfe, 0x01, 0x23])); // 'cafe0123'
+ * ```
+ */
+function bytesToHex(bytes) {
+  abytes(bytes);
+  // @ts-ignore
+  if (hasHexBuiltin) return bytes.toHex();
+  // pre-caching improves the speed 6x
+  var hex = '';
+  for (var i = 0; i < bytes.length; i++) {
+    hex += hexes[bytes[i]];
+  }
+  return hex;
+}
+// We use optimized technique to convert hex string to byte array
+var asciis = {
+  _0: 48,
+  _9: 57,
+  A: 65,
+  F: 70,
+  a: 97,
+  f: 102
+};
+function asciiToBase16(ch) {
+  if (ch >= asciis._0 && ch <= asciis._9) return ch - asciis._0; // '2' => 50-48
+  if (ch >= asciis.A && ch <= asciis.F) return ch - (asciis.A - 10); // 'B' => 66-(65-10)
+  if (ch >= asciis.a && ch <= asciis.f) return ch - (asciis.a - 10); // 'b' => 98-(97-10)
+  return;
+}
+/**
+ * Convert hex string to byte array. Uses built-in function, when available.
+ * @param hex - Hexadecimal string to decode.
+ * @returns Decoded bytes.
+ * @throws On wrong argument types. {@link TypeError}
+ * @throws On malformed hexadecimal input. {@link RangeError}
+ * @example
+ * Parses a hex test vector into bytes.
+ *
+ * ```ts
+ * hexToBytes('cafe0123'); // Uint8Array.from([0xca, 0xfe, 0x01, 0x23])
+ * ```
+ */
+function hexToBytes(hex) {
+  if (typeof hex !== 'string') throw new TypeError('hex string expected, got ' + typeof hex);
+  if (hasHexBuiltin) {
+    try {
+      return Uint8Array.fromHex(hex);
+    } catch (error) {
+      if (error instanceof SyntaxError) throw new RangeError(error.message);
+      throw error;
+    }
+  }
+  var hl = hex.length;
+  var al = hl / 2;
+  if (hl % 2) throw new RangeError('hex string expected, got unpadded hex of length ' + hl);
+  var array = new Uint8Array(al);
+  for (var ai = 0, hi = 0; ai < al; ai++, hi += 2) {
+    var n1 = asciiToBase16(hex.charCodeAt(hi));
+    var n2 = asciiToBase16(hex.charCodeAt(hi + 1));
+    if (n1 === undefined || n2 === undefined) {
+      var char = hex[hi] + hex[hi + 1];
+      throw new RangeError('hex string expected, got non-hex character "' + char + '" at index ' + hi);
+    }
+    array[ai] = n1 * 16 + n2; // multiply first octet, e.g. 'a3' => 10*16+3 => 160 + 3 => 163
+  }
+  return array;
+}
+// Used in micro
+/**
+ * Converts a big-endian hex string into bigint.
+ * @param hex - Hexadecimal string without `0x`.
+ * @returns Parsed bigint value. The empty string is treated as `0n`.
+ * @throws On wrong argument types. {@link TypeError}
+ * @example
+ * Parses a big-endian field element or counter from hex.
+ *
+ * ```ts
+ * hexToNumber('ff');
+ * ```
+ */
+function hexToNumber(hex) {
+  if (typeof hex !== 'string') throw new TypeError('hex string expected, got ' + typeof hex);
+  return BigInt(hex === '' ? '0' : '0x' + hex); // Big Endian
+}
+// Used in ff1
+// BE: Big Endian, LE: Little Endian
+/**
+ * Converts big-endian bytes into bigint.
+ * @param bytes - Big-endian bytes.
+ * @returns Parsed bigint value. Empty input is treated as `0n`.
+ * @throws On invalid byte input passed to the internal hex conversion. {@link TypeError}
+ * @example
+ * Reads a big-endian integer from serialized bytes.
+ *
+ * ```ts
+ * bytesToNumberBE(new Uint8Array([1, 0]));
+ * ```
+ */
+function bytesToNumberBE(bytes) {
+  return hexToNumber(bytesToHex(bytes));
+}
+// Used in micro, ff1
+/**
+ * Converts a number into big-endian bytes of fixed length.
+ * @param n - Number to encode.
+ * @param len - Output length in bytes.
+ * @returns Big-endian bytes padded to `len`.
+ * Validation is indirect through `hexToBytes(...)`, so negative values, `len = 0`,
+ * and values that do not fit surface through the downstream hex parser instead of a
+ * dedicated range guard here.
+ * @throws On wrong argument types. {@link TypeError}
+ * @throws If the requested output length cannot represent the encoded value. {@link RangeError}
+ * @example
+ * Encodes a counter as fixed-width big-endian bytes.
+ *
+ * ```ts
+ * numberToBytesBE(1, 2);
+ * ```
+ */
+function numberToBytesBE(n, len) {
+  // Reject coercible non-numeric inputs before string/hex conversion changes behavior.
+  if (typeof n === 'number') anumber(n);else if (typeof n !== 'bigint') throw new TypeError("number or bigint expected, got ".concat(typeof n));
+  anumber(len);
+  return hexToBytes(n.toString(16).padStart(len * 2, '0'));
+}
+/**
+ * Converts string to bytes using UTF8 encoding.
+ * @param str - String to encode.
+ * @returns UTF-8 bytes in a detached fresh Uint8Array copy.
+ * @throws On wrong argument types. {@link TypeError}
+ * @example
+ * Encodes application text before encryption or MACing.
+ *
+ * ```ts
+ * utf8ToBytes('abc'); // new Uint8Array([97, 98, 99])
+ * ```
+ */
+function utf8ToBytes(str) {
+  if (typeof str !== 'string') throw new TypeError('string expected');
+  return new Uint8Array(new TextEncoder().encode(str)); // {@link https://bugzil.la/1681809 | Firefox bug 1681809}
+}
+/**
+ * Converts bytes to string using UTF8 encoding.
+ * @param bytes - UTF-8 bytes.
+ * @returns Decoded string. Input validation is delegated to `TextDecoder`, and malformed
+ * UTF-8 is replacement-decoded instead of rejected.
+ * @example
+ * Decodes UTF-8 plaintext back into a string.
+ *
+ * ```ts
+ * bytesToUtf8(new Uint8Array([97, 98, 99])); // 'abc'
+ * ```
+ */
+function bytesToUtf8(bytes) {
+  return new TextDecoder().decode(bytes);
+}
+/**
+ * Checks if two U8A use same underlying buffer and overlaps.
+ * This is invalid and can corrupt data.
+ * @param a - First byte view.
+ * @param b - Second byte view.
+ * @returns `true` when the views overlap in memory.
+ * @example
+ * Detects whether two slices alias the same backing buffer.
+ *
+ * ```ts
+ * overlapBytes(new Uint8Array(4), new Uint8Array(4));
+ * ```
+ */
+function overlapBytes(a, b) {
+  // Zero-length views cannot overwrite anything, even if their offset sits inside another range.
+  if (!a.byteLength || !b.byteLength) return false;
+  return a.buffer === b.buffer &&
+  // best we can do, may fail with an obscure Proxy
+  a.byteOffset < b.byteOffset + b.byteLength &&
+  // a starts before b end
+  b.byteOffset < a.byteOffset + a.byteLength // b starts before a end
+;
+}
+/**
+ * If input and output overlap and input starts before output, we will overwrite end of input before
+ * we start processing it, so this is not supported for most ciphers
+ * (except chacha/salsa, which were designed for this)
+ * @param input - Input bytes.
+ * @param output - Output bytes.
+ * @throws If the output view would overwrite unread input bytes. {@link Error}
+ * @example
+ * Rejects an in-place layout that would overwrite unread input bytes.
+ *
+ * ```ts
+ * complexOverlapBytes(new Uint8Array(4), new Uint8Array(4));
+ * ```
+ */
+function complexOverlapBytes(input, output) {
+  // This is very cursed. It works somehow, but I'm completely unsure,
+  // reasoning about overlapping aligned windows is very hard.
+  if (overlapBytes(input, output) && input.byteOffset < output.byteOffset) throw new Error('complex overlap of input and output is not supported');
+}
+/**
+ * Copies several Uint8Arrays into one.
+ * @param arrays - Byte arrays to concatenate.
+ * @returns Combined byte array.
+ * @throws On wrong argument types inside the byte-array list. {@link TypeError}
+ * @example
+ * Builds a `nonce || ciphertext` style buffer.
+ *
+ * ```ts
+ * concatBytes(new Uint8Array([1]), new Uint8Array([2]));
+ * ```
+ */
+function concatBytes() {
+  var sum = 0;
+  for (var i = 0; i < arguments.length; i++) {
+    var a = i < 0 || arguments.length <= i ? undefined : arguments[i];
+    abytes(a);
+    sum += a.length;
+  }
+  var res = new Uint8Array(sum);
+  for (var _i = 0, pad = 0; _i < arguments.length; _i++) {
+    var _a = _i < 0 || arguments.length <= _i ? undefined : arguments[_i];
+    res.set(_a, pad);
+    pad += _a.length;
+  }
+  return res;
+}
+/**
+ * Merges user options into defaults.
+ * @param defaults - Default option values.
+ * @param opts - User-provided overrides.
+ * @returns Combined options object.
+ * The merge mutates `defaults` in place and returns the same object.
+ * @throws If options are missing or not an object. {@link Error}
+ * @example
+ * Applies user overrides to the default cipher options.
+ *
+ * ```ts
+ * checkOpts({ rounds: 20 }, { rounds: 8 });
+ * ```
+ */
+function checkOpts(defaults, opts) {
+  if (opts == null || typeof opts !== 'object') throw new Error('options must be defined');
+  var merged = Object.assign(defaults, opts);
+  return merged;
+}
+/**
+ * Compares two byte arrays in kinda constant time once lengths already match.
+ * @param a - First byte array.
+ * @param b - Second byte array.
+ * @returns `true` when the arrays contain the same bytes. Different lengths still return early.
+ * @example
+ * Compares an expected authentication tag with the received one.
+ *
+ * ```ts
+ * equalBytes(new Uint8Array([1]), new Uint8Array([1]));
+ * ```
+ */
+function equalBytes(a, b) {
+  if (a.length !== b.length) return false;
+  var diff = 0;
+  for (var i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+  return diff === 0;
+}
+/**
+ * Wraps a keyed MAC constructor into a one-shot helper with `.create()`.
+ * @param keyLen - Valid probe-key length used to read static metadata once.
+ * The probe key is only used for `outputLen` / `blockLen`, so callers with several valid key sizes
+ * can pass any representative size as long as those values stay fixed.
+ * @param macCons - Keyed MAC constructor or factory.
+ * @param fromMsg - Optional adapter that derives extra constructor args from the one-shot message.
+ * @returns Callable MAC helper with `.create()`.
+ */
+function wrapMacConstructor(keyLen, macCons, fromMsg) {
+  var mac = macCons;
+  var getArgs = fromMsg || (() => []);
+  var macC = (msg, key) => mac(key, ...getArgs(msg)).update(msg).digest();
+  var tmp = mac(new Uint8Array(keyLen), ...getArgs(new Uint8Array(0)));
+  macC.outputLen = tmp.outputLen;
+  macC.blockLen = tmp.blockLen;
+  macC.create = function (key) {
+    for (var _len2 = arguments.length, args = new Array(_len2 > 1 ? _len2 - 1 : 0), _key2 = 1; _key2 < _len2; _key2++) {
+      args[_key2 - 1] = arguments[_key2];
+    }
+    return mac(key, ...args);
+  };
+  return macC;
+}
+/**
+ * Wraps a cipher: validates args, ensures encrypt() can only be called once.
+ * Used internally by the exported cipher constructors.
+ * Output-buffer support is inferred from the wrapped `encrypt` / `decrypt`
+ * arity (`fn.length === 2`), and tag-bearing constructors are expected to use
+ * `args[1]` for optional AAD.
+ * @__NO_SIDE_EFFECTS__
+ * @param params - Static cipher metadata. See {@link CipherParams}.
+ * @param constructor - Cipher constructor.
+ * @returns Wrapped constructor with validation.
+ */
+var wrapCipher = (params, constructor) => {
+  function wrappedCipher(key) {
+    // Validate key
+    abytes(key, undefined, 'key');
+    // Validate nonce if nonceLength is present
+    for (var _len3 = arguments.length, args = new Array(_len3 > 1 ? _len3 - 1 : 0), _key3 = 1; _key3 < _len3; _key3++) {
+      args[_key3 - 1] = arguments[_key3];
+    }
+    if (params.nonceLength !== undefined) {
+      var nonce = args[0];
+      abytes(nonce, params.varSizeNonce ? undefined : params.nonceLength, 'nonce');
+    }
+    // Validate AAD if tagLength present
+    var tagl = params.tagLength;
+    if (tagl && args[1] !== undefined) abytes(args[1], undefined, 'AAD');
+    var cipher = constructor(key, ...args);
+    var checkOutput = (fnLength, output) => {
+      if (output !== undefined) {
+        if (fnLength !== 2) throw new Error('cipher output not supported');
+        abytes(output, undefined, 'output');
+      }
+    };
+    // Create wrapped cipher with validation and single-use encryption
+    var called = false;
+    var wrCipher = {
+      encrypt(data, output) {
+        if (called) throw new Error('cannot encrypt() twice with same key + nonce');
+        called = true;
+        abytes(data);
+        checkOutput(cipher.encrypt.length, output);
+        return cipher.encrypt(data, output);
+      },
+      decrypt(data, output) {
+        abytes(data);
+        if (tagl && data.length < tagl) throw new Error('"ciphertext" expected length bigger than tagLength=' + tagl);
+        checkOutput(cipher.decrypt.length, output);
+        return cipher.decrypt(data, output);
+      }
+    };
+    return wrCipher;
+  }
+  Object.assign(wrappedCipher, params);
+  return wrappedCipher;
+};
+/**
+ * By default, returns u8a of length.
+ * When out is available, it checks it for validity and uses it.
+ * @param expectedLength - Required output length.
+ * @param out - Optional destination buffer.
+ * @param onlyAligned - Whether `out` must be 4-byte aligned.
+ * @returns Output buffer ready for writing.
+ * @throws On wrong argument types. {@link TypeError}
+ * @throws If the provided output buffer has the wrong size or alignment. {@link Error}
+ * @example
+ * Reuses a caller-provided output buffer when lengths match.
+ *
+ * ```ts
+ * getOutput(16, new Uint8Array(16));
+ * ```
+ */
+function getOutput(expectedLength, out) {
+  var onlyAligned = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : true;
+  if (out === undefined) return new Uint8Array(expectedLength);
+  // Keep Buffer/cross-realm Uint8Array support here instead of trusting a shape-compatible object.
+  abytes(out, undefined, 'output');
+  if (out.length !== expectedLength) throw new Error('"output" expected Uint8Array of length ' + expectedLength + ', got: ' + out.length);
+  if (onlyAligned && !isAligned32(out)) throw new Error('invalid output, must be aligned');
+  return out;
+}
+/**
+ * Encodes data and AAD bit lengths into a 16-byte buffer.
+ * @param dataLength - Data length in bits.
+ * @param aadLength - AAD length in bits.
+ * The serialized block is still `aadLength || dataLength`, matching GCM/Poly1305
+ * conventions even though the helper parameter order is `(dataLength, aadLength)`.
+ * @param isLE - Whether to encode lengths as little-endian.
+ * @returns 16-byte length block.
+ * @throws On wrong argument types passed to the endian validator. {@link TypeError}
+ * @throws On wrong argument ranges or values. {@link RangeError}
+ * @example
+ * Builds the length block appended by GCM and Poly1305.
+ *
+ * ```ts
+ * u64Lengths(16, 8, true);
+ * ```
+ */
+function u64Lengths(dataLength, aadLength, isLE) {
+  // Reject coercible non-number lengths like '10' and true before BigInt(...) accepts them.
+  anumber(dataLength);
+  anumber(aadLength);
+  abool(isLE);
+  var num = new Uint8Array(16);
+  var view = createView(num);
+  view.setBigUint64(0, BigInt(aadLength), isLE);
+  view.setBigUint64(8, BigInt(dataLength), isLE);
+  return num;
+}
+/**
+ * Checks whether a byte array is aligned to a 4-byte offset.
+ * @param bytes - Byte array to inspect.
+ * @returns `true` when the view is 4-byte aligned.
+ * @example
+ * Checks whether a buffer can be safely viewed as Uint32Array.
+ *
+ * ```ts
+ * isAligned32(new Uint8Array(4));
+ * ```
+ */
+function isAligned32(bytes) {
+  return bytes.byteOffset % 4 === 0;
+}
+/**
+ * Copies bytes into a new Uint8Array.
+ * @param bytes - Bytes to copy.
+ * @returns Copied byte array.
+ * @throws On wrong argument types. {@link TypeError}
+ * @example
+ * Copies input into an aligned Uint8Array before block processing.
+ *
+ * ```ts
+ * copyBytes(new Uint8Array([1, 2]));
+ * ```
+ */
+function copyBytes(bytes) {
+  // `Uint8Array.from(...)` would also accept arrays / other typed arrays. Keep this helper strict
+  // because callers use it at byte-validation boundaries before mutating the detached copy.
+  return Uint8Array.from(abytes(bytes));
+}
+/**
+ * Cryptographically secure PRNG.
+ * Uses internal OS-level `crypto.getRandomValues`.
+ * @param bytesLength - Number of bytes to produce.
+ * Validation is delegated to `Uint8Array(bytesLength)` and `getRandomValues`, so
+ * non-integers, negative lengths, and oversize requests surface backend/runtime errors.
+ * @returns Random byte array.
+ * @throws On wrong argument types. {@link TypeError}
+ * @throws On wrong argument ranges or values. {@link RangeError}
+ * @throws If the runtime does not expose `crypto.getRandomValues`. {@link Error}
+ * @example
+ * Generates a fresh nonce or key.
+ *
+ * ```ts
+ * randomBytes(16);
+ * ```
+ */
+function randomBytes() {
+  var bytesLength = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : 32;
+  // Validate upfront so fractional / coercible lengths do not silently
+  // truncate through Uint8Array().
+  anumber(bytesLength);
+  var cr = typeof globalThis === 'object' ? globalThis.crypto : null;
+  if (typeof (cr === null || cr === void 0 ? void 0 : cr.getRandomValues) !== 'function') throw new Error('crypto.getRandomValues must be defined');
+  return cr.getRandomValues(new Uint8Array(bytesLength));
+}
+/**
+ * Uses CSPRNG for nonce, nonce injected in ciphertext.
+ * For `encrypt`, a `nonceBytes`-length buffer is fetched from CSPRNG and
+ * prepended to encrypted ciphertext. For `decrypt`, first `nonceBytes` of ciphertext
+ * are treated as nonce. The wrapper always allocates a fresh `nonce || ciphertext`
+ * buffer on encrypt and intentionally does not support caller-provided destination buffers.
+ * Too-short decrypt inputs are split into short/empty nonce views and then delegated
+ * to the wrapped cipher instead of being rejected here first.
+ *
+ * NOTE: Under the same key, using random nonces (e.g. `managedNonce`) with AES-GCM and ChaCha
+ * should be limited to `2**23` (8M) messages to get a collision chance of
+ * `2**-50`. Stretching to `2**32` (4B) messages would raise that chance to
+ * `2**-33`, still negligible but creeping up.
+ * @param fn - Cipher constructor that expects a nonce.
+ * @param randomBytes_ - Random-byte source used for nonce generation.
+ * @returns Cipher constructor that prepends the nonce to ciphertext.
+ * @throws On wrong argument types. {@link TypeError}
+ * @throws On invalid nonce lengths observed at wrapper construction or use. {@link RangeError}
+ * @example
+ * Prepends a fresh random nonce to every ciphertext.
+ *
+ * ```ts
+ * import { gcm } from '@noble/ciphers/aes.js';
+ * import { managedNonce, randomBytes } from '@noble/ciphers/utils.js';
+ * const wrapped = managedNonce(gcm);
+ * const key = randomBytes(16);
+ * const ciphertext = wrapped(key).encrypt(new Uint8Array([1, 2, 3]));
+ * wrapped(key).decrypt(ciphertext);
+ * ```
+ */
+function managedNonce(fn) {
+  var randomBytes_ = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : randomBytes;
+  var nonceLength = fn.nonceLength;
+  anumber(nonceLength);
+  var addNonce = (nonce, ciphertext, plaintext) => {
+    var out = concatBytes(nonce, ciphertext);
+    // Wrapped ciphers may alias caller plaintext on encrypt(); never zero
+    // caller-owned buffers here.
+    if (!overlapBytes(plaintext, ciphertext)) ciphertext.fill(0);
+    return out;
+  };
+  // NOTE: we cannot support DST here, it would be mistake:
+  // - we don't know how much dst length cipher requires
+  // - nonce may unalign dst and break everything
+  // - we create new u8a anyway (concatBytes)
+  // - previously we passed all args to cipher, but that was mistake!
+  var res = function res(key) {
+    for (var _len4 = arguments.length, args = new Array(_len4 > 1 ? _len4 - 1 : 0), _key4 = 1; _key4 < _len4; _key4++) {
+      args[_key4 - 1] = arguments[_key4];
+    }
+    return {
+      encrypt(plaintext) {
+        abytes(plaintext);
+        var nonce = randomBytes_(nonceLength);
+        var encrypted = fn(key, nonce, ...args).encrypt(plaintext);
+        // @ts-ignore
+        if (encrypted instanceof Promise) return encrypted.then(ct => addNonce(nonce, ct, plaintext));
+        return addNonce(nonce, encrypted, plaintext);
+      },
+      decrypt(ciphertext) {
+        abytes(ciphertext);
+        var nonce = ciphertext.subarray(0, nonceLength);
+        var decrypted = ciphertext.subarray(nonceLength);
+        return fn(key, nonce, ...args).decrypt(decrypted);
+      }
+    };
+  };
+  // Auto-nonce wrappers still preserve the wrapped payload geometry.
+  if ('blockSize' in fn) res.blockSize = fn.blockSize;
+  if ('tagLength' in fn) res.tagLength = fn.tagLength;
+  return res;
+}
+
+/***/ }),
+
+/***/ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/abstract/curve.js":
+/*!**************************************************************************!*\
+  !*** ./src/onlykey-fido2/onlykey/vendor/@noble/curves/abstract/curve.js ***!
+  \**************************************************************************/
+/*! exports provided: validatePointCons, negateCt, normalizeZ, wNAF, mulEndoUnsafe, pippenger, precomputeMSMUnsafe, createCurveFields, createKeygen */
+/***/ (function(module, __webpack_exports__, __webpack_require__) {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "validatePointCons", function() { return validatePointCons; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "negateCt", function() { return negateCt; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "normalizeZ", function() { return normalizeZ; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "wNAF", function() { return wNAF; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "mulEndoUnsafe", function() { return mulEndoUnsafe; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "pippenger", function() { return pippenger; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "precomputeMSMUnsafe", function() { return precomputeMSMUnsafe; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "createCurveFields", function() { return createCurveFields; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "createKeygen", function() { return createKeygen; });
+/* harmony import */ var _utils_js__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! ../utils.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/utils.js");
+/* harmony import */ var _modular_js__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(/*! ./modular.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/abstract/modular.js");
+function _defineProperty(e, r, t) { return (r = _toPropertyKey(r)) in e ? Object.defineProperty(e, r, { value: t, enumerable: !0, configurable: !0, writable: !0 }) : e[r] = t, e; }
+function _toPropertyKey(t) { var i = _toPrimitive(t, "string"); return "symbol" == typeof i ? i : i + ""; }
+function _toPrimitive(t, r) { if ("object" != typeof t || !t) return t; var e = t[Symbol.toPrimitive]; if (void 0 !== e) { var i = e.call(t, r || "default"); if ("object" != typeof i) return i; throw new TypeError("@@toPrimitive must return a primitive value."); } return ("string" === r ? String : Number)(t); }
+/**
+ * Methods for elliptic curve multiplication by scalars.
+ * Contains wNAF, pippenger.
+ * @module
+ */
+/*! noble-curves - MIT License (c) 2022 Paul Miller (paulmillr.com) */
+
+
+var _0n = /* @__PURE__ */BigInt(0);
+var _1n = /* @__PURE__ */BigInt(1);
+/**
+ * Validates the static surface of a point constructor.
+ * This is only a cheap sanity check for the constructor hooks and fields consumed by generic
+ * factories; it does not certify `BASE`/`ZERO` semantics or prove the curve implementation itself.
+ * @param Point - Runtime point constructor.
+ * @throws On missing constructor hooks or malformed field metadata. {@link TypeError}
+ * @example
+ * Check that one point constructor exposes the static hooks generic helpers need.
+ *
+ * ```ts
+ * import { ed25519 } from '@noble/curves/ed25519.js';
+ * import { validatePointCons } from '@noble/curves/abstract/curve.js';
+ * validatePointCons(ed25519.Point);
+ * ```
+ */
+function validatePointCons(Point) {
+  var pc = Point;
+  if (typeof pc !== 'function') throw new TypeError('Point must be a constructor');
+  // validateObject only accepts plain objects, so copy the constructor statics into one bag first.
+  Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["validateObject"])({
+    Fp: pc.Fp,
+    Fn: pc.Fn,
+    fromAffine: pc.fromAffine,
+    fromBytes: pc.fromBytes,
+    fromHex: pc.fromHex
+  }, {
+    Fp: 'object',
+    Fn: 'object',
+    fromAffine: 'function',
+    fromBytes: 'function',
+    fromHex: 'function'
+  });
+  Object(_modular_js__WEBPACK_IMPORTED_MODULE_1__["validateField"])(pc.Fp);
+  Object(_modular_js__WEBPACK_IMPORTED_MODULE_1__["validateField"])(pc.Fn);
+}
+/**
+ * Computes both candidates first, but the final selection still branches on `condition`, so this
+ * is not a strict constant-time CMOV primitive.
+ * @param condition - Whether to negate the point.
+ * @param item - Point-like value.
+ * @returns Original or negated value.
+ * @example
+ * Keep the point or return its negation based on one boolean branch.
+ *
+ * ```ts
+ * import { negateCt } from '@noble/curves/abstract/curve.js';
+ * import { p256 } from '@noble/curves/nist.js';
+ * const maybeNegated = negateCt(true, p256.Point.BASE);
+ * ```
+ */
+function negateCt(condition, item) {
+  var neg = item.negate();
+  return condition ? neg : item;
+}
+/**
+ * Takes a bunch of Projective Points but executes only one
+ * inversion on all of them. Inversion is very slow operation,
+ * so this improves performance massively.
+ * Optimization: converts a list of projective points to a list of identical points with Z=1.
+ * Input points are left unchanged; the normalized points are returned as fresh instances.
+ * @param c - Point constructor.
+ * @param points - Projective points.
+ * @returns Fresh projective points reconstructed from normalized affine coordinates.
+ * @example
+ * Batch-normalize projective points with a single shared inversion.
+ *
+ * ```ts
+ * import { normalizeZ } from '@noble/curves/abstract/curve.js';
+ * import { p256 } from '@noble/curves/nist.js';
+ * const points = normalizeZ(p256.Point, [p256.Point.BASE, p256.Point.BASE.double()]);
+ * ```
+ */
+function normalizeZ(c, points) {
+  var invertedZs = Object(_modular_js__WEBPACK_IMPORTED_MODULE_1__["FpInvertBatch"])(c.Fp, points.map(p => p.Z));
+  return points.map((p, i) => c.fromAffine(p.toAffine(invertedZs[i])));
+}
+function validateW(W, bits) {
+  if (!Number.isSafeInteger(W) || W <= 0 || W > bits) throw new Error('invalid window size, expected [1..' + bits + '], got W=' + W);
+}
+function calcWOpts(W, scalarBits) {
+  validateW(W, scalarBits);
+  var windows = Math.ceil(scalarBits / W) + 1; // W=8 33. Not 32, because we skip zero
+  var windowSize = 2 ** (W - 1); // W=8 128. Not 256, because we skip zero
+  var maxNumber = 2 ** W; // W=8 256
+  var mask = Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["bitMask"])(W); // W=8 255 == mask 0b11111111
+  var shiftBy = BigInt(W); // W=8 8
+  return {
+    windows,
+    windowSize,
+    mask,
+    maxNumber,
+    shiftBy
+  };
+}
+function calcOffsets(n, window, wOpts) {
+  var windowSize = wOpts.windowSize,
+    mask = wOpts.mask,
+    maxNumber = wOpts.maxNumber,
+    shiftBy = wOpts.shiftBy;
+  var wbits = Number(n & mask); // extract W bits.
+  var nextN = n >> shiftBy; // shift number by W bits.
+  // What actually happens here:
+  // const highestBit = Number(mask ^ (mask >> 1n));
+  // let wbits2 = wbits - 1; // skip zero
+  // if (wbits2 & highestBit) { wbits2 ^= Number(mask); // (~);
+  // split if bits > max: +224 => 256-32
+  if (wbits > windowSize) {
+    // we skip zero, which means instead of `>= size-1`, we do `> size`
+    wbits -= maxNumber; // -32, can be maxNumber - wbits, but then we need to set isNeg here.
+    nextN += _1n; // +256 (carry)
+  }
+  var offsetStart = window * windowSize;
+  var offset = offsetStart + Math.abs(wbits) - 1; // -1 because we skip zero; ignore when isZero
+  var isZero = wbits === 0; // is current window slice a 0?
+  var isNeg = wbits < 0; // is current window slice negative?
+  var isNegF = window % 2 !== 0; // fake branch noise only
+  var offsetF = offsetStart; // fake branch noise only
+  return {
+    nextN,
+    offset,
+    isZero,
+    isNeg,
+    isNegF,
+    offsetF
+  };
+}
+function validateMSMPoints(points, c) {
+  if (!Array.isArray(points)) throw new Error('array expected');
+  points.forEach((p, i) => {
+    if (!(p instanceof c)) throw new Error('invalid point at index ' + i);
+  });
+}
+function validateMSMScalars(scalars, field) {
+  if (!Array.isArray(scalars)) throw new Error('array of scalars expected');
+  scalars.forEach((s, i) => {
+    if (!field.isValid(s)) throw new Error('invalid scalar at index ' + i);
+  });
+}
+// Since points in different groups cannot be equal (different object constructor),
+// we can have single place to store precomputes.
+// Allows to make points frozen / immutable.
+var pointPrecomputes = new WeakMap();
+var pointWindowSizes = new WeakMap();
+function getW(P) {
+  // To disable precomputes:
+  // return 1;
+  // `1` is also the uncached sentinel: use the ladder / non-precomputed path.
+  return pointWindowSizes.get(P) || 1;
+}
+function assert0(n) {
+  // Internal invariant: a non-zero remainder here means the wNAF window decomposition or loop
+  // count is inconsistent, not that the original caller provided a bad scalar.
+  if (n !== _0n) throw new Error('invalid wNAF');
+}
+/**
+ * Elliptic curve multiplication of Point by scalar. Fragile.
+ * Table generation takes **30MB of ram and 10ms on high-end CPU**,
+ * but may take much longer on slow devices. Actual generation will happen on
+ * first call of `multiply()`. By default, `BASE` point is precomputed.
+ *
+ * Scalars should always be less than curve order: this should be checked inside of a curve itself.
+ * Creates precomputation tables for fast multiplication:
+ * - private scalar is split by fixed size windows of W bits
+ * - every window point is collected from window's table & added to accumulator
+ * - since windows are different, same point inside tables won't be accessed more than once per calc
+ * - each multiplication is 'Math.ceil(CURVE_ORDER / 𝑊) + 1' point additions (fixed for any scalar)
+ * - +1 window is neccessary for wNAF
+ * - wNAF reduces table size: 2x less memory + 2x faster generation, but 10% slower multiplication
+ *
+ * TODO: research returning a 2d JS array of windows instead of a single window.
+ * This would allow windows to be in different memory locations.
+ * @param Point - Point constructor.
+ * @param bits - Scalar bit length.
+ * @example
+ * Elliptic curve multiplication of Point by scalar.
+ *
+ * ```ts
+ * import { wNAF } from '@noble/curves/abstract/curve.js';
+ * import { p256 } from '@noble/curves/nist.js';
+ * const ladder = new wNAF(p256.Point, p256.Point.Fn.BITS);
+ * ```
+ */
+class wNAF {
+  // Parametrized with a given Point class (not individual point)
+  constructor(Point, bits) {
+    _defineProperty(this, "BASE", void 0);
+    _defineProperty(this, "ZERO", void 0);
+    _defineProperty(this, "Fn", void 0);
+    _defineProperty(this, "bits", void 0);
+    this.BASE = Point.BASE;
+    this.ZERO = Point.ZERO;
+    this.Fn = Point.Fn;
+    this.bits = bits;
+  }
+  // non-const time multiplication ladder
+  _unsafeLadder(elm, n) {
+    var p = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : this.ZERO;
+    var d = elm;
+    while (n > _0n) {
+      if (n & _1n) p = p.add(d);
+      d = d.double();
+      n >>= _1n;
+    }
+    return p;
+  }
+  /**
+   * Creates a wNAF precomputation window. Used for caching.
+   * Default window size is set by `utils.precompute()` and is equal to 8.
+   * Number of precomputed points depends on the curve size:
+   * 2^(𝑊−1) * (Math.ceil(𝑛 / 𝑊) + 1), where:
+   * - 𝑊 is the window size
+   * - 𝑛 is the bitlength of the curve order.
+   * For a 256-bit curve and window size 8, the number of precomputed points is 128 * 33 = 4224.
+   * @param point - Point instance
+   * @param W - window size
+   * @returns precomputed point tables flattened to a single array
+   */
+  precomputeWindow(point, W) {
+    var _calcWOpts = calcWOpts(W, this.bits),
+      windows = _calcWOpts.windows,
+      windowSize = _calcWOpts.windowSize;
+    var points = [];
+    var p = point;
+    var base = p;
+    for (var window = 0; window < windows; window++) {
+      base = p;
+      points.push(base);
+      // i=1, bc we skip 0
+      for (var i = 1; i < windowSize; i++) {
+        base = base.add(p);
+        points.push(base);
+      }
+      p = base.double();
+    }
+    return points;
+  }
+  /**
+   * Implements ec multiplication using precomputed tables and w-ary non-adjacent form.
+   * More compact implementation:
+   * https://github.com/paulmillr/noble-secp256k1/blob/47cb1669b6e506ad66b35fe7d76132ae97465da2/index.ts#L502-L541
+   * @returns real and fake (for const-time) points
+   */
+  wNAF(W, precomputes, n) {
+    // Scalar should be smaller than field order
+    if (!this.Fn.isValid(n)) throw new Error('invalid scalar');
+    // Accumulators
+    var p = this.ZERO;
+    var f = this.BASE;
+    // This code was first written with assumption that 'f' and 'p' will never be infinity point:
+    // since each addition is multiplied by 2 ** W, it cannot cancel each other. However,
+    // there is negate now: it is possible that negated element from low value
+    // would be the same as high element, which will create carry into next window.
+    // It's not obvious how this can fail, but still worth investigating later.
+    var wo = calcWOpts(W, this.bits);
+    for (var window = 0; window < wo.windows; window++) {
+      // (n === _0n) is handled and not early-exited. isEven and offsetF are used for noise
+      var _calcOffsets = calcOffsets(n, window, wo),
+        nextN = _calcOffsets.nextN,
+        offset = _calcOffsets.offset,
+        isZero = _calcOffsets.isZero,
+        isNeg = _calcOffsets.isNeg,
+        isNegF = _calcOffsets.isNegF,
+        offsetF = _calcOffsets.offsetF;
+      n = nextN;
+      if (isZero) {
+        // bits are 0: add garbage to fake point
+        // Important part for const-time getPublicKey: add random "noise" point to f.
+        f = f.add(negateCt(isNegF, precomputes[offsetF]));
+      } else {
+        // bits are 1: add to result point
+        p = p.add(negateCt(isNeg, precomputes[offset]));
+      }
+    }
+    assert0(n);
+    // Return both real and fake points so JIT keeps the noise path alive.
+    // Known caveat: negate/carry interactions can still drive `f` to infinity even when `p` is not,
+    // which weakens the noise path and leaves this only "less const-time" by about one bigint mul.
+    return {
+      p,
+      f
+    };
+  }
+  /**
+   * Implements unsafe EC multiplication using precomputed tables
+   * and w-ary non-adjacent form.
+   * @param acc - accumulator point to add result of multiplication
+   * @returns point
+   */
+  wNAFUnsafe(W, precomputes, n) {
+    var acc = arguments.length > 3 && arguments[3] !== undefined ? arguments[3] : this.ZERO;
+    var wo = calcWOpts(W, this.bits);
+    for (var window = 0; window < wo.windows; window++) {
+      if (n === _0n) break; // Early-exit, skip 0 value
+      var _calcOffsets2 = calcOffsets(n, window, wo),
+        nextN = _calcOffsets2.nextN,
+        offset = _calcOffsets2.offset,
+        isZero = _calcOffsets2.isZero,
+        isNeg = _calcOffsets2.isNeg;
+      n = nextN;
+      if (isZero) {
+        // Window bits are 0: skip processing.
+        // Move to next window.
+        continue;
+      } else {
+        var item = precomputes[offset];
+        acc = acc.add(isNeg ? item.negate() : item); // Re-using acc allows to save adds in MSM
+      }
+    }
+    assert0(n);
+    return acc;
+  }
+  getPrecomputes(W, point, transform) {
+    // Cache key is only point identity plus the remembered window size; callers must not reuse the
+    // same point with incompatible `transform(...)` layouts and expect a separate cache entry.
+    var comp = pointPrecomputes.get(point);
+    if (!comp) {
+      comp = this.precomputeWindow(point, W);
+      if (W !== 1) {
+        // Doing transform outside of if brings 15% perf hit
+        if (typeof transform === 'function') comp = transform(comp);
+        pointPrecomputes.set(point, comp);
+      }
+    }
+    return comp;
+  }
+  cached(point, scalar, transform) {
+    var W = getW(point);
+    return this.wNAF(W, this.getPrecomputes(W, point, transform), scalar);
+  }
+  unsafe(point, scalar, transform, prev) {
+    var W = getW(point);
+    if (W === 1) return this._unsafeLadder(point, scalar, prev); // For W=1 ladder is ~x2 faster
+    return this.wNAFUnsafe(W, this.getPrecomputes(W, point, transform), scalar, prev);
+  }
+  // We calculate precomputes for elliptic curve point multiplication
+  // using windowed method. This specifies window size and
+  // stores precomputed values. Usually only base point would be precomputed.
+  createCache(P, W) {
+    validateW(W, this.bits);
+    pointWindowSizes.set(P, W);
+    pointPrecomputes.delete(P);
+  }
+  hasCache(elm) {
+    return getW(elm) !== 1;
+  }
+}
+/**
+ * Endomorphism-specific multiplication for Koblitz curves.
+ * Cost: 128 dbl, 0-256 adds.
+ * @param Point - Point constructor.
+ * @param point - Input point.
+ * @param k1 - First non-negative absolute scalar chunk.
+ * @param k2 - Second non-negative absolute scalar chunk.
+ * @returns Partial multiplication results.
+ * @example
+ * Endomorphism-specific multiplication for Koblitz curves.
+ *
+ * ```ts
+ * import { mulEndoUnsafe } from '@noble/curves/abstract/curve.js';
+ * import { secp256k1 } from '@noble/curves/secp256k1.js';
+ * const parts = mulEndoUnsafe(secp256k1.Point, secp256k1.Point.BASE, 3n, 5n);
+ * ```
+ */
+function mulEndoUnsafe(Point, point, k1, k2) {
+  var acc = point;
+  var p1 = Point.ZERO;
+  var p2 = Point.ZERO;
+  while (k1 > _0n || k2 > _0n) {
+    if (k1 & _1n) p1 = p1.add(acc);
+    if (k2 & _1n) p2 = p2.add(acc);
+    acc = acc.double();
+    k1 >>= _1n;
+    k2 >>= _1n;
+  }
+  return {
+    p1,
+    p2
+  };
+}
+/**
+ * Pippenger algorithm for multi-scalar multiplication (MSM, Pa + Qb + Rc + ...).
+ * 30x faster vs naive addition on L=4096, 10x faster than precomputes.
+ * For N=254bit, L=1, it does: 1024 ADD + 254 DBL. For L=5: 1536 ADD + 254 DBL.
+ * Algorithmically constant-time (for same L), even when 1 point + scalar, or when scalar = 0.
+ * @param c - Curve Point constructor
+ * @param points - array of L curve points
+ * @param scalars - array of L scalars (aka secret keys / bigints)
+ * @returns MSM result point. Empty input is accepted and returns the identity.
+ * @throws If the point set, scalar set, or MSM sizing is invalid. {@link Error}
+ * @example
+ * Pippenger algorithm for multi-scalar multiplication (MSM, Pa + Qb + Rc + ...).
+ *
+ * ```ts
+ * import { pippenger } from '@noble/curves/abstract/curve.js';
+ * import { p256 } from '@noble/curves/nist.js';
+ * const point = pippenger(p256.Point, [p256.Point.BASE, p256.Point.BASE.double()], [2n, 3n]);
+ * ```
+ */
+function pippenger(c, points, scalars) {
+  // If we split scalars by some window (let's say 8 bits), every chunk will only
+  // take 256 buckets even if there are 4096 scalars, also re-uses double.
+  // TODO:
+  // - https://eprint.iacr.org/2024/750.pdf
+  // - https://tches.iacr.org/index.php/TCHES/article/view/10287
+  // 0 is accepted in scalars
+  var fieldN = c.Fn;
+  validateMSMPoints(points, c);
+  validateMSMScalars(scalars, fieldN);
+  var plength = points.length;
+  var slength = scalars.length;
+  if (plength !== slength) throw new Error('arrays of points and scalars must have equal length');
+  // if (plength === 0) throw new Error('array must be of length >= 2');
+  var zero = c.ZERO;
+  var wbits = Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["bitLen"])(BigInt(plength));
+  var windowSize = 1; // bits
+  if (wbits > 12) windowSize = wbits - 3;else if (wbits > 4) windowSize = wbits - 2;else if (wbits > 0) windowSize = 2;
+  var MASK = Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["bitMask"])(windowSize);
+  var buckets = new Array(Number(MASK) + 1).fill(zero); // +1 for zero array
+  var lastBits = Math.floor((fieldN.BITS - 1) / windowSize) * windowSize;
+  var sum = zero;
+  for (var i = lastBits; i >= 0; i -= windowSize) {
+    buckets.fill(zero);
+    for (var j = 0; j < slength; j++) {
+      var scalar = scalars[j];
+      var _wbits = Number(scalar >> BigInt(i) & MASK);
+      buckets[_wbits] = buckets[_wbits].add(points[j]);
+    }
+    var resI = zero; // not using this will do small speed-up, but will lose ct
+    // Skip first bucket, because it is zero
+    for (var _j = buckets.length - 1, sumI = zero; _j > 0; _j--) {
+      sumI = sumI.add(buckets[_j]);
+      resI = resI.add(sumI);
+    }
+    sum = sum.add(resI);
+    if (i !== 0) for (var _j2 = 0; _j2 < windowSize; _j2++) sum = sum.double();
+  }
+  return sum;
+}
+/**
+ * Precomputed multi-scalar multiplication (MSM, Pa + Qb + Rc + ...).
+ * @param c - Curve Point constructor
+ * @param points - array of L curve points
+ * @param windowSize - Precompute window size.
+ * @returns Function which multiplies points with scalars. The closure accepts
+ *   `scalars.length <= points.length`, and omitted trailing scalars are treated as zero.
+ * @throws If the point set or precompute window is invalid. {@link Error}
+ * @example
+ * Precomputed multi-scalar multiplication (MSM, Pa + Qb + Rc + ...).
+ *
+ * ```ts
+ * import { precomputeMSMUnsafe } from '@noble/curves/abstract/curve.js';
+ * import { p256 } from '@noble/curves/nist.js';
+ * const msm = precomputeMSMUnsafe(p256.Point, [p256.Point.BASE], 4);
+ * const point = msm([3n]);
+ * ```
+ */
+function precomputeMSMUnsafe(c, points, windowSize) {
+  /**
+   * Performance Analysis of Window-based Precomputation
+   *
+   * Base Case (256-bit scalar, 8-bit window):
+   * - Standard precomputation requires:
+   *   - 31 additions per scalar × 256 scalars = 7,936 ops
+   *   - Plus 255 summary additions = 8,191 total ops
+   *   Note: Summary additions can be optimized via accumulator
+   *
+   * Chunked Precomputation Analysis:
+   * - Using 32 chunks requires:
+   *   - 255 additions per chunk
+   *   - 256 doublings
+   *   - Total: (255 × 32) + 256 = 8,416 ops
+   *
+   * Memory Usage Comparison:
+   * Window Size | Standard Points | Chunked Points
+   * ------------|-----------------|---------------
+   *     4-bit   |     520         |      15
+   *     8-bit   |    4,224        |     255
+   *    10-bit   |   13,824        |   1,023
+   *    16-bit   |  557,056        |  65,535
+   *
+   * Key Advantages:
+   * 1. Enables larger window sizes due to reduced memory overhead
+   * 2. More efficient for smaller scalar counts:
+   *    - 16 chunks: (16 × 255) + 256 = 4,336 ops
+   *    - ~2x faster than standard 8,191 ops
+   *
+   * Limitations:
+   * - Not suitable for plain precomputes (requires 256 constant doublings)
+   * - Performance degrades with larger scalar counts:
+   *   - Optimal for ~256 scalars
+   *   - Less efficient for 4096+ scalars (Pippenger preferred)
+   */
+  var fieldN = c.Fn;
+  validateW(windowSize, fieldN.BITS);
+  validateMSMPoints(points, c);
+  var zero = c.ZERO;
+  var tableSize = 2 ** windowSize - 1; // table size (without zero)
+  var chunks = Math.ceil(fieldN.BITS / windowSize); // chunks of item
+  var MASK = Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["bitMask"])(windowSize);
+  var tables = points.map(p => {
+    var res = [];
+    for (var i = 0, acc = p; i < tableSize; i++) {
+      res.push(acc);
+      acc = acc.add(p);
+    }
+    return res;
+  });
+  return scalars => {
+    validateMSMScalars(scalars, fieldN);
+    if (scalars.length > points.length) throw new Error('array of scalars must be smaller than array of points');
+    var res = zero;
+    for (var i = 0; i < chunks; i++) {
+      // No need to double if accumulator is still zero.
+      if (res !== zero) for (var j = 0; j < windowSize; j++) res = res.double();
+      var shiftBy = BigInt(chunks * windowSize - (i + 1) * windowSize);
+      for (var _j3 = 0; _j3 < scalars.length; _j3++) {
+        var n = scalars[_j3];
+        var curr = Number(n >> shiftBy & MASK);
+        if (!curr) continue; // skip zero scalars chunks
+        res = res.add(tables[_j3][curr - 1]);
+      }
+    }
+    return res;
+  };
+}
+function createField(order, field, isLE) {
+  if (field) {
+    // Reuse supplied field overrides as-is; `isLE` only affects freshly constructed fallback
+    // fields, and validateField() below only checks the arithmetic subset, not full byte/cmov
+    // behavior.
+    if (field.ORDER !== order) throw new Error('Field.ORDER must match order: Fp == p, Fn == n');
+    Object(_modular_js__WEBPACK_IMPORTED_MODULE_1__["validateField"])(field);
+    return field;
+  } else {
+    return Object(_modular_js__WEBPACK_IMPORTED_MODULE_1__["Field"])(order, {
+      isLE
+    });
+  }
+}
+/**
+ * Validates basic CURVE shape and field membership, then creates fields.
+ * This does not prove that the generator is on-curve, that subgroup/order data are consistent, or
+ * that the curve equation itself is otherwise sane.
+ * @param type - Curve family.
+ * @param CURVE - Curve parameters.
+ * @param curveOpts - Optional field overrides:
+ *   - `Fp` (optional): Optional base-field override.
+ *   - `Fn` (optional): Optional scalar-field override.
+ * @param FpFnLE - Whether field encoding is little-endian.
+ * @returns Frozen curve parameters and fields.
+ * @throws If the curve parameters or field overrides are invalid. {@link Error}
+ * @example
+ * Build curve fields from raw constants before constructing a curve instance.
+ *
+ * ```ts
+ * const curve = createCurveFields('weierstrass', {
+ *   p: 17n,
+ *   n: 19n,
+ *   h: 1n,
+ *   a: 2n,
+ *   b: 2n,
+ *   Gx: 5n,
+ *   Gy: 1n,
+ * });
+ * ```
+ */
+function createCurveFields(type, CURVE) {
+  var curveOpts = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : {};
+  var FpFnLE = arguments.length > 3 ? arguments[3] : undefined;
+  if (FpFnLE === undefined) FpFnLE = type === 'edwards';
+  if (!CURVE || typeof CURVE !== 'object') throw new Error("expected valid ".concat(type, " CURVE object"));
+  for (var p of ['p', 'n', 'h']) {
+    var val = CURVE[p];
+    if (!(typeof val === 'bigint' && val > _0n)) throw new Error("CURVE.".concat(p, " must be positive bigint"));
+  }
+  var Fp = createField(CURVE.p, curveOpts.Fp, FpFnLE);
+  var Fn = createField(CURVE.n, curveOpts.Fn, FpFnLE);
+  var _b = type === 'weierstrass' ? 'b' : 'd';
+  var params = ['Gx', 'Gy', 'a', _b];
+  for (var _p of params) {
+    // @ts-ignore
+    if (!Fp.isValid(CURVE[_p])) throw new Error("CURVE.".concat(_p, " must be valid field element of CURVE.Fp"));
+  }
+  CURVE = Object.freeze(Object.assign({}, CURVE));
+  return {
+    CURVE,
+    Fp,
+    Fn
+  };
+}
+/**
+ * @param randomSecretKey - Secret-key generator.
+ * @param getPublicKey - Public-key derivation helper.
+ * @returns Keypair generator.
+ * @example
+ * Build a `keygen()` helper from existing secret-key and public-key primitives.
+ *
+ * ```ts
+ * import { createKeygen } from '@noble/curves/abstract/curve.js';
+ * import { p256 } from '@noble/curves/nist.js';
+ * const keygen = createKeygen(p256.utils.randomSecretKey, p256.getPublicKey);
+ * const pair = keygen();
+ * ```
+ */
+function createKeygen(randomSecretKey, getPublicKey) {
+  return function keygen(seed) {
+    var secretKey = randomSecretKey(seed);
+    return {
+      secretKey,
+      publicKey: getPublicKey(secretKey)
+    };
+  };
+}
+
+/***/ }),
+
+/***/ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/abstract/edwards.js":
+/*!****************************************************************************!*\
+  !*** ./src/onlykey-fido2/onlykey/vendor/@noble/curves/abstract/edwards.js ***!
+  \****************************************************************************/
+/*! exports provided: edwards, PrimeEdwardsPoint, eddsa */
+/***/ (function(module, __webpack_exports__, __webpack_require__) {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "edwards", function() { return edwards; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "PrimeEdwardsPoint", function() { return PrimeEdwardsPoint; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "eddsa", function() { return eddsa; });
+/* harmony import */ var _utils_js__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! ../utils.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/utils.js");
+/* harmony import */ var _curve_js__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(/*! ./curve.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/abstract/curve.js");
+/* harmony import */ var _modular_js__WEBPACK_IMPORTED_MODULE_2__ = __webpack_require__(/*! ./modular.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/abstract/modular.js");
+function _defineProperty(e, r, t) { return (r = _toPropertyKey(r)) in e ? Object.defineProperty(e, r, { value: t, enumerable: !0, configurable: !0, writable: !0 }) : e[r] = t, e; }
+function _toPropertyKey(t) { var i = _toPrimitive(t, "string"); return "symbol" == typeof i ? i : i + ""; }
+function _toPrimitive(t, r) { if ("object" != typeof t || !t) return t; var e = t[Symbol.toPrimitive]; if (void 0 !== e) { var i = e.call(t, r || "default"); if ("object" != typeof i) return i; throw new TypeError("@@toPrimitive must return a primitive value."); } return ("string" === r ? String : Number)(t); }
+/**
+ * Twisted Edwards curve. The formula is: ax² + y² = 1 + dx²y².
+ * For design rationale of types / exports, see weierstrass module documentation.
+ * Untwisted Edwards curves exist, but they aren't used in real-world protocols.
+ * @module
+ */
+/*! noble-curves - MIT License (c) 2022 Paul Miller (paulmillr.com) */
+
+
+
+// Be friendly to bad ECMAScript parsers by not using bigint literals
+// prettier-ignore
+var _0n = /* @__PURE__ */BigInt(0),
+  _1n = /* @__PURE__ */BigInt(1),
+  _2n = /* @__PURE__ */BigInt(2),
+  _8n = /* @__PURE__ */BigInt(8);
+// Affine Edwards-equation check only; this does not prove subgroup membership, canonical
+// encoding, prime-order base-point requirements, or identity exclusion.
+function isEdValidXY(Fp, CURVE, x, y) {
+  var x2 = Fp.sqr(x);
+  var y2 = Fp.sqr(y);
+  var left = Fp.add(Fp.mul(CURVE.a, x2), y2);
+  var right = Fp.add(Fp.ONE, Fp.mul(CURVE.d, Fp.mul(x2, y2)));
+  return Fp.eql(left, right);
+}
+/**
+ * @param params - Curve parameters. See {@link EdwardsOpts}.
+ * @param extraOpts - Optional helpers and overrides. See {@link EdwardsExtraOpts}.
+ * @returns Edwards point constructor. Generator validation here only checks
+ *   that `(Gx, Gy)` satisfies the affine Edwards equation.
+ *   RFC 8032 base-point constraints like `B != (0,1)` and `[L]B = 0`
+ *   are left to the caller's chosen parameters, since eager subgroup
+ *   validation here adds about 10-15ms to heavyweight imports like ed448.
+ *   The returned constructor also eagerly marks `Point.BASE` for W=8
+ *   precompute caching. Some code paths still assume
+ *   `Fp.BYTES === Fn.BYTES`, so mismatched byte lengths are not fully audited here.
+ * @throws If the curve parameters or Edwards overrides are invalid. {@link Error}
+ * @example
+ * ```ts
+ * import { edwards } from '@noble/curves/abstract/edwards.js';
+ * import { jubjub } from '@noble/curves/misc.js';
+ * // Build a point constructor from explicit curve parameters, then use its base point.
+ * const Point = edwards(jubjub.Point.CURVE());
+ * Point.BASE.toHex();
+ * ```
+ */
+function edwards(params) {
+  var _Point;
+  var extraOpts = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : {};
+  var opts = extraOpts;
+  var validated = Object(_curve_js__WEBPACK_IMPORTED_MODULE_1__["createCurveFields"])('edwards', params, opts, opts.FpFnLE);
+  var Fp = validated.Fp,
+    Fn = validated.Fn;
+  var CURVE = validated.CURVE;
+  var cofactor = CURVE.h;
+  Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["validateObject"])(opts, {}, {
+    uvRatio: 'function'
+  });
+  // Important:
+  // There are some places where Fp.BYTES is used instead of nByteLength.
+  // So far, everything has been tested with curves of Fp.BYTES == nByteLength.
+  // TODO: test and find curves which behave otherwise.
+  var MASK = _2n << BigInt(Fn.BYTES * 8) - _1n;
+  var modP = n => Fp.create(n); // Function overrides
+  // sqrt(u/v)
+  var uvRatio = opts.uvRatio === undefined ? (u, v) => {
+    try {
+      return {
+        isValid: true,
+        value: Fp.sqrt(Fp.div(u, v))
+      };
+    } catch (e) {
+      return {
+        isValid: false,
+        value: _0n
+      };
+    }
+  } : opts.uvRatio;
+  // Validate whether the passed curve params are valid.
+  // equation ax² + y² = 1 + dx²y² should work for generator point.
+  if (!isEdValidXY(Fp, CURVE, CURVE.Gx, CURVE.Gy)) throw new Error('bad curve params: generator point');
+  /**
+   * Asserts coordinate is valid: 0 <= n < MASK.
+   * Coordinates >= Fp.ORDER are allowed for zip215.
+   */
+  function acoord(title, n) {
+    var banZero = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : false;
+    var min = banZero ? _1n : _0n;
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["aInRange"])('coordinate ' + title, n, min, MASK);
+    return n;
+  }
+  function aedpoint(other) {
+    if (!(other instanceof Point)) throw new Error('EdwardsPoint expected');
+  }
+  // Extended Point works in extended coordinates: (X, Y, Z, T) ∋ (x=X/Z, y=Y/Z, T=xy).
+  // https://en.wikipedia.org/wiki/Twisted_Edwards_curve#Extended_coordinates
+  class Point {
+    constructor(X, Y, Z, T) {
+      _defineProperty(this, "X", void 0);
+      _defineProperty(this, "Y", void 0);
+      _defineProperty(this, "Z", void 0);
+      _defineProperty(this, "T", void 0);
+      this.X = acoord('x', X);
+      this.Y = acoord('y', Y);
+      this.Z = acoord('z', Z, true);
+      this.T = acoord('t', T);
+      Object.freeze(this);
+    }
+    static CURVE() {
+      return CURVE;
+    }
+    /**
+     * Create one extended Edwards point from affine coordinates.
+     * Does NOT validate that the point is on-curve or torsion-free.
+     * Use `.assertValidity()` on adversarial inputs.
+     */
+    static fromAffine(p) {
+      if (p instanceof Point) throw new Error('extended point not allowed');
+      var _ref = p || {},
+        x = _ref.x,
+        y = _ref.y;
+      acoord('x', x);
+      acoord('y', y);
+      return new Point(x, y, _1n, modP(x * y));
+    }
+    // Uses algo from RFC8032 5.1.3.
+    static fromBytes(bytes) {
+      var zip215 = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : false;
+      var len = Fp.BYTES;
+      var a = CURVE.a,
+        d = CURVE.d;
+      bytes = Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["copyBytes"])(Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(bytes, len, 'point'));
+      Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abool"])(zip215, 'zip215');
+      var normed = Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["copyBytes"])(bytes); // copy again, we'll manipulate it
+      var lastByte = bytes[len - 1]; // select last byte
+      normed[len - 1] = lastByte & ~0x80; // clear last bit
+      var y = Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["bytesToNumberLE"])(normed);
+      // zip215=true is good for consensus-critical apps. =false follows RFC8032 / NIST186-5.
+      // RFC8032 prohibits >= p, but ZIP215 doesn't
+      // zip215=true:  0 <= y < MASK (2^256 for ed25519)
+      // zip215=false: 0 <= y < P (2^255-19 for ed25519)
+      var max = zip215 ? MASK : Fp.ORDER;
+      Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["aInRange"])('point.y', y, _0n, max);
+      // Ed25519: x² = (y²-1)/(dy²+1) mod p. Ed448: x² = (y²-1)/(dy²-1) mod p. Generic case:
+      // ax²+y²=1+dx²y² => y²-1=dx²y²-ax² => y²-1=x²(dy²-a) => x²=(y²-1)/(dy²-a)
+      var y2 = modP(y * y); // denominator is always non-0 mod p.
+      var u = modP(y2 - _1n); // u = y² - 1
+      var v = modP(d * y2 - a); // v = d y² + 1.
+      var _uvRatio = uvRatio(u, v),
+        isValid = _uvRatio.isValid,
+        x = _uvRatio.value; // √(u/v)
+      if (!isValid) throw new Error('bad point: invalid y coordinate');
+      var isXOdd = (x & _1n) === _1n; // There are 2 square roots. Use x_0 bit to select proper
+      var isLastByteOdd = (lastByte & 0x80) !== 0; // x_0, last bit
+      if (!zip215 && x === _0n && isLastByteOdd)
+        // if x=0 and x_0 = 1, fail
+        throw new Error('bad point: x=0 and x_0=1');
+      if (isLastByteOdd !== isXOdd) x = modP(-x); // if x_0 != x mod 2, set x = p-x
+      return Point.fromAffine({
+        x,
+        y
+      });
+    }
+    static fromHex(hex) {
+      var zip215 = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : false;
+      return Point.fromBytes(Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["hexToBytes"])(hex), zip215);
+    }
+    get x() {
+      return this.toAffine().x;
+    }
+    get y() {
+      return this.toAffine().y;
+    }
+    precompute() {
+      var windowSize = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : 8;
+      var isLazy = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : true;
+      wnaf.createCache(this, windowSize);
+      if (!isLazy) this.multiply(_2n); // random number
+      return this;
+    }
+    // Useful in fromAffine() - not for fromBytes(), which always created valid points.
+    assertValidity() {
+      var p = this;
+      var a = CURVE.a,
+        d = CURVE.d;
+      // Keep generic Edwards validation fail-closed on the neutral point.
+      // Even though ZERO is algebraically valid and can roundtrip through encodings, higher-level
+      // callers often reach it only through broken hash/scalar plumbing; rejecting it here avoids
+      // silently treating that degenerate state as an ordinary public point.
+      if (p.is0()) throw new Error('bad point: ZERO'); // TODO: optimize, with vars below?
+      // Equation in affine coordinates: ax² + y² = 1 + dx²y²
+      // Equation in projective coordinates (X/Z, Y/Z, Z):  (aX² + Y²)Z² = Z⁴ + dX²Y²
+      var X = p.X,
+        Y = p.Y,
+        Z = p.Z,
+        T = p.T;
+      var X2 = modP(X * X); // X²
+      var Y2 = modP(Y * Y); // Y²
+      var Z2 = modP(Z * Z); // Z²
+      var Z4 = modP(Z2 * Z2); // Z⁴
+      var aX2 = modP(X2 * a); // aX²
+      var left = modP(Z2 * modP(aX2 + Y2)); // (aX² + Y²)Z²
+      var right = modP(Z4 + modP(d * modP(X2 * Y2))); // Z⁴ + dX²Y²
+      if (left !== right) throw new Error('bad point: equation left != right (1)');
+      // In Extended coordinates we also have T, which is x*y=T/Z: check X*Y == Z*T
+      var XY = modP(X * Y);
+      var ZT = modP(Z * T);
+      if (XY !== ZT) throw new Error('bad point: equation left != right (2)');
+    }
+    // Compare one point to another.
+    equals(other) {
+      aedpoint(other);
+      var X1 = this.X,
+        Y1 = this.Y,
+        Z1 = this.Z;
+      var X2 = other.X,
+        Y2 = other.Y,
+        Z2 = other.Z;
+      var X1Z2 = modP(X1 * Z2);
+      var X2Z1 = modP(X2 * Z1);
+      var Y1Z2 = modP(Y1 * Z2);
+      var Y2Z1 = modP(Y2 * Z1);
+      return X1Z2 === X2Z1 && Y1Z2 === Y2Z1;
+    }
+    is0() {
+      return this.equals(Point.ZERO);
+    }
+    negate() {
+      // Flips point sign to a negative one (-x, y in affine coords)
+      return new Point(modP(-this.X), this.Y, this.Z, modP(-this.T));
+    }
+    // Fast algo for doubling Extended Point.
+    // https://hyperelliptic.org/EFD/g1p/auto-twisted-extended.html#doubling-dbl-2008-hwcd
+    // Cost: 4M + 4S + 1*a + 6add + 1*2.
+    double() {
+      var a = CURVE.a;
+      var X1 = this.X,
+        Y1 = this.Y,
+        Z1 = this.Z;
+      var A = modP(X1 * X1); // A = X12
+      var B = modP(Y1 * Y1); // B = Y12
+      var C = modP(_2n * modP(Z1 * Z1)); // C = 2*Z12
+      var D = modP(a * A); // D = a*A
+      var x1y1 = X1 + Y1;
+      var E = modP(modP(x1y1 * x1y1) - A - B); // E = (X1+Y1)2-A-B
+      var G = D + B; // G = D+B
+      var F = G - C; // F = G-C
+      var H = D - B; // H = D-B
+      var X3 = modP(E * F); // X3 = E*F
+      var Y3 = modP(G * H); // Y3 = G*H
+      var T3 = modP(E * H); // T3 = E*H
+      var Z3 = modP(F * G); // Z3 = F*G
+      return new Point(X3, Y3, Z3, T3);
+    }
+    // Fast algo for adding 2 Extended Points.
+    // https://hyperelliptic.org/EFD/g1p/auto-twisted-extended.html#addition-add-2008-hwcd
+    // Cost: 9M + 1*a + 1*d + 7add.
+    add(other) {
+      aedpoint(other);
+      var a = CURVE.a,
+        d = CURVE.d;
+      var X1 = this.X,
+        Y1 = this.Y,
+        Z1 = this.Z,
+        T1 = this.T;
+      var X2 = other.X,
+        Y2 = other.Y,
+        Z2 = other.Z,
+        T2 = other.T;
+      var A = modP(X1 * X2); // A = X1*X2
+      var B = modP(Y1 * Y2); // B = Y1*Y2
+      var C = modP(T1 * d * T2); // C = T1*d*T2
+      var D = modP(Z1 * Z2); // D = Z1*Z2
+      var E = modP((X1 + Y1) * (X2 + Y2) - A - B); // E = (X1+Y1)*(X2+Y2)-A-B
+      var F = D - C; // F = D-C
+      var G = D + C; // G = D+C
+      var H = modP(B - a * A); // H = B-a*A
+      var X3 = modP(E * F); // X3 = E*F
+      var Y3 = modP(G * H); // Y3 = G*H
+      var T3 = modP(E * H); // T3 = E*H
+      var Z3 = modP(F * G); // Z3 = F*G
+      return new Point(X3, Y3, Z3, T3);
+    }
+    subtract(other) {
+      // Validate before calling `negate()` so wrong inputs fail with the point guard
+      // instead of leaking a foreign `negate()` error.
+      aedpoint(other);
+      return this.add(other.negate());
+    }
+    // Constant-time multiplication.
+    multiply(scalar) {
+      // 1 <= scalar < L
+      // Keep the subgroup-scalar contract strict instead of reducing 0 / n to ZERO.
+      // In keygen/signing-style callers, those values usually mean broken hash/scalar plumbing,
+      // and failing closed is safer than silently producing the identity point.
+      if (!Fn.isValidNot0(scalar)) throw new RangeError('invalid scalar: expected 1 <= sc < curve.n');
+      var _wnaf$cached = wnaf.cached(this, scalar, p => Object(_curve_js__WEBPACK_IMPORTED_MODULE_1__["normalizeZ"])(Point, p)),
+        p = _wnaf$cached.p,
+        f = _wnaf$cached.f;
+      return Object(_curve_js__WEBPACK_IMPORTED_MODULE_1__["normalizeZ"])(Point, [p, f])[0];
+    }
+    // Non-constant-time multiplication. Uses double-and-add algorithm.
+    // It's faster, but should only be used when you don't care about
+    // an exposed private key e.g. sig verification.
+    // Keeps the same subgroup-scalar contract: 0 is allowed for public-scalar callers, but
+    // n and larger values are rejected instead of being reduced mod n to the identity point.
+    multiplyUnsafe(scalar) {
+      // 0 <= scalar < L
+      if (!Fn.isValid(scalar)) throw new RangeError('invalid scalar: expected 0 <= sc < curve.n');
+      if (scalar === _0n) return Point.ZERO;
+      if (this.is0() || scalar === _1n) return this;
+      return wnaf.unsafe(this, scalar, p => Object(_curve_js__WEBPACK_IMPORTED_MODULE_1__["normalizeZ"])(Point, p));
+    }
+    // Checks if point is of small order.
+    // If you add something to small order point, you will have "dirty"
+    // point with torsion component.
+    // Clears cofactor and checks if the result is 0.
+    isSmallOrder() {
+      return this.clearCofactor().is0();
+    }
+    // Multiplies point by curve order and checks if the result is 0.
+    // Returns `false` is the point is dirty.
+    isTorsionFree() {
+      return wnaf.unsafe(this, CURVE.n).is0();
+    }
+    // Converts Extended point to default (x, y) coordinates.
+    // Can accept precomputed Z^-1 - for example, from invertBatch.
+    toAffine(invertedZ) {
+      var p = this;
+      var iz = invertedZ;
+      var X = p.X,
+        Y = p.Y,
+        Z = p.Z;
+      var is0 = p.is0();
+      if (iz == null) iz = is0 ? _8n : Fp.inv(Z); // 8 was chosen arbitrarily
+      var x = modP(X * iz);
+      var y = modP(Y * iz);
+      var zz = Fp.mul(Z, iz);
+      if (is0) return {
+        x: _0n,
+        y: _1n
+      };
+      if (zz !== _1n) throw new Error('invZ was invalid');
+      return {
+        x,
+        y
+      };
+    }
+    clearCofactor() {
+      if (cofactor === _1n) return this;
+      return this.multiplyUnsafe(cofactor);
+    }
+    toBytes() {
+      var _this$toAffine = this.toAffine(),
+        x = _this$toAffine.x,
+        y = _this$toAffine.y;
+      // Fp.toBytes() allows non-canonical encoding of y (>= p).
+      var bytes = Fp.toBytes(y);
+      // Each y has 2 valid points: (x, y), (x,-y).
+      // When compressing, it's enough to store y and use the last byte to encode sign of x
+      bytes[bytes.length - 1] |= x & _1n ? 0x80 : 0;
+      return bytes;
+    }
+    toHex() {
+      return Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["bytesToHex"])(this.toBytes());
+    }
+    toString() {
+      return "<Point ".concat(this.is0() ? 'ZERO' : this.toHex(), ">");
+    }
+  }
+  _Point = Point;
+  // base / generator point
+  _defineProperty(Point, "BASE", new _Point(CURVE.Gx, CURVE.Gy, _1n, modP(CURVE.Gx * CURVE.Gy)));
+  // zero / infinity / identity point
+  _defineProperty(Point, "ZERO", new _Point(_0n, _1n, _1n, _0n));
+  // 0, 1, 1, 0
+  // math field
+  _defineProperty(Point, "Fp", Fp);
+  // scalar field
+  _defineProperty(Point, "Fn", Fn);
+  var wnaf = new _curve_js__WEBPACK_IMPORTED_MODULE_1__["wNAF"](Point, Fn.BITS);
+  // Keep constructor work cheap: subgroup/generator validation belongs to the caller's curve
+  // parameters, and doing the extra checks here adds about 10-15ms to heavy module imports.
+  // Callers that construct custom curves are responsible for supplying the correct base point.
+  // try {
+  //   Point.BASE.assertValidity();
+  //   if (!Point.BASE.isTorsionFree()) throw new Error('bad point: not in prime-order subgroup');
+  // } catch {
+  //   throw new Error('bad curve params: generator point');
+  // }
+  // Tiny toy curves can have scalar fields narrower than 8 bits. Skip the
+  // eager W=8 cache there instead of rejecting an otherwise valid constructor.
+  if (Fn.BITS >= 8) Point.BASE.precompute(8); // Enable precomputes. Slows down first publicKey computation by 20ms.
+  Object.freeze(Point.prototype);
+  Object.freeze(Point);
+  return Point;
+}
+/**
+ * Base class for prime-order points like Ristretto255 and Decaf448.
+ * These points eliminate cofactor issues by representing equivalence classes
+ * of Edwards curve points. Multiple Edwards representatives can describe the
+ * same abstract wrapper element, so wrapper validity is not the same thing as
+ * the hidden representative being torsion-free.
+ * @param ep - Backing Edwards point.
+ * @example
+ * Base class for prime-order points like Ristretto255 and Decaf448.
+ *
+ * ```ts
+ * import { ristretto255 } from '@noble/curves/ed25519.js';
+ * const point = ristretto255.Point.BASE.multiply(2n);
+ * ```
+ */
+class PrimeEdwardsPoint {
+  /**
+   * Wrap one internal Edwards representative directly.
+   * This is not a canonical encoding boundary: alternate Edwards
+   * representatives may still describe the same abstract wrapper element.
+   */
+  constructor(ep) {
+    _defineProperty(this, "ep", void 0);
+    this.ep = ep;
+  }
+  // Static methods that must be implemented by subclasses
+  static fromBytes(_bytes) {
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["notImplemented"])();
+  }
+  static fromHex(_hex) {
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["notImplemented"])();
+  }
+  get x() {
+    return this.toAffine().x;
+  }
+  get y() {
+    return this.toAffine().y;
+  }
+  // Common implementations
+  clearCofactor() {
+    // no-op for the abstract prime-order wrapper group; this is about the
+    // wrapper element, not the hidden Edwards representative.
+    return this;
+  }
+  assertValidity() {
+    // Keep wrapper validity at the abstract-group boundary. Canonical decode
+    // may choose Edwards representatives that differ by small torsion, so
+    // checking `this.ep.isTorsionFree()` here would reject valid wrapper points.
+    this.ep.assertValidity();
+  }
+  /**
+   * Return affine coordinates of the current internal Edwards representative.
+   * This is a convenience helper, not a canonical Ristretto/Decaf encoding.
+   * Equal abstract elements may expose different `x` / `y`; use
+   * `toBytes()` / `fromBytes()` for canonical roundtrips.
+   */
+  toAffine(invertedZ) {
+    return this.ep.toAffine(invertedZ);
+  }
+  toHex() {
+    return Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["bytesToHex"])(this.toBytes());
+  }
+  toString() {
+    return this.toHex();
+  }
+  isTorsionFree() {
+    // Abstract Ristretto/Decaf elements are already prime-order even when the
+    // hidden Edwards representative is not torsion-free.
+    return true;
+  }
+  isSmallOrder() {
+    return false;
+  }
+  add(other) {
+    this.assertSame(other);
+    return this.init(this.ep.add(other.ep));
+  }
+  subtract(other) {
+    this.assertSame(other);
+    return this.init(this.ep.subtract(other.ep));
+  }
+  multiply(scalar) {
+    return this.init(this.ep.multiply(scalar));
+  }
+  multiplyUnsafe(scalar) {
+    return this.init(this.ep.multiplyUnsafe(scalar));
+  }
+  double() {
+    return this.init(this.ep.double());
+  }
+  negate() {
+    return this.init(this.ep.negate());
+  }
+  precompute(windowSize, isLazy) {
+    this.ep.precompute(windowSize, isLazy);
+    // Keep the wrapper identity stable like the backing Edwards API instead of
+    // allocating a fresh wrapper around the same cached point.
+    return this;
+  }
+}
+/**
+ * Initializes EdDSA signatures over given Edwards curve.
+ * @param Point - Edwards point constructor.
+ * @param cHash - Hash function.
+ * @param eddsaOpts - Optional signature helpers. See {@link EdDSAOpts}.
+ * @returns EdDSA helper namespace.
+ * @throws If the hash function, options, or derived point operations are invalid. {@link Error}
+ * @example
+ * Initializes EdDSA signatures over given Edwards curve.
+ *
+ * ```ts
+ * import { eddsa } from '@noble/curves/abstract/edwards.js';
+ * import { jubjub } from '@noble/curves/misc.js';
+ * import { sha512 } from '@noble/hashes/sha2.js';
+ * const sigs = eddsa(jubjub.Point, sha512);
+ * const { secretKey, publicKey } = sigs.keygen();
+ * const msg = new TextEncoder().encode('hello noble');
+ * const sig = sigs.sign(msg, secretKey);
+ * const isValid = sigs.verify(sig, msg, publicKey);
+ * ```
+ */
+_defineProperty(PrimeEdwardsPoint, "BASE", void 0);
+_defineProperty(PrimeEdwardsPoint, "ZERO", void 0);
+_defineProperty(PrimeEdwardsPoint, "Fp", void 0);
+_defineProperty(PrimeEdwardsPoint, "Fn", void 0);
+function eddsa(Point, cHash) {
+  var eddsaOpts = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : {};
+  if (typeof cHash !== 'function') throw new Error('"hash" function param is required');
+  var hash = cHash;
+  var opts = eddsaOpts;
+  Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["validateObject"])(opts, {}, {
+    adjustScalarBytes: 'function',
+    randomBytes: 'function',
+    domain: 'function',
+    prehash: 'function',
+    zip215: 'boolean',
+    mapToCurve: 'function'
+  });
+  var prehash = opts.prehash;
+  var BASE = Point.BASE,
+    Fp = Point.Fp,
+    Fn = Point.Fn;
+  var outputLen = hash.outputLen;
+  var expectedLen = 2 * Fp.BYTES;
+  // When hash metadata is available, reject incompatible EdDSA wrappers at construction time
+  // instead of deferring the mismatch until the first keygen/sign call.
+  if (outputLen !== undefined) {
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["asafenumber"])(outputLen, 'hash.outputLen');
+    if (outputLen !== expectedLen) throw new Error("hash.outputLen must be ".concat(expectedLen, ", got ").concat(outputLen));
+  }
+  var randomBytes = opts.randomBytes === undefined ? _utils_js__WEBPACK_IMPORTED_MODULE_0__["randomBytes"] : opts.randomBytes;
+  var adjustScalarBytes = opts.adjustScalarBytes === undefined ? bytes => bytes : opts.adjustScalarBytes;
+  var domain = opts.domain === undefined ? (data, ctx, phflag) => {
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abool"])(phflag, 'phflag');
+    if (ctx.length || phflag) throw new Error('Contexts/pre-hash are not supported');
+    return data;
+  } : opts.domain; // NOOP
+  // Parse an EdDSA digest as a little-endian integer and reduce it modulo the scalar field order.
+  function modN_LE(hash) {
+    return Fn.create(Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["bytesToNumberLE"])(hash)); // Not Fn.fromBytes: it has length limit
+  }
+  // Get the hashed private scalar per RFC8032 5.1.5
+  function getPrivateScalar(key) {
+    var len = lengths.secretKey;
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(key, lengths.secretKey, 'secretKey');
+    // Hash private key with curve's hash function to produce uniformingly random input
+    // Check byte lengths: ensure(64, h(ensure(32, key)))
+    var hashed = Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(hash(key), 2 * len, 'hashedSecretKey');
+    // Slice before clamping so in-place adjustors don't corrupt the prefix half.
+    var head = adjustScalarBytes(hashed.slice(0, len)); // clear first half bits, produce FE
+    var prefix = hashed.slice(len, 2 * len); // second half is called key prefix (5.1.6)
+    var scalar = modN_LE(head); // The actual private scalar
+    return {
+      head,
+      prefix,
+      scalar
+    };
+  }
+  /** Convenience method that creates public key from scalar. RFC8032 5.1.5
+   * Also exposes the derived scalar/prefix tuple and point form reused by sign().
+   */
+  function getExtendedPublicKey(secretKey) {
+    var _getPrivateScalar = getPrivateScalar(secretKey),
+      head = _getPrivateScalar.head,
+      prefix = _getPrivateScalar.prefix,
+      scalar = _getPrivateScalar.scalar;
+    var point = BASE.multiply(scalar); // Point on Edwards curve aka public key
+    var pointBytes = point.toBytes();
+    return {
+      head,
+      prefix,
+      scalar,
+      point,
+      pointBytes
+    };
+  }
+  /** Calculates EdDSA pub key. RFC8032 5.1.5. */
+  function getPublicKey(secretKey) {
+    return getExtendedPublicKey(secretKey).pointBytes;
+  }
+  // Hash domain-separated chunks into a little-endian scalar modulo the group order.
+  function hashDomainToScalar() {
+    var context = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : Uint8Array.of();
+    for (var _len = arguments.length, msgs = new Array(_len > 1 ? _len - 1 : 0), _key = 1; _key < _len; _key++) {
+      msgs[_key - 1] = arguments[_key];
+    }
+    var msg = Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["concatBytes"])(...msgs);
+    return modN_LE(hash(domain(msg, Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(context, undefined, 'context'), !!prehash)));
+  }
+  /** Signs message with secret key. RFC8032 5.1.6 */
+  function sign(msg, secretKey) {
+    var options = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : {};
+    msg = Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(msg, undefined, 'message');
+    if (prehash) msg = prehash(msg); // for ed25519ph etc.
+    var _getExtendedPublicKey = getExtendedPublicKey(secretKey),
+      prefix = _getExtendedPublicKey.prefix,
+      scalar = _getExtendedPublicKey.scalar,
+      pointBytes = _getExtendedPublicKey.pointBytes;
+    var r = hashDomainToScalar(options.context, prefix, msg); // r = dom2(F, C) || prefix || PH(M)
+    // RFC 8032 5.1.6 allows r mod L = 0, and SUPERCOP ref10 accepts the resulting identity-point
+    // signature.
+    // We intentionally keep the safe multiply() rejection here so a miswired all-zero hash provider
+    // fails loudly instead of silently producing a degenerate signature.
+    var R = BASE.multiply(r).toBytes(); // R = rG
+    var k = hashDomainToScalar(options.context, R, pointBytes, msg); // R || A || PH(M)
+    var s = Fn.create(r + k * scalar); // S = (r + k * s) mod L
+    if (!Fn.isValid(s)) throw new Error('sign failed: invalid s'); // 0 <= s < L
+    var rs = Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["concatBytes"])(R, Fn.toBytes(s));
+    return Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(rs, lengths.signature, 'result');
+  }
+  // Keep the shared helper strict by default: RFC 8032 / NIST-style wrappers should reject
+  // non-canonical encodings unless they explicitly opt into ZIP-215's more permissive decode rules.
+  var verifyOpts = {
+    zip215: opts.zip215
+  };
+  /**
+   * Verifies EdDSA signature against message and public key. RFC 8032 §§5.1.7 and 5.2.7.
+   * A cofactored verification equation is checked.
+   */
+  function verify(sig, msg, publicKey) {
+    var options = arguments.length > 3 && arguments[3] !== undefined ? arguments[3] : verifyOpts;
+    // Preserve the wrapper-selected default for `{}` / `{ zip215: undefined }`, not just omitted opts.
+    var context = options.context;
+    var zip215 = options.zip215 === undefined ? !!verifyOpts.zip215 : options.zip215;
+    var len = lengths.signature;
+    sig = Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(sig, len, 'signature');
+    msg = Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(msg, undefined, 'message');
+    publicKey = Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(publicKey, lengths.publicKey, 'publicKey');
+    if (zip215 !== undefined) Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abool"])(zip215, 'zip215');
+    if (prehash) msg = prehash(msg); // for ed25519ph, etc
+    var mid = len / 2;
+    var r = sig.subarray(0, mid);
+    var s = Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["bytesToNumberLE"])(sig.subarray(mid, len));
+    var A, R, SB;
+    try {
+      // ZIP-215 is more permissive than RFC 8032 / NIST186-5. Use it only for wrappers that
+      // explicitly want consensus-style unreduced encoding acceptance.
+      // zip215=true:  0 <= y < MASK (2^256 for ed25519)
+      // zip215=false: 0 <= y < P (2^255-19 for ed25519)
+      A = Point.fromBytes(publicKey, zip215);
+      R = Point.fromBytes(r, zip215);
+      SB = BASE.multiplyUnsafe(s); // 0 <= s < l is done inside
+    } catch (error) {
+      return false;
+    }
+    // RFC 8032 §§5.1.7/5.2.7 and FIPS 186-5 §§7.7.2/7.8.2 only decode A' and check the cofactored
+    // verification equation; they do not add a separate low-order-public-key rejection here.
+    // Strict mode still rejects small-order A' intentionally for SBS-style non-repudiation and to
+    // avoid ambiguous verification outcomes where unusual low-order keys can make distinct
+    // key/signature/message combinations verify.
+    if (!zip215 && A.isSmallOrder()) return false;
+    // ZIP-215 accepts noncanonical / unreduced point encodings, so the challenge hash must use the
+    // exact signature/public-key bytes rather than canonicalized re-encodings of the decoded points.
+    var k = hashDomainToScalar(context, r, publicKey, msg);
+    var RkA = R.add(A.multiplyUnsafe(k));
+    // Check the cofactored verification equation via the curve cofactor h.
+    // [h][S]B = [h]R + [h][k]A'
+    return RkA.subtract(SB).clearCofactor().is0();
+  }
+  var _size = Fp.BYTES; // 32 for ed25519, 57 for ed448
+  var lengths = {
+    secretKey: _size,
+    publicKey: _size,
+    signature: 2 * _size,
+    seed: _size
+  };
+  function randomSecretKey(seed) {
+    seed = seed === undefined ? randomBytes(lengths.seed) : seed;
+    return Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(seed, lengths.seed, 'seed');
+  }
+  function isValidSecretKey(key) {
+    return Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["isBytes"])(key) && key.length === lengths.secretKey;
+  }
+  function isValidPublicKey(key, zip215) {
+    try {
+      // Preserve the wrapper-selected default for omitted / `undefined` ZIP-215 flags here too.
+      return !!Point.fromBytes(key, zip215 === undefined ? verifyOpts.zip215 : zip215);
+    } catch (error) {
+      return false;
+    }
+  }
+  var utils = {
+    getExtendedPublicKey,
+    randomSecretKey,
+    isValidSecretKey,
+    isValidPublicKey,
+    /**
+     * Converts ed public key to x public key. Uses formula:
+     * - ed25519:
+     *   - `(u, v) = ((1+y)/(1-y), sqrt(-486664)*u/x)`
+     *   - `(x, y) = (sqrt(-486664)*u/v, (u-1)/(u+1))`
+     * - ed448:
+     *   - `(u, v) = ((y-1)/(y+1), sqrt(156324)*u/x)`
+     *   - `(x, y) = (sqrt(156324)*u/v, (1+u)/(1-u))`
+     */
+    toMontgomery(publicKey) {
+      var _Point$fromBytes = Point.fromBytes(publicKey),
+        y = _Point$fromBytes.y;
+      var size = lengths.publicKey;
+      var is25519 = size === 32;
+      if (!is25519 && size !== 57) throw new Error('only defined for 25519 and 448');
+      var u = is25519 ? Fp.div(_1n + y, _1n - y) : Fp.div(y - _1n, y + _1n);
+      return Fp.toBytes(u);
+    },
+    toMontgomerySecret(secretKey) {
+      var size = lengths.secretKey;
+      Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(secretKey, size);
+      var hashed = hash(secretKey.subarray(0, size));
+      return adjustScalarBytes(hashed).subarray(0, size);
+    }
+  };
+  Object.freeze(lengths);
+  Object.freeze(utils);
+  return Object.freeze({
+    keygen: Object(_curve_js__WEBPACK_IMPORTED_MODULE_1__["createKeygen"])(randomSecretKey, getPublicKey),
+    getPublicKey,
+    sign,
+    verify,
+    utils,
+    Point,
+    lengths
+  });
+}
+
+/***/ }),
+
+/***/ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/abstract/fft.js":
+/*!************************************************************************!*\
+  !*** ./src/onlykey-fido2/onlykey/vendor/@noble/curves/abstract/fft.js ***!
+  \************************************************************************/
+/*! exports provided: isPowerOfTwo, nextPowerOfTwo, reverseBits, log2, bitReversalInplace, bitReversalPermutation, rootsOfUnity, FFTCore, FFT, poly */
+/***/ (function(module, __webpack_exports__, __webpack_require__) {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "isPowerOfTwo", function() { return isPowerOfTwo; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "nextPowerOfTwo", function() { return nextPowerOfTwo; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "reverseBits", function() { return reverseBits; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "log2", function() { return log2; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "bitReversalInplace", function() { return bitReversalInplace; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "bitReversalPermutation", function() { return bitReversalPermutation; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "rootsOfUnity", function() { return rootsOfUnity; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "FFTCore", function() { return FFTCore; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "FFT", function() { return FFT; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "poly", function() { return poly; });
+function checkU32(n) {
+  // 0xff_ff_ff_ff
+  if (!Number.isSafeInteger(n) || n < 0 || n > 0xffffffff) throw new Error('wrong u32 integer:' + n);
+  return n;
+}
+/**
+ * Checks if integer is in form of `1 << X`.
+ * @param x - Integer to inspect.
+ * @returns `true` when the value is a power of two.
+ * @throws If `x` is not a valid unsigned 32-bit integer. {@link Error}
+ * @example
+ * Validate that an FFT size is a power of two.
+ *
+ * ```ts
+ * isPowerOfTwo(8);
+ * ```
+ */
+function isPowerOfTwo(x) {
+  checkU32(x);
+  return (x & x - 1) === 0 && x !== 0;
+}
+/**
+ * @param n - Input value.
+ * @returns Next power of two within the u32/array-length domain.
+ * @throws If `n` is not a valid unsigned 32-bit integer. {@link Error}
+ * @example
+ * Round an integer up to the FFT size it needs.
+ *
+ * ```ts
+ * nextPowerOfTwo(9);
+ * ```
+ */
+function nextPowerOfTwo(n) {
+  checkU32(n);
+  if (n <= 1) return 1;
+  // FFT sizes here are used as JS array lengths, so `2^32` is not a meaningful result:
+  // keep the fast u32 bit-twiddling path and fail explicitly instead of wrapping to 1.
+  if (n > 0x80000000) throw new Error('nextPowerOfTwo overflow: result does not fit u32');
+  return 1 << log2(n - 1) + 1 >>> 0;
+}
+/**
+ * @param n - Value to reverse.
+ * @param bits - Number of bits to use.
+ * @returns Bit-reversed integer.
+ * @throws If `n` is not a valid unsigned 32-bit integer. {@link Error}
+ * @example
+ * Reverse the low `bits` bits of one index.
+ *
+ * ```ts
+ * reverseBits(3, 3);
+ * ```
+ */
+function reverseBits(n, bits) {
+  checkU32(n);
+  if (!Number.isSafeInteger(bits) || bits < 0 || bits > 32) throw new Error("expected integer 0 <= bits <= 32, got ".concat(bits));
+  var reversed = 0;
+  for (var i = 0; i < bits; i++, n >>>= 1) reversed = reversed << 1 | n & 1;
+  // JS bitwise ops are signed i32; cast back so 32-bit reversals stay in the unsigned u32 domain.
+  return reversed >>> 0;
+}
+/**
+ * Similar to `bitLen(x)-1` but much faster for small integers, like indices.
+ * @param n - Input value.
+ * @returns Base-2 logarithm. For `n = 0`, the current implementation returns `-1`.
+ * @throws If `n` is not a valid unsigned 32-bit integer. {@link Error}
+ * @example
+ * Compute the radix-2 stage count for one transform size.
+ *
+ * ```ts
+ * log2(8);
+ * ```
+ */
+function log2(n) {
+  checkU32(n);
+  return 31 - Math.clz32(n);
+}
+/**
+ * Moves lowest bit to highest position, which at first step splits
+ * array on even and odd indices, then it applied again to each part,
+ * which is core of fft
+ * @param values - Mutable coefficient array.
+ * @returns Mutated input array.
+ * @throws If the array length is not a positive power of two. {@link Error}
+ * @example
+ * Reorder coefficients into bit-reversed order in place.
+ *
+ * ```ts
+ * const values = Uint8Array.from([0, 1, 2, 3]);
+ * bitReversalInplace(values);
+ * ```
+ */
+function bitReversalInplace(values) {
+  var n = values.length;
+  // Size-1 FFT is the identity, so bit-reversal must stay a no-op there instead of rejecting it.
+  if (!isPowerOfTwo(n)) throw new Error('expected positive power-of-two length, got ' + n);
+  var bits = log2(n);
+  for (var i = 0; i < n; i++) {
+    var j = reverseBits(i, bits);
+    if (i < j) {
+      var tmp = values[i];
+      values[i] = values[j];
+      values[j] = tmp;
+    }
+  }
+  return values;
+}
+/**
+ * @param values - Input values.
+ * @returns Reordered copy.
+ * @throws If the array length is not a positive power of two. {@link Error}
+ * @example
+ * Return a reordered copy instead of mutating the input in place.
+ *
+ * ```ts
+ * const reordered = bitReversalPermutation([0, 1, 2, 3]);
+ * ```
+ */
+function bitReversalPermutation(values) {
+  return bitReversalInplace(values.slice());
+}
+var _1n = /** @__PURE__ */BigInt(1);
+function findGenerator(field) {
+  var G = BigInt(2);
+  for (; field.eql(field.pow(G, field.ORDER >> _1n), field.ONE); G++);
+  return G;
+}
+/**
+ * We limit roots up to 2**31, which is a lot: 2-billion polynomimal should be rare.
+ * @param field - Field implementation.
+ * @param generator - Optional generator override.
+ * @returns Roots-of-unity cache.
+ * @example
+ * Cache roots once, then ask for the omega table of one FFT size.
+ *
+ * ```ts
+ * import { rootsOfUnity } from '@noble/curves/abstract/fft.js';
+ * import { Field } from '@noble/curves/abstract/modular.js';
+ * const roots = rootsOfUnity(Field(17n));
+ * const omega = roots.omega(4);
+ * ```
+ */
+function rootsOfUnity(field, generator) {
+  // Factor field.ORDER-1 as oddFactor * 2^powerOfTwo
+  var oddFactor = field.ORDER - _1n;
+  var powerOfTwo = 0;
+  for (; (oddFactor & _1n) !== _1n; powerOfTwo++, oddFactor >>= _1n);
+  // Find non quadratic residue
+  var G = generator !== undefined ? BigInt(generator) : findGenerator(field);
+  // Powers of generator
+  var omegas = new Array(powerOfTwo + 1);
+  omegas[powerOfTwo] = field.pow(G, oddFactor);
+  for (var i = powerOfTwo; i > 0; i--) omegas[i - 1] = field.sqr(omegas[i]);
+  // Compute all roots of unity for powers up to maxPower
+  var rootsCache = [];
+  var checkBits = bits => {
+    checkU32(bits);
+    if (bits > 31 || bits > powerOfTwo) throw new Error('rootsOfUnity: wrong bits ' + bits + ' powerOfTwo=' + powerOfTwo);
+    return bits;
+  };
+  var precomputeRoots = maxPower => {
+    checkBits(maxPower);
+    for (var power = maxPower; power >= 0; power--) {
+      if (rootsCache[power]) continue; // Skip if we've already computed roots for this power
+      var rootsAtPower = [];
+      for (var j = 0, cur = field.ONE; j < 2 ** power; j++, cur = field.mul(cur, omegas[power])) rootsAtPower.push(cur);
+      rootsCache[power] = rootsAtPower;
+    }
+    return rootsCache[maxPower];
+  };
+  var brpCache = new Map();
+  var inverseCache = new Map();
+  // roots()/brp()/inverse() expose shared cached arrays by reference for speed; callers must treat them as read-only.
+  // NOTE: we use bits instead of power, because power = 2**bits,
+  // but power is not neccesary isPowerOfTwo(power)!
+  return {
+    info: {
+      G,
+      powerOfTwo,
+      oddFactor
+    },
+    roots: bits => {
+      var b = checkBits(bits);
+      return precomputeRoots(b);
+    },
+    brp(bits) {
+      var b = checkBits(bits);
+      if (brpCache.has(b)) return brpCache.get(b);else {
+        var res = bitReversalPermutation(this.roots(b));
+        brpCache.set(b, res);
+        return res;
+      }
+    },
+    inverse(bits) {
+      var b = checkBits(bits);
+      if (inverseCache.has(b)) return inverseCache.get(b);else {
+        var res = field.invertBatch(this.roots(b));
+        inverseCache.set(b, res);
+        return res;
+      }
+    },
+    omega: bits => omegas[checkBits(bits)],
+    clear: () => {
+      rootsCache.splice(0, rootsCache.length);
+      brpCache.clear();
+      inverseCache.clear();
+    }
+  };
+}
+/**
+ * Constructs different flavors of FFT. radix2 implementation of low level mutating API. Flavors:
+ *
+ * - DIT (Decimation-in-Time): Bottom-Up (leaves to root), Cool-Turkey
+ * - DIF (Decimation-in-Frequency): Top-Down (root to leaves), Gentleman-Sande
+ *
+ * DIT takes brp input, returns natural output.
+ * DIF takes natural input, returns brp output.
+ *
+ * The output is actually identical. Time / frequence distinction is not meaningful
+ * for Polynomial multiplication in fields.
+ * Which means if protocol supports/needs brp output/inputs, then we can skip this step.
+ *
+ * Cyclic NTT: Rq = Zq[x]/(x^n-1). butterfly_DIT+loop_DIT OR butterfly_DIF+loop_DIT, roots are omega
+ * Negacyclic NTT: Rq = Zq[x]/(x^n+1). butterfly_DIT+loop_DIF, at least for mlkem / mldsa
+ * @param F - Field operations.
+ * @param coreOpts - FFT configuration:
+ *   - `N`: Transform size. Must be a power of two.
+ *   - `roots`: Stage roots for the selected transform size.
+ *   - `dit`: Whether to run the DIT variant instead of DIF.
+ *   - `invertButterflies` (optional): Whether to invert butterfly placement.
+ *   - `skipStages` (optional): Number of initial stages to skip.
+ *   - `brp` (optional): Whether to apply bit-reversal permutation at the boundary.
+ * @returns Low-level FFT loop.
+ * @throws If the FFT options or cached roots are invalid for the requested size. {@link Error}
+ * @example
+ * Constructs different flavors of FFT.
+ *
+ * ```ts
+ * import { FFTCore, rootsOfUnity } from '@noble/curves/abstract/fft.js';
+ * import { Field } from '@noble/curves/abstract/modular.js';
+ * const Fp = Field(17n);
+ * const roots = rootsOfUnity(Fp).roots(2);
+ * const loop = FFTCore(Fp, { N: 4, roots, dit: true });
+ * const values = loop([1n, 2n, 3n, 4n]);
+ * ```
+ */
+var FFTCore = (F, coreOpts) => {
+  var N = coreOpts.N,
+    roots = coreOpts.roots,
+    dit = coreOpts.dit,
+    _coreOpts$invertButte = coreOpts.invertButterflies,
+    invertButterflies = _coreOpts$invertButte === void 0 ? false : _coreOpts$invertButte,
+    _coreOpts$skipStages = coreOpts.skipStages,
+    skipStages = _coreOpts$skipStages === void 0 ? 0 : _coreOpts$skipStages,
+    _coreOpts$brp = coreOpts.brp,
+    brp = _coreOpts$brp === void 0 ? true : _coreOpts$brp;
+  var bits = log2(N);
+  if (!isPowerOfTwo(N)) throw new Error('FFT: Polynomial size should be power of two');
+  // Wrong-sized root tables can stay in-bounds for some loop shapes and silently compute nonsense.
+  if (roots.length !== N) throw new Error("FFT: wrong roots length: expected ".concat(N, ", got ").concat(roots.length));
+  var isDit = dit !== invertButterflies;
+  isDit;
+  return values => {
+    if (values.length !== N) throw new Error('FFT: wrong Polynomial length');
+    if (dit && brp) bitReversalInplace(values);
+    for (var i = 0, g = 1; i < bits - skipStages; i++) {
+      // For each stage s (sub-FFT length m = 2^s)
+      var s = dit ? i + 1 + skipStages : bits - i;
+      var m = 1 << s;
+      var m2 = m >> 1;
+      var stride = N >> s;
+      // Loop over each subarray of length m
+      for (var k = 0; k < N; k += m) {
+        // Loop over each butterfly within the subarray
+        for (var j = 0, grp = g++; j < m2; j++) {
+          var rootPos = invertButterflies ? dit ? N - grp : grp : j * stride;
+          var i0 = k + j;
+          var i1 = k + j + m2;
+          var omega = roots[rootPos];
+          var b = values[i1];
+          var a = values[i0];
+          // Inlining gives us 10% perf in kyber vs functions
+          if (isDit) {
+            var t = F.mul(b, omega); // Standard DIT butterfly
+            values[i0] = F.add(a, t);
+            values[i1] = F.sub(a, t);
+          } else if (invertButterflies) {
+            values[i0] = F.add(b, a); // DIT loop + inverted butterflies (Kyber decode)
+            values[i1] = F.mul(F.sub(b, a), omega);
+          } else {
+            values[i0] = F.add(a, b); // Standard DIF butterfly
+            values[i1] = F.mul(F.sub(a, b), omega);
+          }
+        }
+      }
+    }
+    if (!dit && brp) bitReversalInplace(values);
+    return values;
+  };
+};
+/**
+ * NTT aka FFT over finite field (NOT over complex numbers).
+ * Naming mirrors other libraries.
+ * @param roots - Roots-of-unity cache.
+ * @param opts - Field operations. See {@link FFTOpts}.
+ * @returns Forward and inverse FFT helpers.
+ * @example
+ * NTT aka FFT over finite field (NOT over complex numbers).
+ *
+ * ```ts
+ * import { FFT, rootsOfUnity } from '@noble/curves/abstract/fft.js';
+ * import { Field } from '@noble/curves/abstract/modular.js';
+ * const Fp = Field(17n);
+ * const fft = FFT(rootsOfUnity(Fp), Fp);
+ * const values = fft.direct([1n, 2n, 3n, 4n]);
+ * ```
+ */
+function FFT(roots, opts) {
+  var getLoop = function getLoop(N, roots) {
+    var brpInput = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : false;
+    var brpOutput = arguments.length > 3 && arguments[3] !== undefined ? arguments[3] : false;
+    if (brpInput && brpOutput) {
+      // we cannot optimize this case, but lets support it anyway
+      return values => FFTCore(opts, {
+        N,
+        roots,
+        dit: false,
+        brp: false
+      })(bitReversalInplace(values));
+    }
+    if (brpInput) return FFTCore(opts, {
+      N,
+      roots,
+      dit: true,
+      brp: false
+    });
+    if (brpOutput) return FFTCore(opts, {
+      N,
+      roots,
+      dit: false,
+      brp: false
+    });
+    return FFTCore(opts, {
+      N,
+      roots,
+      dit: true,
+      brp: true
+    }); // all natural
+  };
+  return {
+    direct(values) {
+      var brpInput = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : false;
+      var brpOutput = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : false;
+      var N = values.length;
+      if (!isPowerOfTwo(N)) throw new Error('FFT: Polynomial size should be power of two');
+      var bits = log2(N);
+      return getLoop(N, roots.roots(bits), brpInput, brpOutput)(values.slice());
+    },
+    inverse(values) {
+      var brpInput = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : false;
+      var brpOutput = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : false;
+      var N = values.length;
+      if (!isPowerOfTwo(N)) throw new Error('FFT: Polynomial size should be power of two');
+      var bits = log2(N);
+      var res = getLoop(N, roots.inverse(bits), brpInput, brpOutput)(values.slice());
+      var ivm = opts.inv(BigInt(values.length)); // scale
+      // we can get brp output if we use dif instead of dit!
+      for (var i = 0; i < res.length; i++) res[i] = opts.mul(res[i], ivm);
+      // Allows to re-use non-inverted roots, but is VERY fragile
+      // return [res[0]].concat(res.slice(1).reverse());
+      // inverse calculated as pow(-1), which transforms into ω^{-kn} (-> reverses indices)
+      return res;
+    }
+  };
+}
+function poly(field, roots, create, fft, length) {
+  var F = field;
+  var _create = create || ((len, elm) => new Array(len).fill(elm !== null && elm !== void 0 ? elm : F.ZERO));
+  // `poly.mul(a, b)` distinguishes polynomial-vs-scalar at runtime, so keep accepted
+  // polynomial containers concrete instead of trying to support arbitrary wrappers.
+  var isPoly = x => {
+    if (Array.isArray(x)) return true;
+    if (!ArrayBuffer.isView(x)) return false;
+    var v = x;
+    return typeof v.length === 'number' && typeof v.slice === 'function' && typeof v[Symbol.iterator] === 'function';
+  };
+  var checkLength = function checkLength() {
+    for (var _len = arguments.length, lst = new Array(_len), _key = 0; _key < _len; _key++) {
+      lst[_key] = arguments[_key];
+    }
+    if (!lst.length) return 0;
+    for (var i of lst) if (!isPoly(i)) throw new Error('poly: not polynomial: ' + i);
+    var L = lst[0].length;
+    for (var _i = 1; _i < lst.length; _i++) if (lst[_i].length !== L) throw new Error("poly: mismatched lengths ".concat(L, " vs ").concat(lst[_i].length));
+    if (length !== undefined && L !== length) throw new Error("poly: expected fixed length ".concat(length, ", got ").concat(L));
+    return L;
+  };
+  function findOmegaIndex(x, n) {
+    var brp = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : false;
+    var bits = log2(n);
+    var omega = brp ? roots.brp(bits) : roots.roots(bits);
+    for (var i = 0; i < n; i++) if (F.eql(x, omega[i])) return i;
+    return -1;
+  }
+  // TODO: mutating versions for mlkem/mldsa
+  return {
+    roots,
+    create: _create,
+    length,
+    extend: (a, len) => {
+      checkLength(a);
+      var out = _create(len, F.ZERO);
+      // Plain arrays grow when writing past `out.length`, so cap the copy explicitly to keep
+      // `extend()` consistent with typed arrays and with its documented truncate behavior.
+      for (var i = 0; i < Math.min(a.length, len); i++) out[i] = a[i];
+      return out;
+    },
+    degree: a => {
+      checkLength(a);
+      for (var i = a.length - 1; i >= 0; i--) if (!F.is0(a[i])) return i;
+      return -1;
+    },
+    add: (a, b) => {
+      var len = checkLength(a, b);
+      var out = _create(len);
+      for (var i = 0; i < len; i++) out[i] = F.add(a[i], b[i]);
+      return out;
+    },
+    sub: (a, b) => {
+      var len = checkLength(a, b);
+      var out = _create(len);
+      for (var i = 0; i < len; i++) out[i] = F.sub(a[i], b[i]);
+      return out;
+    },
+    dot: (a, b) => {
+      var len = checkLength(a, b);
+      var out = _create(len);
+      for (var i = 0; i < len; i++) out[i] = F.mul(a[i], b[i]);
+      return out;
+    },
+    mul: (a, b) => {
+      if (isPoly(b)) {
+        var len = checkLength(a, b);
+        if (fft) {
+          var A = fft.direct(a, false, true);
+          var B = fft.direct(b, false, true);
+          for (var i = 0; i < A.length; i++) A[i] = F.mul(A[i], B[i]);
+          return fft.inverse(A, true, false);
+        } else {
+          // NOTE: this is quadratic and mostly for compat tests with FFT
+          var res = _create(len);
+          for (var _i2 = 0; _i2 < len; _i2++) {
+            for (var j = 0; j < len; j++) {
+              var k = (_i2 + j) % len; // wrap mod length
+              res[k] = F.add(res[k], F.mul(a[_i2], b[j]));
+            }
+          }
+          return res;
+        }
+      } else {
+        var out = _create(checkLength(a));
+        for (var _i3 = 0; _i3 < out.length; _i3++) out[_i3] = F.mul(a[_i3], b);
+        return out;
+      }
+    },
+    convolve(a, b) {
+      var len = nextPowerOfTwo(a.length + b.length - 1);
+      return this.mul(this.extend(a, len), this.extend(b, len));
+    },
+    shift(p, factor) {
+      var out = _create(checkLength(p));
+      out[0] = p[0];
+      for (var i = 1, power = F.ONE; i < p.length; i++) {
+        power = F.mul(power, factor);
+        out[i] = F.mul(p[i], power);
+      }
+      return out;
+    },
+    clone: a => {
+      checkLength(a);
+      var out = _create(a.length);
+      for (var i = 0; i < a.length; i++) out[i] = a[i];
+      return out;
+    },
+    eval: (a, basis) => {
+      checkLength(a, basis);
+      var acc = F.ZERO;
+      for (var i = 0; i < a.length; i++) acc = F.add(acc, F.mul(a[i], basis[i]));
+      return acc;
+    },
+    monomial: {
+      basis: (x, n) => {
+        var out = _create(n);
+        var pow = F.ONE;
+        for (var i = 0; i < n; i++) {
+          out[i] = pow;
+          pow = F.mul(pow, x);
+        }
+        return out;
+      },
+      eval: (a, x) => {
+        checkLength(a);
+        // Same as eval(a, monomialBasis(x, a.length)), but it is faster this way
+        var acc = F.ZERO;
+        for (var i = a.length - 1; i >= 0; i--) acc = F.add(F.mul(acc, x), a[i]);
+        return acc;
+      }
+    },
+    lagrange: {
+      basis: function basis(x, n) {
+        var brp = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : false;
+        var weights = arguments.length > 3 ? arguments[3] : undefined;
+        var bits = log2(n);
+        var cache = weights || (brp ? roots.brp(bits) : roots.roots(bits)); // [ω⁰, ω¹, ..., ωⁿ⁻¹]
+        var out = _create(n);
+        // Fast Kronecker-δ shortcut
+        var idx = findOmegaIndex(x, n, brp);
+        if (idx !== -1) {
+          out[idx] = F.ONE;
+          return out;
+        }
+        var tm = F.pow(x, BigInt(n));
+        var c = F.mul(F.sub(tm, F.ONE), F.inv(BigInt(n))); // c = (xⁿ - 1)/n
+        var denom = _create(n);
+        for (var i = 0; i < n; i++) denom[i] = F.sub(x, cache[i]);
+        var inv = F.invertBatch(denom);
+        for (var _i4 = 0; _i4 < n; _i4++) out[_i4] = F.mul(c, F.mul(cache[_i4], inv[_i4]));
+        return out;
+      },
+      eval(a, x) {
+        var brp = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : false;
+        checkLength(a);
+        var idx = findOmegaIndex(x, a.length, brp);
+        if (idx !== -1) return a[idx]; // fast path
+        var L = this.basis(x, a.length, brp); // Lᵢ(x)
+        var acc = F.ZERO;
+        for (var i = 0; i < a.length; i++) if (!F.is0(a[i])) acc = F.add(acc, F.mul(a[i], L[i]));
+        return acc;
+      }
+    },
+    vanishing(roots) {
+      checkLength(roots);
+      var out = _create(roots.length + 1, F.ZERO);
+      out[0] = F.ONE;
+      for (var r of roots) {
+        var neg = F.neg(r);
+        for (var j = out.length - 1; j > 0; j--) out[j] = F.add(F.mul(out[j], neg), out[j - 1]);
+        out[0] = F.mul(out[0], neg);
+      }
+      return out;
+    }
+  };
+}
+
+/***/ }),
+
+/***/ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/abstract/frost.js":
+/*!**************************************************************************!*\
+  !*** ./src/onlykey-fido2/onlykey/vendor/@noble/curves/abstract/frost.js ***!
+  \**************************************************************************/
+/*! exports provided: createFROST */
+/***/ (function(module, __webpack_exports__, __webpack_require__) {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "createFROST", function() { return createFROST; });
+/* harmony import */ var _noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! @noble/hashes/utils.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/hashes/utils.js");
+/* harmony import */ var _utils_js__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(/*! ../utils.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/utils.js");
+/* harmony import */ var _curve_js__WEBPACK_IMPORTED_MODULE_2__ = __webpack_require__(/*! ./curve.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/abstract/curve.js");
+/* harmony import */ var _fft_js__WEBPACK_IMPORTED_MODULE_3__ = __webpack_require__(/*! ./fft.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/abstract/fft.js");
+/* harmony import */ var _hash_to_curve_js__WEBPACK_IMPORTED_MODULE_4__ = __webpack_require__(/*! ./hash-to-curve.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/abstract/hash-to-curve.js");
+/* harmony import */ var _modular_js__WEBPACK_IMPORTED_MODULE_5__ = __webpack_require__(/*! ./modular.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/abstract/modular.js");
+function ownKeys(e, r) { var t = Object.keys(e); if (Object.getOwnPropertySymbols) { var o = Object.getOwnPropertySymbols(e); r && (o = o.filter(function (r) { return Object.getOwnPropertyDescriptor(e, r).enumerable; })), t.push.apply(t, o); } return t; }
+function _objectSpread(e) { for (var r = 1; r < arguments.length; r++) { var t = null != arguments[r] ? arguments[r] : {}; r % 2 ? ownKeys(Object(t), !0).forEach(function (r) { _defineProperty(e, r, t[r]); }) : Object.getOwnPropertyDescriptors ? Object.defineProperties(e, Object.getOwnPropertyDescriptors(t)) : ownKeys(Object(t)).forEach(function (r) { Object.defineProperty(e, r, Object.getOwnPropertyDescriptor(t, r)); }); } return e; }
+function _slicedToArray(r, e) { return _arrayWithHoles(r) || _iterableToArrayLimit(r, e) || _unsupportedIterableToArray(r, e) || _nonIterableRest(); }
+function _nonIterableRest() { throw new TypeError("Invalid attempt to destructure non-iterable instance.\nIn order to be iterable, non-array objects must have a [Symbol.iterator]() method."); }
+function _unsupportedIterableToArray(r, a) { if (r) { if ("string" == typeof r) return _arrayLikeToArray(r, a); var t = {}.toString.call(r).slice(8, -1); return "Object" === t && r.constructor && (t = r.constructor.name), "Map" === t || "Set" === t ? Array.from(r) : "Arguments" === t || /^(?:Ui|I)nt(?:8|16|32)(?:Clamped)?Array$/.test(t) ? _arrayLikeToArray(r, a) : void 0; } }
+function _arrayLikeToArray(r, a) { (null == a || a > r.length) && (a = r.length); for (var e = 0, n = Array(a); e < a; e++) n[e] = r[e]; return n; }
+function _iterableToArrayLimit(r, l) { var t = null == r ? null : "undefined" != typeof Symbol && r[Symbol.iterator] || r["@@iterator"]; if (null != t) { var e, n, i, u, a = [], f = !0, o = !1; try { if (i = (t = t.call(r)).next, 0 === l) { if (Object(t) !== t) return; f = !1; } else for (; !(f = (e = i.call(t)).done) && (a.push(e.value), a.length !== l); f = !0); } catch (r) { o = !0, n = r; } finally { try { if (!f && null != t.return && (u = t.return(), Object(u) !== u)) return; } finally { if (o) throw n; } } return a; } }
+function _arrayWithHoles(r) { if (Array.isArray(r)) return r; }
+function _defineProperty(e, r, t) { return (r = _toPropertyKey(r)) in e ? Object.defineProperty(e, r, { value: t, enumerable: !0, configurable: !0, writable: !0 }) : e[r] = t, e; }
+function _toPropertyKey(t) { var i = _toPrimitive(t, "string"); return "symbol" == typeof i ? i : i + ""; }
+function _toPrimitive(t, r) { if ("object" != typeof t || !t) return t; var e = t[Symbol.toPrimitive]; if (void 0 !== e) { var i = e.call(t, r || "default"); if ("object" != typeof i) return i; throw new TypeError("@@toPrimitive must return a primitive value."); } return ("string" === r ? String : Number)(t); }
+/**
+ * FROST: Flexible Round-Optimized Schnorr Threshold Protocol for Two-Round Schnorr Signatures.
+ *
+ * See [RFC 9591](https://datatracker.ietf.org/doc/rfc9591/) and [frost.zfnd.org](https://frost.zfnd.org).
+ * @module
+ */
+
+
+
+
+
+
+// PubKey = commitments, verifyingShares
+// PrivKey = id, signingShare, commitment
+var validateSigners = signers => {
+  if (!Number.isSafeInteger(signers.min) || !Number.isSafeInteger(signers.max)) throw new Error('Wrong signers info: min=' + signers.min + ' max=' + signers.max);
+  // Compatibility with frost-rs intentionally narrows RFC 9591's positive-nonzero threshold rule
+  // to `min >= 2`, even though the RFC text itself allows `MIN_PARTICIPANTS = 1`.
+  // This API is for actual threshold signing across participants; 1-of-n degenerates to ordinary
+  // single-signer mode, which does not need FROST's network/coordination machinery at all.
+  if (signers.min < 2 || signers.max < 2 || signers.min > signers.max) throw new Error('Wrong signers info: min=' + signers.min + ' max=' + signers.max);
+};
+var validateCommitmentsNum = (signers, len) => {
+  // RFC 9591 Sections 5.2/5.3 require MIN_PARTICIPANTS <= NUM_PARTICIPANTS <= MAX_PARTICIPANTS.
+  if (len < signers.min || len > signers.max) throw new Error('Wrong number of commitments=' + len);
+};
+class AggErr extends Error {
+  constructor(msg, cheaters) {
+    super(msg);
+    // Empty means aggregation failed before per-share verification could attribute a signer.
+    _defineProperty(this, "cheaters", void 0);
+    this.cheaters = cheaters;
+  }
+}
+function createFROST(opts) {
+  Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["validateObject"])(opts, {
+    name: 'string',
+    hash: 'function'
+  }, {
+    hashToScalar: 'function',
+    validatePoint: 'function',
+    parsePublicKey: 'function',
+    adjustScalar: 'function',
+    adjustPoint: 'function',
+    challenge: 'function',
+    adjustNonces: 'function',
+    adjustSecret: 'function',
+    adjustPublic: 'function',
+    adjustGroupCommitmentShare: 'function',
+    adjustDKG: 'function'
+  });
+  // Cheap constructor-surface sanity check only: this verifies the generic static hooks/fields that
+  // FROST consumes, but it does not certify point semantics like BASE/ZERO correctness.
+  Object(_curve_js__WEBPACK_IMPORTED_MODULE_2__["validatePointCons"])(opts.Point);
+  var Point = opts.Point;
+  var Fn = opts.Fn === undefined ? Point.Fn : opts.Fn;
+  // Hashes
+  var hashBytes = opts.hash;
+  var hashToScalar = opts.hashToScalar === undefined ? function (msg) {
+    var opts = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : {
+      DST: new Uint8Array()
+    };
+    var t = hashBytes(Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["concatBytes"])(opts.DST, msg));
+    return Fn.create(Fn.isLE ? Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["bytesToNumberLE"])(t) : Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["bytesToNumberBE"])(t));
+  } : opts.hashToScalar;
+  var H1Prefix = Object(_noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__["utf8ToBytes"])(opts.H1 !== undefined ? opts.H1 : opts.name + 'rho');
+  var H2Prefix = Object(_noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__["utf8ToBytes"])(opts.H2 !== undefined ? opts.H2 : opts.name + 'chal');
+  var H3Prefix = Object(_noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__["utf8ToBytes"])(opts.H3 !== undefined ? opts.H3 : opts.name + 'nonce');
+  var H4Prefix = Object(_noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__["utf8ToBytes"])(opts.H4 !== undefined ? opts.H4 : opts.name + 'msg');
+  var H5Prefix = Object(_noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__["utf8ToBytes"])(opts.H5 !== undefined ? opts.H5 : opts.name + 'com');
+  var HDKGPrefix = Object(_noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__["utf8ToBytes"])(opts.HDKG !== undefined ? opts.HDKG : opts.name + 'dkg');
+  var HIDPrefix = Object(_noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__["utf8ToBytes"])(opts.HID !== undefined ? opts.HID : opts.name + 'id');
+  var H1 = msg => hashToScalar(msg, {
+    DST: H1Prefix
+  });
+  // Empty H2 still passes `{ DST: new Uint8Array() }` into custom hashToScalar hooks.
+  // The built-in fallback hashes that identically to omitted DST, which is how
+  // the Ed25519 suite models RFC 9591's undecorated H2 challenge hash.
+  var H2 = msg => hashToScalar(msg, {
+    DST: H2Prefix
+  });
+  var H3 = msg => hashToScalar(msg, {
+    DST: H3Prefix
+  });
+  var H4 = msg => hashBytes(Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["concatBytes"])(H4Prefix, msg));
+  var H5 = msg => hashBytes(Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["concatBytes"])(H5Prefix, msg));
+  var HDKG = msg => hashToScalar(msg, {
+    DST: HDKGPrefix
+  });
+  var HID = msg => hashToScalar(msg, {
+    DST: HIDPrefix
+  });
+  // /Hashes
+  var randomScalar = function randomScalar() {
+    var rng = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : _utils_js__WEBPACK_IMPORTED_MODULE_1__["randomBytes"];
+    // Intentional divergence from RFC 9591 §4.1 / §5.1: the RFC nonce_generate helper outputs a
+    // Scalar in [0, p-1], but round-one commit publishes ScalarBaseMult(nonce) values and §3.1
+    // requires SerializeElement / DeserializeElement to reject the identity element. Keep noble's
+    // mapHashToField generation here so round-one public nonce commitments stay in 1..n-1.
+    var t = Object(_modular_js__WEBPACK_IMPORTED_MODULE_5__["mapHashToField"])(rng(Object(_modular_js__WEBPACK_IMPORTED_MODULE_5__["getMinHashLength"])(Fn.ORDER)), Fn.ORDER, Fn.isLE);
+    // We cannot use Fn.fromBytes here because the field can have a different
+    // byte width, like ed448.
+    return Fn.isLE ? Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["bytesToNumberLE"])(t) : Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["bytesToNumberBE"])(t);
+  };
+  var serializePoint = p => p.toBytes();
+  var parsePoint = bytes => {
+    // RFC 9591 Section 3.1 requires DeserializeElement validation. Suite-specific validatePoint
+    // hooks tighten this further for ciphersuites in Section 6. Bare createFROST(...) only gets
+    // canonical point decoding unless the caller installs those extra subgroup / identity checks.
+    var p = Point.fromBytes(bytes);
+    if (opts.validatePoint) opts.validatePoint(p);
+    return p;
+  };
+  // RFC 9591 Sections 4.1/5.1 model each participant's round-one output as two public commitments.
+  var nonceCommitments = (identifier, nonces) => ({
+    identifier,
+    hiding: serializePoint(Point.BASE.multiply(Fn.fromBytes(nonces.hiding))),
+    binding: serializePoint(Point.BASE.multiply(Fn.fromBytes(nonces.binding)))
+  });
+  var adjustPoint = opts.adjustPoint === undefined ? n => n : opts.adjustPoint;
+  // We use hex to make it easier to use inside objects
+  var validateIdentifier = n => {
+    // Identifiers are canonical non-zero scalars. Custom / derived identifiers are allowed, so this
+    // is intentionally not bounded by the current signers.max slot count.
+    if (!Fn.isValid(n) || Fn.is0(n)) throw new Error('Invalid identifier ' + n);
+    return n;
+  };
+  var serializeIdentifier = id => Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["bytesToHex"])(Fn.toBytes(validateIdentifier(id)));
+  var parseIdentifier = id => {
+    var n = validateIdentifier(Fn.fromBytes(Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["hexToBytes"])(id)));
+    // Keep string-keyed maps stable by accepting only the canonical serialized form.
+    if (serializeIdentifier(n) !== id) throw new Error('expected canonical identifier hex');
+    return n;
+  };
+  var Signature = {
+    // RFC 9591 Appendix A encodes signatures canonically as
+    // SerializeElement(R) || SerializeScalar(z).
+    encode: (R, z) => {
+      var res = Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["concatBytes"])(serializePoint(R), Fn.toBytes(z));
+      if (opts.adjustTx) res = opts.adjustTx.encode(res);
+      return res;
+    },
+    decode: sig => {
+      if (opts.adjustTx) sig = opts.adjustTx.decode(sig);
+      // We don't know size of point, but we know size of scalar
+      var R = parsePoint(sig.subarray(0, -Fn.BYTES));
+      var z = Fn.fromBytes(sig.subarray(-Fn.BYTES));
+      return {
+        R,
+        z
+      };
+    }
+  };
+  // Generates pair of (scalar, point)
+  var genPointScalarPair = function genPointScalarPair() {
+    var rng = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : _utils_js__WEBPACK_IMPORTED_MODULE_1__["randomBytes"];
+    var n = randomScalar(rng);
+    if (opts.adjustScalar) n = opts.adjustScalar(n);
+    var p = Point.BASE.multiply(n);
+    return {
+      scalar: n,
+      point: p
+    };
+  };
+  // No roots here: root-based methods will throw.
+  // `poly` expects a structured roots-of-unity domain, but FROST uses an
+  // arbitrary domain and only needs the non-root operations below.
+  var nrErr = 'roots are unavailable in FROST polynomial mode';
+  var noRoots = {
+    info: {
+      G: Fn.ZERO,
+      oddFactor: Fn.ZERO,
+      powerOfTwo: 0
+    },
+    roots() {
+      throw new Error(nrErr);
+    },
+    brp() {
+      throw new Error(nrErr);
+    },
+    inverse() {
+      throw new Error(nrErr);
+    },
+    omega() {
+      throw new Error(nrErr);
+    },
+    clear() {}
+  };
+  var Poly = Object(_fft_js__WEBPACK_IMPORTED_MODULE_3__["poly"])(Fn, noRoots);
+  var msm = (points, scalars) => Object(_curve_js__WEBPACK_IMPORTED_MODULE_2__["pippenger"])(Point, points, scalars);
+  // Internal stuff uses bigints & Points, external Uint8Arrays
+  var polynomialEvaluate = (x, coeffs) => {
+    if (!coeffs.length) throw new Error('empty coefficients');
+    return Poly.monomial.eval(coeffs, x);
+  };
+  var deriveInterpolatingValue = (L, xi) => {
+    var err = 'invalid parameters';
+    // Generates lagrange coefficient
+    if (!L.some(x => Fn.eql(x, xi))) throw new Error(err);
+    // Throws error if any x-coordinate is represented more than once in L.
+    var Lset = new Set(L);
+    if (Lset.size !== L.length) throw new Error(err);
+    // Or if xi is missing
+    if (!Lset.has(xi)) throw new Error(err);
+    var num = Fn.ONE;
+    var den = Fn.ONE;
+    for (var x of L) {
+      if (Fn.eql(x, xi)) continue;
+      num = Fn.mul(num, x); // num *= x
+      den = Fn.mul(den, Fn.sub(x, xi)); // RFC 9591 §4.2: denominator *= x_j - x_i
+    }
+    return Fn.div(num, den);
+  };
+  var evalutateVSS = (identifier, commitment) => {
+    // RFC 9591 Appendix C.2: S_i' = Σ_j ScalarMult(vss_commitment[j], i^j).
+    var monomial = Poly.monomial.basis(identifier, commitment.length);
+    return msm(commitment, monomial);
+  };
+  // High-level internal stuff
+  var _generateSecretPolynomial = function generateSecretPolynomial(signers, secret, coeffs) {
+    var rng = arguments.length > 3 && arguments[3] !== undefined ? arguments[3] : _utils_js__WEBPACK_IMPORTED_MODULE_1__["randomBytes"];
+    validateSigners(signers);
+    // Dealer/DKG polynomial sampling reuses the same hardened scalar derivation as round-one
+    // nonces: overriding `rng` only swaps the entropy source, not the non-zero `1..n-1` policy.
+    var secretScalar = secret === undefined ? randomScalar(rng) : Fn.fromBytes(secret);
+    if (!coeffs) {
+      coeffs = [];
+      for (var i = 0; i < signers.min - 1; i++) coeffs.push(randomScalar(rng));
+    }
+    if (coeffs.length !== signers.min - 1) throw new Error('wrong coefficients length');
+    var coefficients = [secretScalar, ...coeffs];
+    // RFC 9591 Appendix C.2 commits to every polynomial coefficient with ScalarBaseMult.
+    var commitment = coefficients.map(i => Point.BASE.multiply(i));
+    return {
+      coefficients,
+      commitment,
+      secret: secretScalar
+    };
+  };
+  // Pretty much sign+verify, same as basic
+  var ProofOfKnowledge = {
+    challenge: (id, verKey, R) => HDKG(Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["concatBytes"])(Fn.toBytes(id), serializePoint(verKey), serializePoint(R))),
+    compute(id, coefficents, commitments) {
+      var rng = arguments.length > 3 && arguments[3] !== undefined ? arguments[3] : _utils_js__WEBPACK_IMPORTED_MODULE_1__["randomBytes"];
+      if (coefficents.length < 1) throw new Error('coefficients should have at least one element');
+      var _genPointScalarPair = genPointScalarPair(rng),
+        R = _genPointScalarPair.point,
+        k = _genPointScalarPair.scalar;
+      var verKey = commitments[0]; // verify key is first one
+      var c = this.challenge(id, verKey, R);
+      var mu = Fn.add(k, Fn.mul(coefficents[0], c)); // mu = k + coeff[0] * c
+      return Signature.encode(R, mu);
+    },
+    validate(id, commitment, proof) {
+      if (commitment.length < 1) throw new Error('commitment should have at least one element');
+      var _Signature$decode = Signature.decode(proof),
+        R = _Signature$decode.R,
+        z = _Signature$decode.z;
+      var phi = parsePoint(commitment[0]);
+      var c = this.challenge(id, phi, R);
+      // R === z*G - phi*c
+      if (!R.equals(Point.BASE.multiply(z).subtract(phi.multiply(c)))) throw new Error('invalid proof of knowledge');
+    }
+  };
+  var Basic = {
+    challenge: (R, PK, msg) => {
+      if (opts.challenge) return opts.challenge(R, PK, msg);
+      return H2(Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["concatBytes"])(serializePoint(R), serializePoint(PK), msg));
+    },
+    sign(msg, sk) {
+      var rng = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : _utils_js__WEBPACK_IMPORTED_MODULE_1__["randomBytes"];
+      var _genPointScalarPair2 = genPointScalarPair(rng),
+        R = _genPointScalarPair2.point,
+        r = _genPointScalarPair2.scalar;
+      var PK = Point.BASE.multiply(sk); // sk*G
+      var c = this.challenge(R, PK, msg);
+      var z = Fn.add(r, Fn.mul(c, sk)); // r + c * sk
+      return [R, z];
+    },
+    verify(msg, R, z, PK) {
+      if (opts.adjustPoint) PK = opts.adjustPoint(PK);
+      if (opts.adjustPoint) R = opts.adjustPoint(R);
+      var c = this.challenge(R, PK, msg);
+      var zB = Point.BASE.multiply(z); // z*G
+      var cA = PK.multiply(c); // c*PK
+      var check = zB.subtract(cA).subtract(R); // zB - cA - R
+      // No clearCoffactor on ristretto
+      if (check.clearCofactor) check = check.clearCofactor();
+      return Point.ZERO.equals(check);
+    }
+  };
+  // === vssVerify
+  var validateSecretShare = (identifier, commitment, signingShare) => {
+    // RFC 9591 Appendix C.2 `vss_verify(share_i, vss_commitment)` is purely algebraic.
+    // Public FROST packages still go through Section 3.1 element encoding,
+    // which rejects identity points, so a zero share or commitment does not
+    // become valid wire data just because VSS matches.
+    if (!Point.BASE.multiply(signingShare).equals(evalutateVSS(identifier, commitment))) throw new Error('invalid secret share');
+  };
+  var Identifier = {
+    fromNumber(n) {
+      if (!Number.isSafeInteger(n)) throw new Error('expected safe interger');
+      return serializeIdentifier(BigInt(n));
+    },
+    // Not in spec, but in FROST implementation,
+    // seems useful and nice, no need to sync identifiers (would require more interactions)
+    derive(s) {
+      if (typeof s !== 'string') throw new Error('wrong identifier string: ' + s);
+      // Derived identifiers may land anywhere in the scalar field; they are not restricted to
+      // sequential `1..max_signers` values.
+      return serializeIdentifier(HID(Object(_noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__["utf8ToBytes"])(s)));
+    }
+  };
+  // RFC 9591 §4.1: nonce_generate() hashes 32 fresh RNG bytes with SerializeScalar(secret).
+  var generateNonce = function generateNonce(secret) {
+    var rng = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : _utils_js__WEBPACK_IMPORTED_MODULE_1__["randomBytes"];
+    return H3(Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["concatBytes"])(rng(32), Fn.toBytes(secret)));
+  };
+  var getGroupCommitment = (GPK, commitmentList, msg) => {
+    var CL = commitmentList.map(i => [i.identifier, parseIdentifier(i.identifier), parsePoint(i.hiding), parsePoint(i.binding)]);
+    // RFC 9591 Sections 4.3/4.4/4.5 and 5.2/5.3 treat commitment_list as sorted by identifier.
+    CL.sort((a, b) => a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0);
+    // Encode commitment list
+    var Cbytes = [];
+    for (var _ref3 of CL) {
+      var _ref2 = _slicedToArray(_ref3, 4);
+      var _ = _ref2[0];
+      var id = _ref2[1];
+      var hC = _ref2[2];
+      var bC = _ref2[3];
+      Cbytes.push(Fn.toBytes(id), serializePoint(hC), serializePoint(bC));
+    }
+    var encodedCommitmentHash = H5(Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["concatBytes"])(...Cbytes));
+    var rhoPrefix = Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["concatBytes"])(serializePoint(GPK), H4(msg), encodedCommitmentHash);
+    // Compute binding factors
+    var bindingFactors = {};
+    for (var _ref6 of CL) {
+      var _ref5 = _slicedToArray(_ref6, 2);
+      var i = _ref5[0];
+      var _id = _ref5[1];
+      bindingFactors[i] = H1(Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["concatBytes"])(rhoPrefix, Fn.toBytes(_id)));
+    }
+    var points = [];
+    var scalars = [];
+    for (var _ref9 of CL) {
+      var _ref8 = _slicedToArray(_ref9, 4);
+      var _i = _ref8[0];
+      var _2 = _ref8[1];
+      var _hC = _ref8[2];
+      var _bC = _ref8[3];
+      if (Point.ZERO.equals(_hC) || Point.ZERO.equals(_bC)) throw new Error('infinity commitment');
+      points.push(_hC, _bC);
+      scalars.push(Fn.ONE, bindingFactors[_i]);
+    }
+    var groupCommitment = msm(points, scalars); //  GC += hC + bC*bindingFactor
+    var identifiers = CL.map(i => i[1]);
+    return {
+      identifiers,
+      groupCommitment,
+      bindingFactors
+    };
+  };
+  var prepareShare = (PK, commitmentList, msg, identifier) => {
+    // RFC 9591 Sections 4.4/4.5/4.6 feed directly into the Section 5.2 signer computation.
+    var GPK = adjustPoint(parsePoint(PK));
+    var id = parseIdentifier(identifier);
+    var _getGroupCommitment = getGroupCommitment(GPK, commitmentList, msg),
+      identifiers = _getGroupCommitment.identifiers,
+      groupCommitment = _getGroupCommitment.groupCommitment,
+      bindingFactors = _getGroupCommitment.bindingFactors;
+    var bindingFactor = bindingFactors[identifier];
+    var lambda = deriveInterpolatingValue(identifiers, id);
+    var challenge = Basic.challenge(groupCommitment, GPK, msg);
+    return {
+      lambda,
+      challenge,
+      bindingFactor,
+      groupCommitment
+    };
+  };
+  Object.freeze(Identifier);
+  var frost = {
+    Identifier,
+    // DKG is Distributed Key Generation, not Trusted Dealer Key Generation.
+    DKG: Object.freeze({
+      // NOTE: we allow to pass secret scalar from user side,
+      // this way it can be derived, instead of random generation
+      round1: function round1(id, signers, secret) {
+        var rng = arguments.length > 3 && arguments[3] !== undefined ? arguments[3] : _utils_js__WEBPACK_IMPORTED_MODULE_1__["randomBytes"];
+        validateSigners(signers);
+        var idNum = parseIdentifier(id);
+        var _generateSecretPolyno = _generateSecretPolynomial(signers, secret, undefined, rng),
+          coefficients = _generateSecretPolyno.coefficients,
+          commitment = _generateSecretPolyno.commitment;
+        var proofOfKnowledge = ProofOfKnowledge.compute(idNum, coefficients, commitment, rng);
+        var commitmentBytes = commitment.map(serializePoint);
+        var round1Public = {
+          identifier: serializeIdentifier(idNum),
+          commitment: commitmentBytes,
+          proofOfKnowledge
+        };
+        // store secret information for signing
+        var round1Secret = {
+          identifier: idNum,
+          coefficients,
+          commitment: commitment.map(serializePoint),
+          // Copy threshold metadata instead of retaining the caller-owned object by reference.
+          signers: {
+            min: signers.min,
+            max: signers.max
+          },
+          step: 1
+        };
+        return {
+          public: round1Public,
+          secret: round1Secret
+        };
+      },
+      round2: (secret, others) => {
+        if (others.length !== secret.signers.max - 1) throw new Error('wrong number of round1 packages');
+        if (!secret.coefficients || secret.step === 3) throw new Error('round3 package used in round2');
+        var res = {};
+        for (var p of others) {
+          if (p.commitment.length !== secret.signers.min) throw new Error('wrong number of commitments');
+          var id = parseIdentifier(p.identifier);
+          if (id === secret.identifier) throw new Error('duplicate id=' + serializeIdentifier(id));
+          ProofOfKnowledge.validate(id, p.commitment, p.proofOfKnowledge);
+          for (var c of p.commitment) parsePoint(c);
+          if (res[p.identifier]) throw new Error('Duplicate id=' + id);
+          var signingShare = Fn.toBytes(polynomialEvaluate(id, secret.coefficients));
+          res[p.identifier] = {
+            identifier: serializeIdentifier(secret.identifier),
+            signingShare: signingShare
+          };
+        }
+        secret.step = 2;
+        return res;
+      },
+      round3: (secret, round1, round2) => {
+        // DKG is outside RFC 9591's signing flow; callers are expected to reuse the same
+        // remote round1 packages already accepted in round2, like frost-rs documents.
+        if (round1.length !== secret.signers.max - 1) throw new Error('wrong length of round1 packages');
+        if (!secret.coefficients || secret.step !== 2) throw new Error('round2 package used in round3');
+        if (round2.length !== round1.length) throw new Error('wrong length of round2 packages');
+        var merged = {};
+        for (var r1 of round1) {
+          if (!r1.identifier || !r1.commitment) throw new Error('wrong round1 share');
+          merged[r1.identifier] = _objectSpread({}, r1);
+        }
+        for (var r2 of round2) {
+          if (!r2.identifier || !r2.signingShare) throw new Error('wrong round2 share');
+          if (!merged[r2.identifier]) throw new Error('round1 share for ' + r2.identifier + ' is missing');
+          merged[r2.identifier].signingShare = r2.signingShare;
+        }
+        if (Object.keys(merged).length !== round1.length) throw new Error('mismatch identifiers between rounds');
+        var signingShare = Fn.ZERO;
+        if (secret.commitment.length !== secret.signers.min) throw new Error('wrong commitments length');
+        var localCommitment = secret.commitment.map(parsePoint);
+        var localShare = polynomialEvaluate(secret.identifier, secret.coefficients);
+        validateSecretShare(secret.identifier, localCommitment, localShare);
+        var localCommitmentBytes = localCommitment.map(serializePoint);
+        var commitments = {
+          [serializeIdentifier(secret.identifier)]: localCommitmentBytes
+        };
+        for (var k in merged) {
+          var v = merged[k];
+          if (!v.signingShare || !v.commitment) throw new Error('mismatch identifiers');
+          var id = parseIdentifier(k); // from
+          var signingSharePart = Fn.fromBytes(v.signingShare);
+          var commitment = v.commitment.map(parsePoint);
+          validateSecretShare(secret.identifier, commitment, signingSharePart);
+          signingShare = Fn.add(signingShare, signingSharePart);
+          var idSer = serializeIdentifier(id);
+          if (commitments[idSer]) throw new Error('duplicated id=' + idSer);
+          commitments[idSer] = v.commitment;
+        }
+        signingShare = Fn.add(signingShare, localShare);
+        var mergedCommitment = new Array(secret.signers.min).fill(Point.ZERO);
+        for (var _k in commitments) {
+          var _v = commitments[_k];
+          if (_v.length !== secret.signers.min) throw new Error('wrong commitments length');
+          for (var i = 0; i < _v.length; i++) mergedCommitment[i] = mergedCommitment[i].add(parsePoint(_v[i]));
+        }
+        var mergedCommitmentBytes = mergedCommitment.map(serializePoint);
+        var verifyingShares = {};
+        for (var _k2 in commitments) verifyingShares[_k2] = serializePoint(evalutateVSS(parseIdentifier(_k2), mergedCommitment));
+        // This is enough to sign stuff
+        var res = {
+          public: {
+            signers: {
+              min: secret.signers.min,
+              max: secret.signers.max
+            },
+            commitments: mergedCommitmentBytes,
+            verifyingShares: Object.fromEntries(Object.entries(verifyingShares).map(_ref0 => {
+              var _ref1 = _slicedToArray(_ref0, 2),
+                k = _ref1[0],
+                v = _ref1[1];
+              return [k, v.slice()];
+            }))
+          },
+          secret: {
+            identifier: serializeIdentifier(secret.identifier),
+            signingShare: Fn.toBytes(signingShare)
+          }
+        };
+        if (opts.adjustDKG) res = opts.adjustDKG(res);
+        for (var _i2 = 0; _i2 < secret.coefficients.length; _i2++) secret.coefficients[_i2] -= secret.coefficients[_i2];
+        delete secret.coefficients;
+        secret.step = 3;
+        return res;
+      },
+      clean(secret) {
+        // Instead of replacing secret bigint with another (zero?), we subtract it from itself
+        // in the hope that JIT will modify it inplace, instead of creating new value.
+        // This is unverified and may not work, but it is best we can do in regard of bigints.
+        secret.identifier -= secret.identifier;
+        if (secret.coefficients) {
+          for (var i = 0; i < secret.coefficients.length; i++) secret.coefficients[i] -= secret.coefficients[i];
+        }
+        // for (const c of secret.commitment) c.fill(0);
+        secret.step = 3;
+      }
+    }),
+    // Trusted dealer setup
+    // Generates keys for all participants
+    trustedDealer(signers, identifiers, secret) {
+      var rng = arguments.length > 3 && arguments[3] !== undefined ? arguments[3] : _utils_js__WEBPACK_IMPORTED_MODULE_1__["randomBytes"];
+      // if no identifiers provided, we generated default identifiers
+      validateSigners(signers);
+      if (identifiers === undefined) {
+        identifiers = [];
+        for (var i = 1; i <= signers.max; i++) identifiers.push(Identifier.fromNumber(i));
+      } else {
+        if (!Array.isArray(identifiers) || identifiers.length !== signers.max) throw new Error('identifiers should be array of ' + signers.max);
+      }
+      var identifierNums = {};
+      for (var id of identifiers) {
+        var idNum = parseIdentifier(id);
+        if (id in identifierNums) throw new Error('duplicated id=' + id);
+        identifierNums[id] = idNum;
+      }
+      var sp = _generateSecretPolynomial(signers, secret, undefined, rng);
+      var commitmentBytes = sp.commitment.map(serializePoint);
+      var secretShares = {};
+      var verifyingShares = {};
+      for (var _id2 of identifiers) {
+        var signingShare = polynomialEvaluate(identifierNums[_id2], sp.coefficients);
+        verifyingShares[_id2] = serializePoint(Point.BASE.multiply(signingShare));
+        secretShares[_id2] = {
+          identifier: _id2,
+          signingShare: Fn.toBytes(signingShare)
+        };
+      }
+      return {
+        public: {
+          signers: {
+            min: signers.min,
+            max: signers.max
+          },
+          commitments: commitmentBytes,
+          verifyingShares
+        },
+        secretShares
+      };
+    },
+    // Validate secret (from trusted dealer or DKG)
+    validateSecret(secret, pub) {
+      var id = parseIdentifier(secret.identifier);
+      var commitment = pub.commitments.map(parsePoint);
+      var signingShare = Fn.fromBytes(secret.signingShare);
+      validateSecretShare(id, commitment, signingShare);
+    },
+    // Actual signing
+    // Round 1: each participant commit to nonces
+    // Nonces kept private, commitments sent to coordinator (or every other participant)
+    // NOTE: we don't need the message at this point, which lets a coordinator
+    // keep multiple nonce commitments per participant in advance and skip
+    // round1 for signing.
+    // But then each participant needs to remember generated shares
+    commit(secret) {
+      var rng = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : _utils_js__WEBPACK_IMPORTED_MODULE_1__["randomBytes"];
+      var secretScalar = Fn.fromBytes(secret.signingShare);
+      var hiding = generateNonce(secretScalar, rng);
+      var binding = generateNonce(secretScalar, rng);
+      var nonces = {
+        hiding: Fn.toBytes(hiding),
+        binding: Fn.toBytes(binding)
+      };
+      return {
+        nonces,
+        commitments: nonceCommitments(secret.identifier, nonces)
+      };
+    },
+    // Round2: sign. Each participant creates a signature share from the secret
+    // and the selected nonce commitments.
+    signShare(secret, pub, nonces, commitmentList, msg) {
+      validateCommitmentsNum(pub.signers, commitmentList.length);
+      var hidingNonce0 = Fn.fromBytes(nonces.hiding);
+      var bindingNonce0 = Fn.fromBytes(nonces.binding);
+      if (Fn.is0(hidingNonce0) || Fn.is0(bindingNonce0)) throw new Error('signing nonces already used');
+      // Reject a coordinator-assigned commitment pair that does not match the signer's own nonce
+      // pair. This must happen before suite-specific nonce adjustment; secp256k1-tr may negate the
+      // actual signing nonces later, but the coordinator still assigns the original commitments.
+      var expectedCommitment = {
+        identifier: secret.identifier,
+        hiding: serializePoint(Point.BASE.multiply(hidingNonce0)),
+        binding: serializePoint(Point.BASE.multiply(bindingNonce0))
+      };
+      var commitment = commitmentList.find(i => i.identifier === secret.identifier);
+      if (!commitment) throw new Error('missing signer commitment');
+      if (Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["bytesToHex"])(commitment.hiding) !== Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["bytesToHex"])(expectedCommitment.hiding) || Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["bytesToHex"])(commitment.binding) !== Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["bytesToHex"])(expectedCommitment.binding)) throw new Error('incorrect signer commitment');
+      if (opts.adjustSecret) secret = opts.adjustSecret(secret, pub);
+      if (opts.adjustPublic) pub = opts.adjustPublic(pub);
+      var SK = Fn.fromBytes(secret.signingShare);
+      var _prepareShare = prepareShare(pub.commitments[0], commitmentList, msg, secret.identifier),
+        lambda = _prepareShare.lambda,
+        challenge = _prepareShare.challenge,
+        bindingFactor = _prepareShare.bindingFactor,
+        groupCommitment = _prepareShare.groupCommitment;
+      var N = opts.adjustNonces ? opts.adjustNonces(groupCommitment, nonces) : nonces;
+      var hidingNonce = opts.adjustNonces ? Fn.fromBytes(N.hiding) : hidingNonce0;
+      var bindingNonce = opts.adjustNonces ? Fn.fromBytes(N.binding) : bindingNonce0;
+      var t = Fn.mul(Fn.mul(lambda, SK), challenge); // challenge * lambda * SK
+      var t2 = Fn.mul(bindingNonce, bindingFactor); // bindingNonce * bindingFactor
+      var r = Fn.toBytes(Fn.add(Fn.add(hidingNonce, t2), t)); // t + t2 + hidingNonce
+      // RFC 9591 round-one commitments are one-time-use, and round two must use the nonce
+      // corresponding to the published commitment. This API returns mutable local nonce bytes,
+      // so consume them after a successful signShare() call: later all-zero reuse fails closed.
+      nonces.hiding.fill(0);
+      nonces.binding.fill(0);
+      return r;
+    },
+    // Each participant (or coordinator) can verify signatures from other participants
+    verifyShare(pub, commitmentList, msg, identifier, sigShare) {
+      if (opts.adjustPublic) pub = opts.adjustPublic(pub);
+      var comm = commitmentList.find(i => i.identifier === identifier);
+      if (!comm) throw new Error('cannot find identifier commitment');
+      var PK = parsePoint(pub.verifyingShares[identifier]);
+      var hidingNonceCommitment = parsePoint(comm.hiding);
+      var bindingNonceCommitment = parsePoint(comm.binding);
+      var _prepareShare2 = prepareShare(pub.commitments[0], commitmentList, msg, identifier),
+        lambda = _prepareShare2.lambda,
+        challenge = _prepareShare2.challenge,
+        bindingFactor = _prepareShare2.bindingFactor,
+        groupCommitment = _prepareShare2.groupCommitment;
+      // hC + bC * bF
+      var commShare = hidingNonceCommitment.add(bindingNonceCommitment.multiply(bindingFactor));
+      if (opts.adjustGroupCommitmentShare) commShare = opts.adjustGroupCommitmentShare(groupCommitment, commShare);
+      var l = Point.BASE.multiply(Fn.fromBytes(sigShare)); // sigShare*G
+      // commShare + PK * (challenge * lambda)
+      var r = commShare.add(PK.multiply(Fn.mul(challenge, lambda)));
+      return l.equals(r);
+    },
+    // Aggregate multiple signature shares into groupSignature
+    aggregate(pub, commitmentList, msg, sigShares) {
+      if (opts.adjustPublic) pub = opts.adjustPublic(pub);
+      try {
+        validateCommitmentsNum(pub.signers, commitmentList.length);
+      } catch (_unused) {
+        throw new AggErr('aggregation failed', []);
+      }
+      var ids = commitmentList.map(i => i.identifier);
+      if (ids.length !== Object.keys(sigShares).length) throw new AggErr('aggregation failed', []);
+      for (var id of ids) {
+        if (!(id in sigShares) || !(id in pub.verifyingShares)) throw new AggErr('aggregation failed', []);
+      }
+      var GPK = parsePoint(pub.commitments[0]);
+      var _getGroupCommitment2 = getGroupCommitment(GPK, commitmentList, msg),
+        groupCommitment = _getGroupCommitment2.groupCommitment;
+      var z = Fn.ZERO;
+      // RFC 9591 Section 5.3 aggregates by summing the validated signature shares.
+      for (var _id3 of ids) z = Fn.add(z, Fn.fromBytes(sigShares[_id3])); // z += zi
+      if (!Basic.verify(msg, groupCommitment, z, GPK)) {
+        var cheaters = [];
+        for (var _id4 of ids) {
+          if (!this.verifyShare(pub, commitmentList, msg, _id4, sigShares[_id4])) cheaters.push(_id4);
+        }
+        throw new AggErr('aggregation failed', cheaters);
+      }
+      return Signature.encode(groupCommitment, z);
+    },
+    // Basic sign/verify using single key
+    sign(msg, secretKey) {
+      var sk = Fn.fromBytes(secretKey);
+      // Taproot single-key signing needs the same scalar normalization as threshold keys.
+      if (opts.adjustScalar) sk = opts.adjustScalar(sk);
+      var _Basic$sign = Basic.sign(msg, sk),
+        _Basic$sign2 = _slicedToArray(_Basic$sign, 2),
+        R = _Basic$sign2[0],
+        z = _Basic$sign2[1];
+      return Signature.encode(R, z);
+    },
+    verify(sig, msg, publicKey) {
+      var PK = opts.parsePublicKey ? opts.parsePublicKey(publicKey) : parsePoint(publicKey);
+      var _Signature$decode2 = Signature.decode(sig),
+        R = _Signature$decode2.R,
+        z = _Signature$decode2.z;
+      return Basic.verify(msg, R, z, PK);
+    },
+    // Combine multiple secret shares to restore secret
+    combineSecret(shares, signers) {
+      validateSigners(signers);
+      if (!Array.isArray(shares) || shares.length < signers.min) throw new Error('wrong secret shares array');
+      var points = [];
+      var seen = {};
+      // Interpolate over the full provided share set and reject duplicate identifiers.
+      for (var s of shares) {
+        var idNum = parseIdentifier(s.identifier);
+        var id = serializeIdentifier(idNum);
+        if (seen[id]) throw new Error('duplicated id=' + id);
+        seen[id] = true;
+        points.push([idNum, Fn.fromBytes(s.signingShare)]);
+      }
+      var xCoords = points.map(_ref10 => {
+        var _ref11 = _slicedToArray(_ref10, 1),
+          x = _ref11[0];
+        return x;
+      });
+      var res = Fn.ZERO;
+      for (var _ref14 of points) {
+        var _ref13 = _slicedToArray(_ref14, 2);
+        var x = _ref13[0];
+        var y = _ref13[1];
+        res = Fn.add(res, Fn.mul(y, deriveInterpolatingValue(xCoords, x)));
+      }
+      return Fn.toBytes(res);
+    },
+    // Utils
+    utils: Object.freeze({
+      Fn,
+      // NOTE: we re-export it here because it may be different from Point.Fn (ed448 is fun!)
+      // Test RNG overrides still go through noble's non-zero scalar derivation; this is not a raw
+      // "bytes become scalar" escape hatch.
+      randomScalar: function randomScalar() {
+        var rng = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : _utils_js__WEBPACK_IMPORTED_MODULE_1__["randomBytes"];
+        return Fn.toBytes(genPointScalarPair(rng).scalar);
+      },
+      generateSecretPolynomial: (signers, secret, coeffs, rng) => {
+        var res = _generateSecretPolynomial(signers, secret, coeffs, rng);
+        return _objectSpread(_objectSpread({}, res), {}, {
+          commitment: res.commitment.map(serializePoint)
+        });
+      }
+    })
+  };
+  return Object.freeze(frost);
+}
+
+/***/ }),
+
+/***/ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/abstract/hash-to-curve.js":
+/*!**********************************************************************************!*\
+  !*** ./src/onlykey-fido2/onlykey/vendor/@noble/curves/abstract/hash-to-curve.js ***!
+  \**********************************************************************************/
+/*! exports provided: expand_message_xmd, expand_message_xof, hash_to_field, isogenyMap, _DST_scalar, createHasher */
+/***/ (function(module, __webpack_exports__, __webpack_require__) {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "expand_message_xmd", function() { return expand_message_xmd; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "expand_message_xof", function() { return expand_message_xof; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "hash_to_field", function() { return hash_to_field; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "isogenyMap", function() { return isogenyMap; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "_DST_scalar", function() { return _DST_scalar; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "createHasher", function() { return createHasher; });
+/* harmony import */ var _utils_js__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! ../utils.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/utils.js");
+/* harmony import */ var _modular_js__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(/*! ./modular.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/abstract/modular.js");
+function ownKeys(e, r) { var t = Object.keys(e); if (Object.getOwnPropertySymbols) { var o = Object.getOwnPropertySymbols(e); r && (o = o.filter(function (r) { return Object.getOwnPropertyDescriptor(e, r).enumerable; })), t.push.apply(t, o); } return t; }
+function _objectSpread(e) { for (var r = 1; r < arguments.length; r++) { var t = null != arguments[r] ? arguments[r] : {}; r % 2 ? ownKeys(Object(t), !0).forEach(function (r) { _defineProperty(e, r, t[r]); }) : Object.getOwnPropertyDescriptors ? Object.defineProperties(e, Object.getOwnPropertyDescriptors(t)) : ownKeys(Object(t)).forEach(function (r) { Object.defineProperty(e, r, Object.getOwnPropertyDescriptor(t, r)); }); } return e; }
+function _defineProperty(e, r, t) { return (r = _toPropertyKey(r)) in e ? Object.defineProperty(e, r, { value: t, enumerable: !0, configurable: !0, writable: !0 }) : e[r] = t, e; }
+function _toPropertyKey(t) { var i = _toPrimitive(t, "string"); return "symbol" == typeof i ? i : i + ""; }
+function _toPrimitive(t, r) { if ("object" != typeof t || !t) return t; var e = t[Symbol.toPrimitive]; if (void 0 !== e) { var i = e.call(t, r || "default"); if ("object" != typeof i) return i; throw new TypeError("@@toPrimitive must return a primitive value."); } return ("string" === r ? String : Number)(t); }
+function _slicedToArray(r, e) { return _arrayWithHoles(r) || _iterableToArrayLimit(r, e) || _unsupportedIterableToArray(r, e) || _nonIterableRest(); }
+function _nonIterableRest() { throw new TypeError("Invalid attempt to destructure non-iterable instance.\nIn order to be iterable, non-array objects must have a [Symbol.iterator]() method."); }
+function _unsupportedIterableToArray(r, a) { if (r) { if ("string" == typeof r) return _arrayLikeToArray(r, a); var t = {}.toString.call(r).slice(8, -1); return "Object" === t && r.constructor && (t = r.constructor.name), "Map" === t || "Set" === t ? Array.from(r) : "Arguments" === t || /^(?:Ui|I)nt(?:8|16|32)(?:Clamped)?Array$/.test(t) ? _arrayLikeToArray(r, a) : void 0; } }
+function _arrayLikeToArray(r, a) { (null == a || a > r.length) && (a = r.length); for (var e = 0, n = Array(a); e < a; e++) n[e] = r[e]; return n; }
+function _iterableToArrayLimit(r, l) { var t = null == r ? null : "undefined" != typeof Symbol && r[Symbol.iterator] || r["@@iterator"]; if (null != t) { var e, n, i, u, a = [], f = !0, o = !1; try { if (i = (t = t.call(r)).next, 0 === l) { if (Object(t) !== t) return; f = !1; } else for (; !(f = (e = i.call(t)).done) && (a.push(e.value), a.length !== l); f = !0); } catch (r) { o = !0, n = r; } finally { try { if (!f && null != t.return && (u = t.return(), Object(u) !== u)) return; } finally { if (o) throw n; } } return a; } }
+function _arrayWithHoles(r) { if (Array.isArray(r)) return r; }
+
+
+// Octet Stream to Integer. "spec" implementation of os2ip is 2.5x slower vs bytesToNumberBE.
+var os2ip = _utils_js__WEBPACK_IMPORTED_MODULE_0__["bytesToNumberBE"];
+// Integer to Octet Stream (numberToBytesBE).
+function i2osp(value, length) {
+  Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["asafenumber"])(value);
+  Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["asafenumber"])(length);
+  // This helper stays on the JS bitwise/u32 fast-path. Callers that need wider encodings should
+  // use bigint + numberToBytesBE instead of routing large widths through this small helper.
+  if (length < 0 || length > 4) throw new Error('invalid I2OSP length: ' + length);
+  if (value < 0 || value > 2 ** (8 * length) - 1) throw new Error('invalid I2OSP input: ' + value);
+  var res = Array.from({
+    length
+  }).fill(0);
+  for (var i = length - 1; i >= 0; i--) {
+    res[i] = value & 0xff;
+    value >>>= 8;
+  }
+  return new Uint8Array(res);
+}
+// RFC 9380 only applies strxor() to equal-length strings; callers must preserve that invariant.
+function strxor(a, b) {
+  var arr = new Uint8Array(a.length);
+  for (var i = 0; i < a.length; i++) {
+    arr[i] = a[i] ^ b[i];
+  }
+  return arr;
+}
+// User can always use utf8 if they want, by passing Uint8Array.
+// If string is passed, we treat it as ASCII: other formats are likely a mistake.
+function normDST(DST) {
+  if (!Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["isBytes"])(DST) && typeof DST !== 'string') throw new Error('DST must be Uint8Array or ascii string');
+  var dst = typeof DST === 'string' ? Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["asciiToBytes"])(DST) : DST;
+  // RFC 9380 §3.1 requirement 2: tags "MUST have nonzero length".
+  if (dst.length === 0) throw new Error('DST must be non-empty');
+  return dst;
+}
+/**
+ * Produces a uniformly random byte string using a cryptographic hash
+ * function H that outputs b bits.
+ * See {@link https://www.rfc-editor.org/rfc/rfc9380#section-5.3.1 | RFC 9380 section 5.3.1}.
+ * @param msg - Input message.
+ * @param DST - Domain separation tag. This helper normalizes DST, rejects empty DSTs, and
+ *   oversize-hashes DST when needed.
+ * @param lenInBytes - Output length.
+ * @param H - Hash function.
+ * @returns Uniform byte string.
+ * @throws If the message, DST, hash, or output length is invalid. {@link Error}
+ * @example
+ * Expand one message into uniform bytes with the XMD construction.
+ *
+ * ```ts
+ * import { expand_message_xmd } from '@noble/curves/abstract/hash-to-curve.js';
+ * import { sha256 } from '@noble/hashes/sha2.js';
+ * const uniform = expand_message_xmd(new TextEncoder().encode('hello noble'), 'DST', 32, sha256);
+ * ```
+ */
+function expand_message_xmd(msg, DST, lenInBytes, H) {
+  Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(msg);
+  Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["asafenumber"])(lenInBytes);
+  DST = normDST(DST);
+  // https://www.rfc-editor.org/rfc/rfc9380#section-5.3.3
+  if (DST.length > 255) DST = H(Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["concatBytes"])(Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["asciiToBytes"])('H2C-OVERSIZE-DST-'), DST));
+  var b_in_bytes = H.outputLen,
+    r_in_bytes = H.blockLen;
+  var ell = Math.ceil(lenInBytes / b_in_bytes);
+  if (lenInBytes > 65535 || ell > 255) throw new Error('expand_message_xmd: invalid lenInBytes');
+  var DST_prime = Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["concatBytes"])(DST, i2osp(DST.length, 1));
+  var Z_pad = new Uint8Array(r_in_bytes); // RFC 9380: Z_pad = I2OSP(0, s_in_bytes)
+  var l_i_b_str = i2osp(lenInBytes, 2); // len_in_bytes_str
+  var b = new Array(ell);
+  var b_0 = H(Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["concatBytes"])(Z_pad, msg, l_i_b_str, i2osp(0, 1), DST_prime));
+  b[0] = H(Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["concatBytes"])(b_0, i2osp(1, 1), DST_prime));
+  // `b[0]` already stores RFC `b_1`, so only derive `b_2..b_ell` here. The old `<= ell`
+  // loop computed one extra tail block, which was usually sliced away but broke at max `ell=255`
+  // by reaching `I2OSP(256, 1)`.
+  for (var i = 1; i < ell; i++) {
+    var args = [strxor(b_0, b[i - 1]), i2osp(i + 1, 1), DST_prime];
+    b[i] = H(Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["concatBytes"])(...args));
+  }
+  var pseudo_random_bytes = Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["concatBytes"])(...b);
+  return pseudo_random_bytes.slice(0, lenInBytes);
+}
+/**
+ * Produces a uniformly random byte string using an extendable-output function (XOF) H.
+ * 1. The collision resistance of H MUST be at least k bits.
+ * 2. H MUST be an XOF that has been proved indifferentiable from
+ *    a random oracle under a reasonable cryptographic assumption.
+ * See {@link https://www.rfc-editor.org/rfc/rfc9380#section-5.3.2 | RFC 9380 section 5.3.2}.
+ * @param msg - Input message.
+ * @param DST - Domain separation tag. This helper normalizes DST, rejects empty DSTs, and
+ *   oversize-hashes DST when needed.
+ * @param lenInBytes - Output length.
+ * @param k - Target security level.
+ * @param H - XOF hash function.
+ * @returns Uniform byte string.
+ * @throws If the message, DST, XOF, or output length is invalid. {@link Error}
+ * @example
+ * Expand one message into uniform bytes with the XOF construction.
+ *
+ * ```ts
+ * import { expand_message_xof } from '@noble/curves/abstract/hash-to-curve.js';
+ * import { shake256 } from '@noble/hashes/sha3.js';
+ * const uniform = expand_message_xof(
+ *   new TextEncoder().encode('hello noble'),
+ *   'DST',
+ *   32,
+ *   128,
+ *   shake256
+ * );
+ * ```
+ */
+function expand_message_xof(msg, DST, lenInBytes, k, H) {
+  Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(msg);
+  Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["asafenumber"])(lenInBytes);
+  DST = normDST(DST);
+  // https://www.rfc-editor.org/rfc/rfc9380#section-5.3.3
+  // RFC 9380 §5.3.3: DST = H("H2C-OVERSIZE-DST-" || a_very_long_DST, ceil(2 * k / 8)).
+  if (DST.length > 255) {
+    var dkLen = Math.ceil(2 * k / 8);
+    DST = H.create({
+      dkLen
+    }).update(Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["asciiToBytes"])('H2C-OVERSIZE-DST-')).update(DST).digest();
+  }
+  if (lenInBytes > 65535 || DST.length > 255) throw new Error('expand_message_xof: invalid lenInBytes');
+  return H.create({
+    dkLen: lenInBytes
+  }).update(msg).update(i2osp(lenInBytes, 2))
+  // 2. DST_prime = DST || I2OSP(len(DST), 1)
+  .update(DST).update(i2osp(DST.length, 1)).digest();
+}
+/**
+ * Hashes arbitrary-length byte strings to a list of one or more elements of a finite field F.
+ * See {@link https://www.rfc-editor.org/rfc/rfc9380#section-5.2 | RFC 9380 section 5.2}.
+ * @param msg - Input message bytes.
+ * @param count - Number of field elements to derive. Must be `>= 1`.
+ * @param options - RFC 9380 options. See {@link H2COpts}. `m` must be `>= 1`.
+ * @returns `[u_0, ..., u_(count - 1)]`, a list of field elements.
+ * @throws If the expander choice or RFC 9380 options are invalid. {@link Error}
+ * @example
+ * Hash one message into field elements before mapping it onto a curve.
+ *
+ * ```ts
+ * import { hash_to_field } from '@noble/curves/abstract/hash-to-curve.js';
+ * import { sha256 } from '@noble/hashes/sha2.js';
+ * const scalars = hash_to_field(new TextEncoder().encode('hello noble'), 2, {
+ *   DST: 'DST',
+ *   p: 17n,
+ *   m: 1,
+ *   k: 128,
+ *   expand: 'xmd',
+ *   hash: sha256,
+ * });
+ * ```
+ */
+function hash_to_field(msg, count, options) {
+  Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["validateObject"])(options, {
+    p: 'bigint',
+    m: 'number',
+    k: 'number',
+    hash: 'function'
+  });
+  var p = options.p,
+    k = options.k,
+    m = options.m,
+    hash = options.hash,
+    expand = options.expand,
+    DST = options.DST;
+  Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["asafenumber"])(hash.outputLen, 'valid hash');
+  Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(msg);
+  Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["asafenumber"])(count);
+  // RFC 9380 §5.2 defines hash_to_field over a list of one or more field elements and requires
+  // extension degree `m >= 1`; rejecting here avoids degenerate `[]` / `[[]]` helper outputs.
+  if (count < 1) throw new Error('hash_to_field: expected count >= 1');
+  if (m < 1) throw new Error('hash_to_field: expected m >= 1');
+  var log2p = p.toString(2).length;
+  var L = Math.ceil((log2p + k) / 8); // section 5.1 of ietf draft link above
+  var len_in_bytes = count * m * L;
+  var prb; // pseudo_random_bytes
+  if (expand === 'xmd') {
+    prb = expand_message_xmd(msg, DST, len_in_bytes, hash);
+  } else if (expand === 'xof') {
+    prb = expand_message_xof(msg, DST, len_in_bytes, k, hash);
+  } else if (expand === '_internal_pass') {
+    // for internal tests only
+    prb = msg;
+  } else {
+    throw new Error('expand must be "xmd" or "xof"');
+  }
+  var u = new Array(count);
+  for (var i = 0; i < count; i++) {
+    var e = new Array(m);
+    for (var j = 0; j < m; j++) {
+      var elm_offset = L * (j + i * m);
+      var tv = prb.subarray(elm_offset, elm_offset + L);
+      e[j] = Object(_modular_js__WEBPACK_IMPORTED_MODULE_1__["mod"])(os2ip(tv), p);
+    }
+    u[i] = e;
+  }
+  return u;
+}
+/**
+ * @param field - Field implementation.
+ * @param map - Isogeny coefficients.
+ * @returns Isogeny mapping helper.
+ * @example
+ * Build one rational isogeny map, then apply it to affine x/y coordinates.
+ *
+ * ```ts
+ * import { isogenyMap } from '@noble/curves/abstract/hash-to-curve.js';
+ * import { Field } from '@noble/curves/abstract/modular.js';
+ * const Fp = Field(17n);
+ * const iso = isogenyMap(Fp, [[0n, 1n], [1n], [1n], [1n]]);
+ * const point = iso(3n, 5n);
+ * ```
+ */
+function isogenyMap(field, map) {
+  // Make same order as in spec
+  var coeff = map.map(i => Array.from(i).reverse());
+  return (x, y) => {
+    var _coeff$map = coeff.map(val => val.reduce((acc, i) => field.add(field.mul(acc, x), i))),
+      _coeff$map2 = _slicedToArray(_coeff$map, 4),
+      xn = _coeff$map2[0],
+      xd = _coeff$map2[1],
+      yn = _coeff$map2[2],
+      yd = _coeff$map2[3];
+    // RFC 9380 §6.6.3 / Appendix E: denominator-zero exceptional cases must
+    // return the identity on E.
+    // Shipped Weierstrass consumers encode that affine identity as all-zero
+    // coordinates, so `passZero=true` intentionally collapses zero
+    // denominators to `{ x: 0, y: 0 }`.
+    var _FpInvertBatch = Object(_modular_js__WEBPACK_IMPORTED_MODULE_1__["FpInvertBatch"])(field, [xd, yd], true),
+      _FpInvertBatch2 = _slicedToArray(_FpInvertBatch, 2),
+      xd_inv = _FpInvertBatch2[0],
+      yd_inv = _FpInvertBatch2[1];
+    x = field.mul(xn, xd_inv); // xNum / xDen
+    y = field.mul(y, field.mul(yn, yd_inv)); // y * (yNum / yDev)
+    return {
+      x,
+      y
+    };
+  };
+}
+// Keep the shared DST removable when the selected bundle never hashes to scalar.
+// Callers that need protocol-specific scalar domain separation must override this generic default.
+// RFC 9497 §§4.1-4.5 use this ASCII prefix before appending the ciphersuite context string.
+// Export a string instead of mutable bytes so callers cannot poison default hash-to-scalar behavior
+// by mutating a shared Uint8Array in place.
+var _DST_scalar = 'HashToScalar-';
+/**
+ * Creates hash-to-curve methods from EC Point and mapToCurve function. See {@link H2CHasher}.
+ * @param Point - Point constructor.
+ * @param mapToCurve - Map-to-curve function.
+ * @param defaults - Default hash-to-curve options. This object is frozen in place and reused as
+ *   the shared defaults bundle for the returned helpers.
+ * @returns Hash-to-curve helper namespace.
+ * @throws If the map-to-curve callback or default hash-to-curve options are invalid. {@link Error}
+ * @example
+ * Bundle hash-to-curve, hash-to-scalar, and encode-to-curve helpers for one curve.
+ *
+ * ```ts
+ * import { createHasher } from '@noble/curves/abstract/hash-to-curve.js';
+ * import { p256 } from '@noble/curves/nist.js';
+ * import { sha256 } from '@noble/hashes/sha2.js';
+ * const hasher = createHasher(p256.Point, () => p256.Point.BASE.toAffine(), {
+ *   DST: 'P256_XMD:SHA-256_SSWU_RO_',
+ *   encodeDST: 'P256_XMD:SHA-256_SSWU_NU_',
+ *   p: p256.Point.Fp.ORDER,
+ *   m: 1,
+ *   k: 128,
+ *   expand: 'xmd',
+ *   hash: sha256,
+ * });
+ * const point = hasher.encodeToCurve(new TextEncoder().encode('hello noble'));
+ * ```
+ */
+function createHasher(Point, mapToCurve, defaults) {
+  if (typeof mapToCurve !== 'function') throw new Error('mapToCurve() must be defined');
+  // `Point` is intentionally not shape-validated eagerly here: point constructors vary across
+  // curve families, so this helper only checks the hooks it can validate cheaply. Misconfigured
+  // suites fail later when hashing first touches Point.fromAffine / Point.ZERO / clearCofactor().
+  var snapshot = src => Object.freeze(_objectSpread(_objectSpread({}, src), {}, {
+    DST: Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["isBytes"])(src.DST) ? Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["copyBytes"])(src.DST) : src.DST
+  }, src.encodeDST === undefined ? {} : {
+    encodeDST: Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["isBytes"])(src.encodeDST) ? Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["copyBytes"])(src.encodeDST) : src.encodeDST
+  }));
+  // Keep one private defaults snapshot for actual hashing and expose fresh
+  // detached snapshots via the public getter.
+  // Otherwise a caller could mutate `hasher.defaults.DST` in place and poison
+  // the singleton hasher for every other consumer in the same process.
+  var safeDefaults = snapshot(defaults);
+  function map(num) {
+    return Point.fromAffine(mapToCurve(num));
+  }
+  function clear(initial) {
+    var P = initial.clearCofactor();
+    // Keep ZERO as the algebraic cofactor-clearing result here; strict public point-validity
+    // surfaces may still reject it later, but createHasher.clear() itself is not that boundary.
+    if (P.equals(Point.ZERO)) return Point.ZERO;
+    P.assertValidity();
+    return P;
+  }
+  return Object.freeze({
+    get defaults() {
+      return snapshot(safeDefaults);
+    },
+    Point,
+    hashToCurve(msg, options) {
+      var opts = Object.assign({}, safeDefaults, options);
+      var u = hash_to_field(msg, 2, opts);
+      var u0 = map(u[0]);
+      var u1 = map(u[1]);
+      return clear(u0.add(u1));
+    },
+    encodeToCurve(msg, options) {
+      var optsDst = safeDefaults.encodeDST ? {
+        DST: safeDefaults.encodeDST
+      } : {};
+      var opts = Object.assign({}, safeDefaults, optsDst, options);
+      var u = hash_to_field(msg, 1, opts);
+      var u0 = map(u[0]);
+      return clear(u0);
+    },
+    /** See {@link H2CHasher} */
+    mapToCurve(scalars) {
+      // Curves with m=1 accept only single scalar
+      if (safeDefaults.m === 1) {
+        if (typeof scalars !== 'bigint') throw new Error('expected bigint (m=1)');
+        return clear(map([scalars]));
+      }
+      if (!Array.isArray(scalars)) throw new Error('expected array of bigints');
+      for (var i of scalars) if (typeof i !== 'bigint') throw new Error('expected array of bigints');
+      return clear(map(scalars));
+    },
+    // hash_to_scalar can produce 0: https://www.rfc-editor.org/errata/eid8393
+    // RFC 9380, draft-irtf-cfrg-bbs-signatures-08. Default scalar DST is the shared generic
+    // `HashToScalar-` prefix above unless the caller overrides it per invocation.
+    hashToScalar(msg, options) {
+      // @ts-ignore
+      var N = Point.Fn.ORDER;
+      var opts = Object.assign({}, safeDefaults, {
+        p: N,
+        m: 1,
+        DST: _DST_scalar
+      }, options);
+      return hash_to_field(msg, 1, opts)[0][0];
+    }
+  });
+}
+
+/***/ }),
+
+/***/ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/abstract/modular.js":
+/*!****************************************************************************!*\
+  !*** ./src/onlykey-fido2/onlykey/vendor/@noble/curves/abstract/modular.js ***!
+  \****************************************************************************/
+/*! exports provided: mod, pow, pow2, invert, tonelliShanks, FpSqrt, isNegativeLE, validateField, FpPow, FpInvertBatch, FpDiv, FpLegendre, FpIsSquare, nLength, Field, FpSqrtOdd, FpSqrtEven, getFieldBytesLength, getMinHashLength, mapHashToField */
+/***/ (function(module, __webpack_exports__, __webpack_require__) {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "mod", function() { return mod; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "pow", function() { return pow; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "pow2", function() { return pow2; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "invert", function() { return invert; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "tonelliShanks", function() { return tonelliShanks; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "FpSqrt", function() { return FpSqrt; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "isNegativeLE", function() { return isNegativeLE; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "validateField", function() { return validateField; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "FpPow", function() { return FpPow; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "FpInvertBatch", function() { return FpInvertBatch; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "FpDiv", function() { return FpDiv; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "FpLegendre", function() { return FpLegendre; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "FpIsSquare", function() { return FpIsSquare; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "nLength", function() { return nLength; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "Field", function() { return Field; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "FpSqrtOdd", function() { return FpSqrtOdd; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "FpSqrtEven", function() { return FpSqrtEven; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "getFieldBytesLength", function() { return getFieldBytesLength; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "getMinHashLength", function() { return getMinHashLength; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "mapHashToField", function() { return mapHashToField; });
+/* harmony import */ var _utils_js__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! ../utils.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/utils.js");
+function _defineProperty(e, r, t) { return (r = _toPropertyKey(r)) in e ? Object.defineProperty(e, r, { value: t, enumerable: !0, configurable: !0, writable: !0 }) : e[r] = t, e; }
+function _toPropertyKey(t) { var i = _toPrimitive(t, "string"); return "symbol" == typeof i ? i : i + ""; }
+function _toPrimitive(t, r) { if ("object" != typeof t || !t) return t; var e = t[Symbol.toPrimitive]; if (void 0 !== e) { var i = e.call(t, r || "default"); if ("object" != typeof i) return i; throw new TypeError("@@toPrimitive must return a primitive value."); } return ("string" === r ? String : Number)(t); }
+/**
+ * Utils for modular division and fields.
+ * Field over 11 is a finite (Galois) field is integer number operations `mod 11`.
+ * There is no division: it is replaced by modular multiplicative inverse.
+ * @module
+ */
+/*! noble-curves - MIT License (c) 2022 Paul Miller (paulmillr.com) */
+
+// Numbers aren't used in x25519 / x448 builds
+// prettier-ignore
+var _0n = /* @__PURE__ */BigInt(0),
+  _1n = /* @__PURE__ */BigInt(1),
+  _2n = /* @__PURE__ */BigInt(2);
+// prettier-ignore
+var _3n = /* @__PURE__ */BigInt(3),
+  _4n = /* @__PURE__ */BigInt(4),
+  _5n = /* @__PURE__ */BigInt(5);
+// prettier-ignore
+var _7n = /* @__PURE__ */BigInt(7),
+  _8n = /* @__PURE__ */BigInt(8),
+  _9n = /* @__PURE__ */BigInt(9);
+var _16n = /* @__PURE__ */BigInt(16);
+/**
+ * @param a - Dividend value.
+ * @param b - Positive modulus.
+ * @returns Reduced value in `[0, b)` only when `b` is positive.
+ * @throws If the modulus is not positive. {@link Error}
+ * @example
+ * Normalize a bigint into one field residue.
+ *
+ * ```ts
+ * mod(-1n, 5n);
+ * ```
+ */
+function mod(a, b) {
+  if (b <= _0n) throw new Error('mod: expected positive modulus, got ' + b);
+  var result = a % b;
+  return result >= _0n ? result : b + result;
+}
+/**
+ * Efficiently raise num to a power with modular reduction.
+ * Unsafe in some contexts: uses ladder, so can expose bigint bits.
+ * Low-level helper: callers that need canonical residues must pass a valid `num` for the chosen
+ * modulus instead of relying on the `power===0/1` fast paths to normalize it.
+ * @param num - Base value.
+ * @param power - Exponent value.
+ * @param modulo - Reduction modulus.
+ * @returns Modular exponentiation result.
+ * @throws If the modulus or exponent is invalid. {@link Error}
+ * @example
+ * Raise one bigint to a modular power.
+ *
+ * ```ts
+ * pow(2n, 6n, 11n) // 64n % 11n == 9n
+ * ```
+ */
+function pow(num, power, modulo) {
+  return FpPow(Field(modulo), num, power);
+}
+/**
+ * Does `x^(2^power)` mod p. `pow2(30, 4)` == `30^(2^4)`.
+ * Low-level helper: callers that need canonical residues must pass a valid `x` for the chosen
+ * modulus; the `power===0` fast path intentionally returns the input unchanged.
+ * @param x - Base value.
+ * @param power - Number of squarings.
+ * @param modulo - Reduction modulus.
+ * @returns Repeated-squaring result.
+ * @throws If the exponent is negative. {@link Error}
+ * @example
+ * Apply repeated squaring inside one field.
+ *
+ * ```ts
+ * pow2(3n, 2n, 11n);
+ * ```
+ */
+function pow2(x, power, modulo) {
+  if (power < _0n) throw new Error('pow2: expected non-negative exponent, got ' + power);
+  var res = x;
+  while (power-- > _0n) {
+    res *= res;
+    res %= modulo;
+  }
+  return res;
+}
+/**
+ * Inverses number over modulo.
+ * Implemented using the {@link https://brilliant.org/wiki/extended-euclidean-algorithm/ | extended Euclidean algorithm}.
+ * @param number - Value to invert.
+ * @param modulo - Positive modulus.
+ * @returns Multiplicative inverse.
+ * @throws If the modulus is invalid or the inverse does not exist. {@link Error}
+ * @example
+ * Compute one modular inverse with the extended Euclidean algorithm.
+ *
+ * ```ts
+ * invert(3n, 11n);
+ * ```
+ */
+function invert(number, modulo) {
+  if (number === _0n) throw new Error('invert: expected non-zero number');
+  if (modulo <= _0n) throw new Error('invert: expected positive modulus, got ' + modulo);
+  // Fermat's little theorem "CT-like" version inv(n) = n^(m-2) mod m is 30x slower.
+  var a = mod(number, modulo);
+  var b = modulo;
+  // prettier-ignore
+  var x = _0n,
+    y = _1n,
+    u = _1n,
+    v = _0n;
+  while (a !== _0n) {
+    var q = b / a;
+    var r = b - a * q;
+    var m = x - u * q;
+    var n = y - v * q;
+    // prettier-ignore
+    b = a, a = r, x = u, y = v, u = m, v = n;
+  }
+  var gcd = b;
+  if (gcd !== _1n) throw new Error('invert: does not exist');
+  return mod(x, modulo);
+}
+function assertIsSquare(Fp, root, n) {
+  var F = Fp;
+  if (!F.eql(F.sqr(root), n)) throw new Error('Cannot find square root');
+}
+// Not all roots are possible! Example which will throw:
+// const NUM =
+// n = 72057594037927816n;
+// Fp = Field(BigInt('0x1a0111ea397fe69a4b1ba7b6434bacd764774b84f38512bf6730d2a0f6b0f6241eabfffeb153ffffb9feffffffffaaab'));
+function sqrt3mod4(Fp, n) {
+  var F = Fp;
+  var p1div4 = (F.ORDER + _1n) / _4n;
+  var root = F.pow(n, p1div4);
+  assertIsSquare(F, root, n);
+  return root;
+}
+// Equivalent `q = 5 (mod 8)` square-root formula (Atkin-style), not the RFC Appendix I.2 CMOV
+// pseudocode verbatim.
+function sqrt5mod8(Fp, n) {
+  var F = Fp;
+  var p5div8 = (F.ORDER - _5n) / _8n;
+  var n2 = F.mul(n, _2n);
+  var v = F.pow(n2, p5div8);
+  var nv = F.mul(n, v);
+  var i = F.mul(F.mul(nv, _2n), v);
+  var root = F.mul(nv, F.sub(i, F.ONE));
+  assertIsSquare(F, root, n);
+  return root;
+}
+// Based on RFC9380, Kong algorithm
+// prettier-ignore
+function sqrt9mod16(P) {
+  var Fp_ = Field(P);
+  var tn = tonelliShanks(P);
+  var c1 = tn(Fp_, Fp_.neg(Fp_.ONE)); //  1. c1 = sqrt(-1) in F, i.e., (c1^2) == -1 in F
+  var c2 = tn(Fp_, c1); //  2. c2 = sqrt(c1) in F, i.e., (c2^2) == c1 in F
+  var c3 = tn(Fp_, Fp_.neg(c1)); //  3. c3 = sqrt(-c1) in F, i.e., (c3^2) == -c1 in F
+  var c4 = (P + _7n) / _16n; //  4. c4 = (q + 7) / 16        # Integer arithmetic
+  return (Fp, n) => {
+    var F = Fp;
+    var tv1 = F.pow(n, c4); //  1. tv1 = x^c4
+    var tv2 = F.mul(tv1, c1); //  2. tv2 = c1 * tv1
+    var tv3 = F.mul(tv1, c2); //  3. tv3 = c2 * tv1
+    var tv4 = F.mul(tv1, c3); //  4. tv4 = c3 * tv1
+    var e1 = F.eql(F.sqr(tv2), n); //  5.  e1 = (tv2^2) == x
+    var e2 = F.eql(F.sqr(tv3), n); //  6.  e2 = (tv3^2) == x
+    tv1 = F.cmov(tv1, tv2, e1); //  7. tv1 = CMOV(tv1, tv2, e1)  # Select tv2 if (tv2^2) == x
+    tv2 = F.cmov(tv4, tv3, e2); //  8. tv2 = CMOV(tv4, tv3, e2)  # Select tv3 if (tv3^2) == x
+    var e3 = F.eql(F.sqr(tv2), n); //  9.  e3 = (tv2^2) == x
+    var root = F.cmov(tv1, tv2, e3); // 10.  z = CMOV(tv1, tv2, e3)   # Select sqrt from tv1 & tv2
+    assertIsSquare(F, root, n);
+    return root;
+  };
+}
+/**
+ * Tonelli-Shanks square root search algorithm.
+ * This implementation is variable-time: it searches data-dependently for the first non-residue `Z`
+ * and for the smallest `i` in the main loop, unlike RFC 9380 Appendix I.4's constant-time shape.
+ * 1. {@link https://eprint.iacr.org/2012/685.pdf | eprint 2012/685}, page 12
+ * 2. Square Roots from 1; 24, 51, 10 to Dan Shanks
+ * @param P - field order
+ * @returns function that takes field Fp (created from P) and number n
+ * @throws If the field is too small, non-prime, or the square root does not exist. {@link Error}
+ * @example
+ * Construct a square-root helper for primes that need Tonelli-Shanks.
+ *
+ * ```ts
+ * import { Field, tonelliShanks } from '@noble/curves/abstract/modular.js';
+ * const Fp = Field(17n);
+ * const sqrt = tonelliShanks(17n)(Fp, 4n);
+ * ```
+ */
+function tonelliShanks(P) {
+  // Initialization (precomputation).
+  // Caching initialization could boost perf by 7%.
+  if (P < _3n) throw new Error('sqrt is not defined for small field');
+  // Factor P - 1 = Q * 2^S, where Q is odd
+  var Q = P - _1n;
+  var S = 0;
+  while (Q % _2n === _0n) {
+    Q /= _2n;
+    S++;
+  }
+  // Find the first quadratic non-residue Z >= 2
+  var Z = _2n;
+  var _Fp = Field(P);
+  while (FpLegendre(_Fp, Z) === 1) {
+    // Basic primality test for P. After x iterations, chance of
+    // not finding quadratic non-residue is 2^x, so 2^1000.
+    if (Z++ > 1000) throw new Error('Cannot find square root: probably non-prime P');
+  }
+  // Fast-path; usually done before Z, but we do "primality test".
+  if (S === 1) return sqrt3mod4;
+  // Slow-path
+  // TODO: test on Fp2 and others
+  var cc = _Fp.pow(Z, Q); // c = z^Q
+  var Q1div2 = (Q + _1n) / _2n;
+  return function tonelliSlow(Fp, n) {
+    var F = Fp;
+    if (F.is0(n)) return n;
+    // Check if n is a quadratic residue using Legendre symbol
+    if (FpLegendre(F, n) !== 1) throw new Error('Cannot find square root');
+    // Initialize variables for the main loop
+    var M = S;
+    var c = F.mul(F.ONE, cc); // c = z^Q, move cc from field _Fp into field Fp
+    var t = F.pow(n, Q); // t = n^Q, first guess at the fudge factor
+    var R = F.pow(n, Q1div2); // R = n^((Q+1)/2), first guess at the square root
+    // Main loop
+    // while t != 1
+    while (!F.eql(t, F.ONE)) {
+      if (F.is0(t)) return F.ZERO; // if t=0 return R=0
+      var i = 1;
+      // Find the smallest i >= 1 such that t^(2^i) ≡ 1 (mod P)
+      var t_tmp = F.sqr(t); // t^(2^1)
+      while (!F.eql(t_tmp, F.ONE)) {
+        i++;
+        t_tmp = F.sqr(t_tmp); // t^(2^2)...
+        if (i === M) throw new Error('Cannot find square root');
+      }
+      // Calculate the exponent for b: 2^(M - i - 1)
+      var exponent = _1n << BigInt(M - i - 1); // bigint is important
+      var b = F.pow(c, exponent); // b = 2^(M - i - 1)
+      // Update variables
+      M = i;
+      c = F.sqr(b); // c = b^2
+      t = F.mul(t, c); // t = (t * b^2)
+      R = F.mul(R, b); // R = R*b
+    }
+    return R;
+  };
+}
+/**
+ * Square root for a finite field. Will try optimized versions first:
+ *
+ * 1. P ≡ 3 (mod 4)
+ * 2. P ≡ 5 (mod 8)
+ * 3. P ≡ 9 (mod 16)
+ * 4. Tonelli-Shanks algorithm
+ *
+ * Different algorithms can give different roots, it is up to user to decide which one they want.
+ * For example there is FpSqrtOdd/FpSqrtEven to choose a root by oddness
+ * (used for hash-to-curve).
+ * @param P - Field order.
+ * @returns Square-root helper. The generic fallback inherits Tonelli-Shanks' variable-time
+ *   behavior and this selector assumes prime-field-style integer moduli.
+ * @throws If the field is unsupported or the square root does not exist. {@link Error}
+ * @example
+ * Choose the square-root helper appropriate for one field modulus.
+ *
+ * ```ts
+ * import { Field, FpSqrt } from '@noble/curves/abstract/modular.js';
+ * const Fp = Field(17n);
+ * const sqrt = FpSqrt(17n)(Fp, 4n);
+ * ```
+ */
+function FpSqrt(P) {
+  // P ≡ 3 (mod 4) => √n = n^((P+1)/4)
+  if (P % _4n === _3n) return sqrt3mod4;
+  // P ≡ 5 (mod 8) => Atkin algorithm, page 10 of https://eprint.iacr.org/2012/685.pdf
+  if (P % _8n === _5n) return sqrt5mod8;
+  // P ≡ 9 (mod 16) => Kong algorithm, page 11 of https://eprint.iacr.org/2012/685.pdf (algorithm 4)
+  if (P % _16n === _9n) return sqrt9mod16(P);
+  // Tonelli-Shanks algorithm
+  return tonelliShanks(P);
+}
+/**
+ * @param num - Value to inspect.
+ * @param modulo - Field modulus.
+ * @returns `true` when the least-significant little-endian bit is set.
+ * @throws If the modulus is invalid for `mod(...)`. {@link Error}
+ * @example
+ * Inspect the low bit used by little-endian sign conventions.
+ *
+ * ```ts
+ * isNegativeLE(3n, 11n);
+ * ```
+ */
+var isNegativeLE = (num, modulo) => (mod(num, modulo) & _1n) === _1n;
+// prettier-ignore
+// Arithmetic-only subset checked by validateField(). This is intentionally not the full runtime
+// IField contract: helpers like `isValidNot0`, `invertBatch`, `toBytes`, `fromBytes`, `cmov`, and
+// field-specific extras like `isOdd` are left to the callers that actually need them.
+var FIELD_FIELDS = ['create', 'isValid', 'is0', 'neg', 'inv', 'sqrt', 'sqr', 'eql', 'add', 'sub', 'mul', 'pow', 'div', 'addN', 'subN', 'mulN', 'sqrN'];
+/**
+ * @param field - Field implementation.
+ * @returns Validated field. This only checks the arithmetic subset needed by generic helpers; it
+ *   does not guarantee full runtime-method coverage for serialization, batching, `cmov`, or
+ *   field-specific extras beyond positive `BYTES` / `BITS`.
+ * @throws If the field shape or numeric metadata are invalid. {@link Error}
+ * @example
+ * Check that a field implementation exposes the operations curve code expects.
+ *
+ * ```ts
+ * import { Field, validateField } from '@noble/curves/abstract/modular.js';
+ * const Fp = validateField(Field(17n));
+ * ```
+ */
+function validateField(field) {
+  var initial = {
+    ORDER: 'bigint',
+    BYTES: 'number',
+    BITS: 'number'
+  };
+  var opts = FIELD_FIELDS.reduce((map, val) => {
+    map[val] = 'function';
+    return map;
+  }, initial);
+  Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["validateObject"])(field, opts);
+  // Runtime field implementations must expose real integer byte/bit sizes; fractional / NaN /
+  // infinite metadata leaks through validateObject(type='number') but breaks encoders and caches.
+  Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["asafenumber"])(field.BYTES, 'BYTES');
+  Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["asafenumber"])(field.BITS, 'BITS');
+  // Runtime field implementations must expose positive byte/bit sizes; zero leaks through the
+  // numeric shape checks above but still breaks encoding helpers and cached-length assumptions.
+  if (field.BYTES < 1 || field.BITS < 1) throw new Error('invalid field: expected BYTES/BITS > 0');
+  if (field.ORDER <= _1n) throw new Error('invalid field: expected ORDER > 1, got ' + field.ORDER);
+  return field;
+}
+// Generic field functions
+/**
+ * Same as `pow` but for Fp: non-constant-time.
+ * Unsafe in some contexts: uses ladder, so can expose bigint bits.
+ * @param Fp - Field implementation.
+ * @param num - Base value.
+ * @param power - Exponent value.
+ * @returns Powered field element.
+ * @throws If the exponent is negative. {@link Error}
+ * @example
+ * Raise one field element to a public exponent.
+ *
+ * ```ts
+ * import { Field, FpPow } from '@noble/curves/abstract/modular.js';
+ * const Fp = Field(17n);
+ * const x = FpPow(Fp, 3n, 5n);
+ * ```
+ */
+function FpPow(Fp, num, power) {
+  var F = Fp;
+  if (power < _0n) throw new Error('invalid exponent, negatives unsupported');
+  if (power === _0n) return F.ONE;
+  if (power === _1n) return num;
+  var p = F.ONE;
+  var d = num;
+  while (power > _0n) {
+    if (power & _1n) p = F.mul(p, d);
+    d = F.sqr(d);
+    power >>= _1n;
+  }
+  return p;
+}
+/**
+ * Efficiently invert an array of Field elements.
+ * Exception-free. Zero-valued field elements stay `undefined` unless `passZero` is enabled.
+ * @param Fp - Field implementation.
+ * @param nums - Values to invert.
+ * @param passZero - map 0 to 0 (instead of undefined)
+ * @returns Inverted values.
+ * @example
+ * Invert several field elements with one shared inversion.
+ *
+ * ```ts
+ * import { Field, FpInvertBatch } from '@noble/curves/abstract/modular.js';
+ * const Fp = Field(17n);
+ * const inv = FpInvertBatch(Fp, [1n, 2n, 4n]);
+ * ```
+ */
+function FpInvertBatch(Fp, nums) {
+  var passZero = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : false;
+  var F = Fp;
+  var inverted = new Array(nums.length).fill(passZero ? F.ZERO : undefined);
+  // Walk from first to last, multiply them by each other MOD p
+  var multipliedAcc = nums.reduce((acc, num, i) => {
+    if (F.is0(num)) return acc;
+    inverted[i] = acc;
+    return F.mul(acc, num);
+  }, F.ONE);
+  // Invert last element
+  var invertedAcc = F.inv(multipliedAcc);
+  // Walk from last to first, multiply them by inverted each other MOD p
+  nums.reduceRight((acc, num, i) => {
+    if (F.is0(num)) return acc;
+    inverted[i] = F.mul(acc, inverted[i]);
+    return F.mul(acc, num);
+  }, invertedAcc);
+  return inverted;
+}
+/**
+ * @param Fp - Field implementation.
+ * @param lhs - Dividend value.
+ * @param rhs - Divisor value.
+ * @returns Division result.
+ * @throws If the divisor is non-invertible. {@link Error}
+ * @example
+ * Divide one field element by another.
+ *
+ * ```ts
+ * import { Field, FpDiv } from '@noble/curves/abstract/modular.js';
+ * const Fp = Field(17n);
+ * const x = FpDiv(Fp, 6n, 3n);
+ * ```
+ */
+function FpDiv(Fp, lhs, rhs) {
+  var F = Fp;
+  return F.mul(lhs, typeof rhs === 'bigint' ? invert(rhs, F.ORDER) : F.inv(rhs));
+}
+/**
+ * Legendre symbol.
+ * Legendre constant is used to calculate Legendre symbol (a | p)
+ * which denotes the value of a^((p-1)/2) (mod p).
+ *
+ * * (a | p) ≡ 1    if a is a square (mod p), quadratic residue
+ * * (a | p) ≡ -1   if a is not a square (mod p), quadratic non residue
+ * * (a | p) ≡ 0    if a ≡ 0 (mod p)
+ * @param Fp - Field implementation.
+ * @param n - Value to inspect.
+ * @returns Legendre symbol.
+ * @throws If the field returns an invalid Legendre symbol value. {@link Error}
+ * @example
+ * Compute the Legendre symbol of one field element.
+ *
+ * ```ts
+ * import { Field, FpLegendre } from '@noble/curves/abstract/modular.js';
+ * const Fp = Field(17n);
+ * const symbol = FpLegendre(Fp, 4n);
+ * ```
+ */
+function FpLegendre(Fp, n) {
+  var F = Fp;
+  // We can use 3rd argument as optional cache of this value
+  // but seems unneeded for now. The operation is very fast.
+  var p1mod2 = (F.ORDER - _1n) / _2n;
+  var powered = F.pow(n, p1mod2);
+  var yes = F.eql(powered, F.ONE);
+  var zero = F.eql(powered, F.ZERO);
+  var no = F.eql(powered, F.neg(F.ONE));
+  if (!yes && !zero && !no) throw new Error('invalid Legendre symbol result');
+  return yes ? 1 : zero ? 0 : -1;
+}
+/**
+ * @param Fp - Field implementation.
+ * @param n - Value to inspect.
+ * @returns `true` when `Fp.sqrt(n)` exists. This includes `0`, even though strict "quadratic
+ *   residue" terminology often reserves that name for the non-zero square class.
+ * @throws If the field returns an invalid Legendre symbol value. {@link Error}
+ * @example
+ * Check whether one field element has a square root in the field.
+ *
+ * ```ts
+ * import { Field, FpIsSquare } from '@noble/curves/abstract/modular.js';
+ * const Fp = Field(17n);
+ * const isSquare = FpIsSquare(Fp, 4n);
+ * ```
+ */
+function FpIsSquare(Fp, n) {
+  var l = FpLegendre(Fp, n);
+  // Zero is a square too: 0 = 0^2, and Fp.sqrt(0) already returns 0.
+  return l !== -1;
+}
+/**
+ * @param n - Curve order. Callers are expected to pass a positive order.
+ * @param nBitLength - Optional cached bit length. Callers are expected to pass a positive cached
+ *   value when overriding the derived bit length.
+ * @returns Byte and bit lengths.
+ * @throws If the order or cached bit length is invalid. {@link Error}
+ * @example
+ * Measure the encoding sizes needed for one modulus.
+ *
+ * ```ts
+ * nLength(255n);
+ * ```
+ */
+function nLength(n, nBitLength) {
+  // Bit size, byte size of CURVE.n
+  if (nBitLength !== undefined) Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["anumber"])(nBitLength);
+  if (n <= _0n) throw new Error('invalid n length: expected positive n, got ' + n);
+  if (nBitLength !== undefined && nBitLength < 1) throw new Error('invalid n length: expected positive bit length, got ' + nBitLength);
+  var bits = Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["bitLen"])(n);
+  // Cached bit lengths smaller than ORDER would truncate serialized scalars/elements and poison
+  // any math that relies on the derived field metadata.
+  if (nBitLength !== undefined && nBitLength < bits) throw new Error("invalid n length: expected bit length (".concat(bits, ") >= n.length (").concat(nBitLength, ")"));
+  var _nBitLength = nBitLength !== undefined ? nBitLength : bits;
+  var nByteLength = Math.ceil(_nBitLength / 8);
+  return {
+    nBitLength: _nBitLength,
+    nByteLength
+  };
+}
+// Keep the lazy sqrt cache off-instance so Field(...) can return a frozen object. Otherwise the
+// cached helper write would keep the field surface externally mutable.
+var FIELD_SQRT = new WeakMap();
+class _Field {
+  constructor(ORDER) {
+    var opts = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : {};
+    _defineProperty(this, "ORDER", void 0);
+    _defineProperty(this, "BITS", void 0);
+    _defineProperty(this, "BYTES", void 0);
+    _defineProperty(this, "isLE", void 0);
+    _defineProperty(this, "ZERO", _0n);
+    _defineProperty(this, "ONE", _1n);
+    _defineProperty(this, "_lengths", void 0);
+    _defineProperty(this, "_mod", void 0);
+    // ORDER <= 1 is degenerate: ONE would not be a valid field element and helpers like pow/inv
+    // would stop modeling field arithmetic.
+    if (ORDER <= _1n) throw new Error('invalid field: expected ORDER > 1, got ' + ORDER);
+    var _nbitLength = undefined;
+    this.isLE = false;
+    if (opts != null && typeof opts === 'object') {
+      // Cached bit lengths are trusted here and should already be positive / consistent with ORDER.
+      if (typeof opts.BITS === 'number') _nbitLength = opts.BITS;
+      if (typeof opts.sqrt === 'function')
+        // `_Field.prototype` is frozen below, so custom sqrt hooks must become own properties
+        // explicitly instead of relying on writable prototype shadowing via assignment.
+        Object.defineProperty(this, 'sqrt', {
+          value: opts.sqrt,
+          enumerable: true
+        });
+      if (typeof opts.isLE === 'boolean') this.isLE = opts.isLE;
+      if (opts.allowedLengths) this._lengths = Object.freeze(opts.allowedLengths.slice());
+      if (typeof opts.modFromBytes === 'boolean') this._mod = opts.modFromBytes;
+    }
+    var _nLength = nLength(ORDER, _nbitLength),
+      nBitLength = _nLength.nBitLength,
+      nByteLength = _nLength.nByteLength;
+    if (nByteLength > 2048) throw new Error('invalid field: expected ORDER of <= 2048 bytes');
+    this.ORDER = ORDER;
+    this.BITS = nBitLength;
+    this.BYTES = nByteLength;
+    Object.freeze(this);
+  }
+  create(num) {
+    return mod(num, this.ORDER);
+  }
+  isValid(num) {
+    if (typeof num !== 'bigint') throw new TypeError('invalid field element: expected bigint, got ' + typeof num);
+    return _0n <= num && num < this.ORDER; // 0 is valid element, but it's not invertible
+  }
+  is0(num) {
+    return num === _0n;
+  }
+  // is valid and invertible
+  isValidNot0(num) {
+    return !this.is0(num) && this.isValid(num);
+  }
+  isOdd(num) {
+    return (num & _1n) === _1n;
+  }
+  neg(num) {
+    return mod(-num, this.ORDER);
+  }
+  eql(lhs, rhs) {
+    return lhs === rhs;
+  }
+  sqr(num) {
+    return mod(num * num, this.ORDER);
+  }
+  add(lhs, rhs) {
+    return mod(lhs + rhs, this.ORDER);
+  }
+  sub(lhs, rhs) {
+    return mod(lhs - rhs, this.ORDER);
+  }
+  mul(lhs, rhs) {
+    return mod(lhs * rhs, this.ORDER);
+  }
+  pow(num, power) {
+    return FpPow(this, num, power);
+  }
+  div(lhs, rhs) {
+    return mod(lhs * invert(rhs, this.ORDER), this.ORDER);
+  }
+  // Same as above, but doesn't normalize
+  sqrN(num) {
+    return num * num;
+  }
+  addN(lhs, rhs) {
+    return lhs + rhs;
+  }
+  subN(lhs, rhs) {
+    return lhs - rhs;
+  }
+  mulN(lhs, rhs) {
+    return lhs * rhs;
+  }
+  inv(num) {
+    return invert(num, this.ORDER);
+  }
+  sqrt(num) {
+    // Caching sqrt helpers speeds up sqrt9mod16 by 5x and Tonelli-Shanks by about 10% without keeping
+    // the field instance itself mutable.
+    var sqrt = FIELD_SQRT.get(this);
+    if (!sqrt) FIELD_SQRT.set(this, sqrt = FpSqrt(this.ORDER));
+    return sqrt(this, num);
+  }
+  toBytes(num) {
+    // Serialize fixed-width limbs without re-validating the field range. Callers that need a
+    // canonical encoding must pass a valid element; some protocols intentionally serialize raw
+    // residues here and reduce or validate them elsewhere.
+    return this.isLE ? Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["numberToBytesLE"])(num, this.BYTES) : Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["numberToBytesBE"])(num, this.BYTES);
+  }
+  fromBytes(bytes) {
+    var skipValidation = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : false;
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(bytes);
+    var allowedLengths = this._lengths,
+      BYTES = this.BYTES,
+      isLE = this.isLE,
+      ORDER = this.ORDER,
+      modFromBytes = this._mod;
+    if (allowedLengths) {
+      // `allowedLengths` must list real positive byte lengths; otherwise empty input would get
+      // padded into zero and silently decode as a field element.
+      if (bytes.length < 1 || !allowedLengths.includes(bytes.length) || bytes.length > BYTES) {
+        throw new Error('Field.fromBytes: expected ' + allowedLengths + ' bytes, got ' + bytes.length);
+      }
+      var padded = new Uint8Array(BYTES);
+      // isLE add 0 to right, !isLE to the left.
+      padded.set(bytes, isLE ? 0 : padded.length - bytes.length);
+      bytes = padded;
+    }
+    if (bytes.length !== BYTES) throw new Error('Field.fromBytes: expected ' + BYTES + ' bytes, got ' + bytes.length);
+    var scalar = isLE ? Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["bytesToNumberLE"])(bytes) : Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["bytesToNumberBE"])(bytes);
+    if (modFromBytes) scalar = mod(scalar, ORDER);
+    if (!skipValidation) if (!this.isValid(scalar)) throw new Error('invalid field element: outside of range 0..ORDER');
+    // Range validation is optional here because some protocols intentionally decode raw residues
+    // and reduce or validate them elsewhere.
+    return scalar;
+  }
+  // TODO: we don't need it here, move out to separate fn
+  invertBatch(lst) {
+    return FpInvertBatch(this, lst);
+  }
+  // We can't move this out because Fp6, Fp12 implement it
+  // and it's unclear what to return in there.
+  cmov(a, b, condition) {
+    // Field elements have `isValid(...)`; the CMOV branch bit is a direct runtime input, so reject
+    // non-boolean selectors here instead of letting JS truthiness silently change arithmetic.
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abool"])(condition, 'condition');
+    return condition ? b : a;
+  }
+}
+// Freeze the shared method surface too; otherwise callers can still poison every Field instance by
+// monkey-patching `_Field.prototype` even if each instance is frozen.
+Object.freeze(_Field.prototype);
+/**
+ * Creates a finite field. Major performance optimizations:
+ * * 1. Denormalized operations like mulN instead of mul.
+ * * 2. Identical object shape: never add or remove keys.
+ * * 3. Frozen stable object shape; the lazy sqrt cache lives in a module-level `WeakMap`.
+ * Fragile: always run a benchmark on a change.
+ * Security note: operations and low-level serializers like `toBytes` don't check `isValid` for
+ * all elements for performance and protocol-flexibility reasons; callers are responsible for
+ * supplying valid elements when they need canonical field behavior.
+ * This is low-level code, please make sure you know what you're doing.
+ *
+ * Note about field properties:
+ * * CHARACTERISTIC p = prime number, number of elements in main subgroup.
+ * * ORDER q = similar to cofactor in curves, may be composite `q = p^m`.
+ *
+ * @param ORDER - field order, probably prime, or could be composite
+ * @param opts - Field options such as bit length or endianness. See {@link FieldOpts}.
+ * @returns Frozen field instance with a stable object shape. This wrapper forwards `opts` straight
+ *   into `_Field`, so it inherits `_Field`'s assumptions about cached sizes and `allowedLengths`.
+ * @example
+ * Construct one prime field with optional overrides.
+ *
+ * ```ts
+ * Field(11n);
+ * ```
+ */
+function Field(ORDER) {
+  var opts = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : {};
+  return new _Field(ORDER, opts);
+}
+// Generic random scalar, we can do same for other fields if via Fp2.mul(Fp2.ONE, Fp2.random)?
+// This allows unsafe methods like ignore bias or zero. These unsafe, but often used in different protocols (if deterministic RNG).
+// which mean we cannot force this via opts.
+// Not sure what to do with randomBytes, we can accept it inside opts if wanted.
+// Probably need to export getMinHashLength somewhere?
+// random(bytes?: Uint8Array, unsafeAllowZero = false, unsafeAllowBias = false) {
+//   const LEN = !unsafeAllowBias ? getMinHashLength(ORDER) : BYTES;
+//   if (bytes === undefined) bytes = randomBytes(LEN); // _opts.randomBytes?
+//   const num = isLE ? bytesToNumberLE(bytes) : bytesToNumberBE(bytes);
+//   // `mod(x, 11)` can sometimes produce 0. `mod(x, 10) + 1` is the same, but no 0
+//   const reduced = unsafeAllowZero ? mod(num, ORDER) : mod(num, ORDER - _1n) + _1n;
+//   return reduced;
+// },
+/**
+ * @param Fp - Field implementation.
+ * @param elm - Value to square-root.
+ * @returns Odd square root when two roots exist. The special case `elm = 0` still returns `0`,
+ *   which is the only square root but is not odd.
+ * @throws If the field lacks oddness checks or the square root does not exist. {@link Error}
+ * @example
+ * Select the odd square root when two roots exist.
+ *
+ * ```ts
+ * import { Field, FpSqrtOdd } from '@noble/curves/abstract/modular.js';
+ * const Fp = Field(17n);
+ * const root = FpSqrtOdd(Fp, 4n);
+ * ```
+ */
+function FpSqrtOdd(Fp, elm) {
+  var F = Fp;
+  if (!F.isOdd) throw new Error("Field doesn't have isOdd");
+  var root = F.sqrt(elm);
+  return F.isOdd(root) ? root : F.neg(root);
+}
+/**
+ * @param Fp - Field implementation.
+ * @param elm - Value to square-root.
+ * @returns Even square root.
+ * @throws If the field lacks oddness checks or the square root does not exist. {@link Error}
+ * @example
+ * Select the even square root when two roots exist.
+ *
+ * ```ts
+ * import { Field, FpSqrtEven } from '@noble/curves/abstract/modular.js';
+ * const Fp = Field(17n);
+ * const root = FpSqrtEven(Fp, 4n);
+ * ```
+ */
+function FpSqrtEven(Fp, elm) {
+  var F = Fp;
+  if (!F.isOdd) throw new Error("Field doesn't have isOdd");
+  var root = F.sqrt(elm);
+  return F.isOdd(root) ? F.neg(root) : root;
+}
+/**
+ * Returns total number of bytes consumed by the field element.
+ * For example, 32 bytes for usual 256-bit weierstrass curve.
+ * @param fieldOrder - number of field elements, usually CURVE.n. Callers are expected to pass an
+ *   order greater than 1.
+ * @returns byte length of field
+ * @throws If the field order is not a bigint. {@link Error}
+ * @example
+ * Read the fixed-width byte length of one field.
+ *
+ * ```ts
+ * getFieldBytesLength(255n);
+ * ```
+ */
+function getFieldBytesLength(fieldOrder) {
+  if (typeof fieldOrder !== 'bigint') throw new Error('field order must be bigint');
+  // Valid field elements are in 0..ORDER-1, so ORDER <= 1 would make the encoded range degenerate.
+  if (fieldOrder <= _1n) throw new Error('field order must be greater than 1');
+  // Valid field elements are < ORDER, so the maximal encoded element is ORDER - 1.
+  var bitLength = Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["bitLen"])(fieldOrder - _1n);
+  return Math.ceil(bitLength / 8);
+}
+/**
+ * Returns minimal amount of bytes that can be safely reduced
+ * by field order.
+ * Should be 2^-128 for 128-bit curve such as P256.
+ * This is the reduction / modulo-bias lower bound; higher-level helpers may still impose a larger
+ * absolute floor for policy reasons.
+ * @param fieldOrder - number of field elements greater than 1, usually CURVE.n.
+ * @returns byte length of target hash
+ * @throws If the field order is invalid. {@link Error}
+ * @example
+ * Compute the minimum hash length needed for field reduction.
+ *
+ * ```ts
+ * getMinHashLength(255n);
+ * ```
+ */
+function getMinHashLength(fieldOrder) {
+  var length = getFieldBytesLength(fieldOrder);
+  return length + Math.ceil(length / 2);
+}
+/**
+ * "Constant-time" private key generation utility.
+ * Can take (n + n/2) or more bytes of uniform input e.g. from CSPRNG or KDF
+ * and convert them into private scalar, with the modulo bias being negligible.
+ * Needs at least 48 bytes of input for 32-byte private key. The implementation also keeps a hard
+ * 16-byte minimum even when `getMinHashLength(...)` is smaller, so toy-small inputs do not look
+ * accidentally acceptable for real scalar derivation.
+ * See {@link https://research.kudelskisecurity.com/2020/07/28/the-definitive-guide-to-modulo-bias-and-how-to-avoid-it/ | Kudelski's modulo-bias guide},
+ * {@link https://csrc.nist.gov/publications/detail/fips/186/5/final | FIPS 186-5 appendix A.2}, and
+ * {@link https://www.rfc-editor.org/rfc/rfc9380#section-5 | RFC 9380 section 5}. Unlike RFC 9380
+ * `hash_to_field`, this helper intentionally maps into the non-zero private-scalar range `1..n-1`.
+ * @param key - Uniform input bytes.
+ * @param fieldOrder - Size of subgroup.
+ * @param isLE - interpret hash bytes as LE num
+ * @returns valid private scalar
+ * @throws If the hash length or field order is invalid for scalar reduction. {@link Error}
+ * @example
+ * Map hash output into a private scalar range.
+ *
+ * ```ts
+ * mapHashToField(new Uint8Array(48).fill(1), 255n);
+ * ```
+ */
+function mapHashToField(key, fieldOrder) {
+  var isLE = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : false;
+  Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(key);
+  var len = key.length;
+  var fieldLen = getFieldBytesLength(fieldOrder);
+  var minLen = Math.max(getMinHashLength(fieldOrder), 16);
+  // No toy-small inputs: the helper is for real scalar derivation, not tiny test curves. No huge
+  // inputs: easier to reason about JS timing / allocation behavior.
+  if (len < minLen || len > 1024) throw new Error('expected ' + minLen + '-1024 bytes of input, got ' + len);
+  var num = isLE ? Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["bytesToNumberLE"])(key) : Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["bytesToNumberBE"])(key);
+  // `mod(x, 11)` can sometimes produce 0. `mod(x, 10) + 1` is the same, but no 0
+  var reduced = mod(num, fieldOrder - _1n) + _1n;
+  return isLE ? Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["numberToBytesLE"])(reduced, fieldLen) : Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["numberToBytesBE"])(reduced, fieldLen);
+}
+
+/***/ }),
+
+/***/ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/abstract/montgomery.js":
+/*!*******************************************************************************!*\
+  !*** ./src/onlykey-fido2/onlykey/vendor/@noble/curves/abstract/montgomery.js ***!
+  \*******************************************************************************/
+/*! exports provided: montgomery */
+/***/ (function(module, __webpack_exports__, __webpack_require__) {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "montgomery", function() { return montgomery; });
+/* harmony import */ var _utils_js__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! ../utils.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/utils.js");
+/* harmony import */ var _curve_js__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(/*! ./curve.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/abstract/curve.js");
+/* harmony import */ var _modular_js__WEBPACK_IMPORTED_MODULE_2__ = __webpack_require__(/*! ./modular.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/abstract/modular.js");
+function ownKeys(e, r) { var t = Object.keys(e); if (Object.getOwnPropertySymbols) { var o = Object.getOwnPropertySymbols(e); r && (o = o.filter(function (r) { return Object.getOwnPropertyDescriptor(e, r).enumerable; })), t.push.apply(t, o); } return t; }
+function _objectSpread(e) { for (var r = 1; r < arguments.length; r++) { var t = null != arguments[r] ? arguments[r] : {}; r % 2 ? ownKeys(Object(t), !0).forEach(function (r) { _defineProperty(e, r, t[r]); }) : Object.getOwnPropertyDescriptors ? Object.defineProperties(e, Object.getOwnPropertyDescriptors(t)) : ownKeys(Object(t)).forEach(function (r) { Object.defineProperty(e, r, Object.getOwnPropertyDescriptor(t, r)); }); } return e; }
+function _defineProperty(e, r, t) { return (r = _toPropertyKey(r)) in e ? Object.defineProperty(e, r, { value: t, enumerable: !0, configurable: !0, writable: !0 }) : e[r] = t, e; }
+function _toPropertyKey(t) { var i = _toPrimitive(t, "string"); return "symbol" == typeof i ? i : i + ""; }
+function _toPrimitive(t, r) { if ("object" != typeof t || !t) return t; var e = t[Symbol.toPrimitive]; if (void 0 !== e) { var i = e.call(t, r || "default"); if ("object" != typeof i) return i; throw new TypeError("@@toPrimitive must return a primitive value."); } return ("string" === r ? String : Number)(t); }
+/**
+ * Montgomery curve methods. It's not really whole montgomery curve,
+ * just bunch of very specific methods for X25519 / X448 from
+ * [RFC 7748](https://www.rfc-editor.org/rfc/rfc7748)
+ * @module
+ */
+/*! noble-curves - MIT License (c) 2022 Paul Miller (paulmillr.com) */
+
+
+
+var _0n = BigInt(0);
+var _1n = BigInt(1);
+var _2n = BigInt(2);
+function validateOpts(curve) {
+  // Validate constructor config eagerly, but do not call user-provided hooks here:
+  // `randomBytes` may be transcript-backed or otherwise contextual. Runtime type checks are
+  // enough to fail fast on malformed configs without consuming user state.
+  Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["validateObject"])(curve, {
+    P: 'bigint',
+    type: 'string',
+    adjustScalarBytes: 'function',
+    powPminus2: 'function'
+  }, {
+    randomBytes: 'function'
+  });
+  return Object.freeze(_objectSpread({}, curve));
+}
+/**
+ * @param curveDef - Montgomery curve definition.
+ * @returns ECDH helper namespace.
+ * @throws If the curve definition or derived shared point is invalid. {@link Error}
+ * @example
+ * Perform one X25519 key exchange through the generic Montgomery helper.
+ *
+ * ```ts
+ * import { x25519 } from '@noble/curves/ed25519.js';
+ * const alice = x25519.keygen();
+ * const shared = x25519.getSharedSecret(alice.secretKey, alice.publicKey);
+ * ```
+ */
+function montgomery(curveDef) {
+  var CURVE = validateOpts(curveDef);
+  var P = CURVE.P,
+    type = CURVE.type,
+    adjustScalarBytes = CURVE.adjustScalarBytes,
+    powPminus2 = CURVE.powPminus2,
+    rand = CURVE.randomBytes;
+  var is25519 = type === 'x25519';
+  if (!is25519 && type !== 'x448') throw new Error('invalid type');
+  var randomBytes_ = rand === undefined ? _utils_js__WEBPACK_IMPORTED_MODULE_0__["randomBytes"] : rand;
+  var montgomeryBits = is25519 ? 255 : 448;
+  var fieldLen = is25519 ? 32 : 56;
+  var Gu = is25519 ? BigInt(9) : BigInt(5);
+  // RFC 7748 #5:
+  // The constant a24 is (486662 - 2) / 4 = 121665 for curve25519/X25519 and
+  // (156326 - 2) / 4 = 39081 for curve448/X448
+  // const a = is25519 ? 486662n : 156326n;
+  var a24 = is25519 ? BigInt(121665) : BigInt(39081);
+  // RFC: x25519 "the resulting integer is of the form 2^254 plus
+  // eight times a value between 0 and 2^251 - 1 (inclusive)"
+  // x448: "2^447 plus four times a value between 0 and 2^445 - 1 (inclusive)"
+  var minScalar = is25519 ? _2n ** BigInt(254) : _2n ** BigInt(447);
+  var maxAdded = is25519 ? BigInt(8) * _2n ** BigInt(251) - _1n : BigInt(4) * _2n ** BigInt(445) - _1n;
+  var maxScalar = minScalar + maxAdded + _1n; // (inclusive)
+  var modP = n => Object(_modular_js__WEBPACK_IMPORTED_MODULE_2__["mod"])(n, P);
+  var GuBytes = encodeU(Gu);
+  function encodeU(u) {
+    return Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["numberToBytesLE"])(modP(u), fieldLen);
+  }
+  function decodeU(u) {
+    var _u = Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["copyBytes"])(Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(u, fieldLen, 'uCoordinate'));
+    // RFC: When receiving such an array, implementations of X25519
+    // (but not X448) MUST mask the most significant bit in the final byte.
+    if (is25519) _u[31] &= 127; // 0b0111_1111
+    // RFC: Implementations MUST accept non-canonical values and process them as
+    // if they had been reduced modulo the field prime.  The non-canonical
+    // values are 2^255 - 19 through 2^255 - 1 for X25519 and 2^448 - 2^224
+    // - 1 through 2^448 - 1 for X448.
+    return modP(Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["bytesToNumberLE"])(_u));
+  }
+  function decodeScalar(scalar) {
+    return Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["bytesToNumberLE"])(adjustScalarBytes(Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["copyBytes"])(Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(scalar, fieldLen, 'scalar'))));
+  }
+  function scalarMult(scalar, u) {
+    var pu = montgomeryLadder(decodeU(u), decodeScalar(scalar));
+    // Some public keys are useless, of low-order. Curve author doesn't think
+    // it needs to be validated, but we do it nonetheless.
+    // https://cr.yp.to/ecdh.html#validate
+    if (pu === _0n) throw new Error('invalid private or public key received');
+    return encodeU(pu);
+  }
+  // Computes public key from private. By doing scalar multiplication of base point.
+  function scalarMultBase(scalar) {
+    return scalarMult(scalar, GuBytes);
+  }
+  var getPublicKey = scalarMultBase;
+  var getSharedSecret = scalarMult;
+  // cswap from RFC7748 "example code"
+  function cswap(swap, x_2, x_3) {
+    // dummy = mask(swap) AND (x_2 XOR x_3)
+    // Where mask(swap) is the all-1 or all-0 word of the same length as x_2
+    // and x_3, computed, e.g., as mask(swap) = 0 - swap.
+    var dummy = modP(swap * (x_2 - x_3));
+    x_2 = modP(x_2 - dummy); // x_2 = x_2 XOR dummy
+    x_3 = modP(x_3 + dummy); // x_3 = x_3 XOR dummy
+    return {
+      x_2,
+      x_3
+    };
+  }
+  /**
+   * Montgomery x-only multiplication ladder for the selected X25519/X448 curve.
+   * @param pointU - decoded Montgomery u coordinate for the selected curve
+   * @param scalar - decoded clamped scalar by which the point is multiplied
+   * @returns resulting Montgomery u coordinate for the selected curve
+   */
+  function montgomeryLadder(u, scalar) {
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["aInRange"])('u', u, _0n, P);
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["aInRange"])('scalar', scalar, minScalar, maxScalar);
+    var k = scalar;
+    var x_1 = u;
+    var x_2 = _1n;
+    var z_2 = _0n;
+    var x_3 = u;
+    var z_3 = _1n;
+    var swap = _0n;
+    for (var t = BigInt(montgomeryBits - 1); t >= _0n; t--) {
+      var k_t = k >> t & _1n;
+      swap ^= k_t;
+      var _cswap = cswap(swap, x_2, x_3);
+      x_2 = _cswap.x_2;
+      x_3 = _cswap.x_3;
+      var _cswap2 = cswap(swap, z_2, z_3);
+      z_2 = _cswap2.x_2;
+      z_3 = _cswap2.x_3;
+      swap = k_t;
+      var A = x_2 + z_2;
+      var AA = modP(A * A);
+      var B = x_2 - z_2;
+      var BB = modP(B * B);
+      var E = AA - BB;
+      var C = x_3 + z_3;
+      var D = x_3 - z_3;
+      var DA = modP(D * A);
+      var CB = modP(C * B);
+      var dacb = DA + CB;
+      var da_cb = DA - CB;
+      x_3 = modP(dacb * dacb);
+      z_3 = modP(x_1 * modP(da_cb * da_cb));
+      x_2 = modP(AA * BB);
+      z_2 = modP(E * (AA + modP(a24 * E)));
+    }
+    var _cswap3 = cswap(swap, x_2, x_3);
+    x_2 = _cswap3.x_2;
+    x_3 = _cswap3.x_3;
+    var _cswap4 = cswap(swap, z_2, z_3);
+    z_2 = _cswap4.x_2;
+    z_3 = _cswap4.x_3;
+    var z2 = powPminus2(z_2); // `Fp.pow(x, P - _2n)` is much slower equivalent
+    return modP(x_2 * z2); // Return x_2 * (z_2^(p - 2))
+  }
+  var lengths = {
+    secretKey: fieldLen,
+    publicKey: fieldLen,
+    seed: fieldLen
+  };
+  var randomSecretKey = seed => {
+    seed = seed === undefined ? randomBytes_(fieldLen) : seed;
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(seed, lengths.seed, 'seed');
+    // Reuse caller-supplied seed bytes verbatim; clamping is deferred until
+    // decodeScalar(...) when the secret key is actually used.
+    return seed;
+  };
+  var utils = {
+    randomSecretKey
+  };
+  Object.freeze(lengths);
+  Object.freeze(utils);
+  return Object.freeze({
+    keygen: Object(_curve_js__WEBPACK_IMPORTED_MODULE_1__["createKeygen"])(randomSecretKey, getPublicKey),
+    getSharedSecret,
+    getPublicKey,
+    scalarMult,
+    scalarMultBase,
+    utils,
+    GuBytes: GuBytes.slice(),
+    lengths
+  });
+}
+
+/***/ }),
+
+/***/ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/abstract/oprf.js":
+/*!*************************************************************************!*\
+  !*** ./src/onlykey-fido2/onlykey/vendor/@noble/curves/abstract/oprf.js ***!
+  \*************************************************************************/
+/*! exports provided: createOPRF */
+/***/ (function(module, __webpack_exports__, __webpack_require__) {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "createOPRF", function() { return createOPRF; });
+/* harmony import */ var _utils_js__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! ../utils.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/utils.js");
+/* harmony import */ var _curve_js__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(/*! ./curve.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/abstract/curve.js");
+/* harmony import */ var _hash_to_curve_js__WEBPACK_IMPORTED_MODULE_2__ = __webpack_require__(/*! ./hash-to-curve.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/abstract/hash-to-curve.js");
+/* harmony import */ var _modular_js__WEBPACK_IMPORTED_MODULE_3__ = __webpack_require__(/*! ./modular.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/abstract/modular.js");
+function _slicedToArray(r, e) { return _arrayWithHoles(r) || _iterableToArrayLimit(r, e) || _unsupportedIterableToArray(r, e) || _nonIterableRest(); }
+function _nonIterableRest() { throw new TypeError("Invalid attempt to destructure non-iterable instance.\nIn order to be iterable, non-array objects must have a [Symbol.iterator]() method."); }
+function _unsupportedIterableToArray(r, a) { if (r) { if ("string" == typeof r) return _arrayLikeToArray(r, a); var t = {}.toString.call(r).slice(8, -1); return "Object" === t && r.constructor && (t = r.constructor.name), "Map" === t || "Set" === t ? Array.from(r) : "Arguments" === t || /^(?:Ui|I)nt(?:8|16|32)(?:Clamped)?Array$/.test(t) ? _arrayLikeToArray(r, a) : void 0; } }
+function _arrayLikeToArray(r, a) { (null == a || a > r.length) && (a = r.length); for (var e = 0, n = Array(a); e < a; e++) n[e] = r[e]; return n; }
+function _iterableToArrayLimit(r, l) { var t = null == r ? null : "undefined" != typeof Symbol && r[Symbol.iterator] || r["@@iterator"]; if (null != t) { var e, n, i, u, a = [], f = !0, o = !1; try { if (i = (t = t.call(r)).next, 0 === l) { if (Object(t) !== t) return; f = !1; } else for (; !(f = (e = i.call(t)).done) && (a.push(e.value), a.length !== l); f = !0); } catch (r) { o = !0, n = r; } finally { try { if (!f && null != t.return && (u = t.return(), Object(u) !== u)) return; } finally { if (o) throw n; } } return a; } }
+function _arrayWithHoles(r) { if (Array.isArray(r)) return r; }
+/**
+ * RFC 9497: Oblivious Pseudorandom Functions (OPRFs) Using Prime-Order Groups.
+ * https://www.rfc-editor.org/rfc/rfc9497
+ *
+
+OPRF allows to interactively create an `Output = PRF(Input, serverSecretKey)`:
+
+- Server cannot calculate Output by itself: it doesn't know Input
+- Client cannot calculate Output by itself: it doesn't know server secretKey
+- An attacker interception the communication can't restore Input/Output/serverSecretKey and can't
+  link Input to some value.
+
+## Issues
+
+- Low-entropy inputs (e.g. password '123') enable brute-forced dictionary attacks by the server
+  (solveable by domain separation in POPRF)
+- High-level protocol needs to be constructed on top, because OPRF is low-level
+
+## Use cases
+
+1. **Password-Authenticated Key Exchange (PAKE):** Enables secure password login (e.g., OPAQUE)
+   without revealing the password to the server.
+2. **Private Set Intersection (PSI):** Allows two parties to compute the intersection of their
+   private sets without revealing non-intersecting elements.
+3. **Anonymous Credential Systems:** Supports issuance of anonymous, unlinkable credentials
+   (e.g., Privacy Pass) using blind OPRF evaluation.
+4. **Private Information Retrieval (PIR):** Helps users query databases without revealing which
+   item they accessed.
+5. **Encrypted Search / Secure Indexing:** Enables keyword search over encrypted data while keeping
+   queries private.
+6. **Spam Prevention and Rate-Limiting:** Issues anonymous tokens to prevent abuse
+   (e.g., CAPTCHA bypass) without compromising user privacy.
+
+## Modes
+
+- OPRF: simple mode, client doesn't need to know server public key
+- VOPRF: verifiable mode. It lets the client verify that the server used the
+  secret key corresponding to a known public key
+- POPRF: partially oblivious mode, VOPRF + domain separation
+
+There is also non-interactive mode (Evaluate), which creates Output
+non-interactively with knowledge of the secret key.
+
+Flow:
+- (once) Server generates secret and public keys, distributes public keys to clients
+  - deterministically: `deriveKeyPair` or just random: `generateKeyPair`
+- Client blinds input: `blind(secretInput)`
+- Server evaluates blinded input: `blindEvaluate` generated by client, sends result to client
+- Client creates output using result of evaluation via 'finalize'
+
+ * @module
+ */
+/*! noble-curves - MIT License (c) 2022 Paul Miller (paulmillr.com) */
+
+
+
+
+var _DST_scalarBytes = /* @__PURE__ */Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["asciiToBytes"])(_hash_to_curve_js__WEBPACK_IMPORTED_MODULE_2__["_DST_scalar"]);
+// welcome to generic hell
+/**
+ * @param opts - OPRF ciphersuite options. See {@link OPRFOpts}.
+ * @returns OPRF helper namespace.
+ * @example
+ * Instantiate an OPRF suite from curve-specific hashing hooks.
+ *
+ * ```ts
+ * import { createOPRF } from '@noble/curves/abstract/oprf.js';
+ * import { p256, p256_hasher } from '@noble/curves/nist.js';
+ * import { sha256 } from '@noble/hashes/sha2.js';
+ * const oprf = createOPRF({
+ *   name: 'P256-SHA256',
+ *   Point: p256.Point,
+ *   hash: sha256,
+ *   hashToGroup: p256_hasher.hashToCurve,
+ *   hashToScalar: p256_hasher.hashToScalar,
+ * });
+ * const keys = oprf.oprf.generateKeyPair();
+ * ```
+ */
+function createOPRF(opts) {
+  Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["validateObject"])(opts, {
+    name: 'string',
+    hash: 'function',
+    hashToScalar: 'function',
+    hashToGroup: 'function'
+  });
+  // Cheap constructor-surface sanity check only: this verifies the generic static hooks/fields that
+  // OPRF consumes, but it does not certify point semantics like BASE/ZERO correctness.
+  Object(_curve_js__WEBPACK_IMPORTED_MODULE_1__["validatePointCons"])(opts.Point);
+  var name = opts.name,
+    Point = opts.Point,
+    hash = opts.hash;
+  var Fn = Point.Fn;
+  var hashToGroup = (msg, ctx) => opts.hashToGroup(msg, {
+    DST: Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["concatBytes"])(Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["asciiToBytes"])('HashToGroup-'), ctx)
+  });
+  var hashToScalarPrefixed = (msg, ctx) => opts.hashToScalar(msg, {
+    DST: Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["concatBytes"])(_DST_scalarBytes, ctx)
+  });
+  var randomScalar = function randomScalar() {
+    var rng = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : _utils_js__WEBPACK_IMPORTED_MODULE_0__["randomBytes"];
+    // RFC 9497 §2.1 defines RandomScalar as nonzero; blind inversion and generated public keys
+    // both rely on keeping this helper in the `1..n-1` range.
+    var t = Object(_modular_js__WEBPACK_IMPORTED_MODULE_3__["mapHashToField"])(rng(Object(_modular_js__WEBPACK_IMPORTED_MODULE_3__["getMinHashLength"])(Fn.ORDER)), Fn.ORDER, Fn.isLE);
+    // We cannot use Fn.fromBytes here, because field
+    // can have different number of bytes (like ed448)
+    return Fn.isLE ? Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["bytesToNumberLE"])(t) : Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["bytesToNumberBE"])(t);
+  };
+  var msm = (points, scalars) => Object(_curve_js__WEBPACK_IMPORTED_MODULE_1__["pippenger"])(Point, points, scalars);
+  var getCtx = mode => Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["concatBytes"])(Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["asciiToBytes"])('OPRFV1-'), new Uint8Array([mode]), Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["asciiToBytes"])('-' + name));
+  var ctxOPRF = getCtx(0x00);
+  var ctxVOPRF = getCtx(0x01);
+  var ctxPOPRF = getCtx(0x02);
+  function encode() {
+    var res = [];
+    for (var _len = arguments.length, args = new Array(_len), _key = 0; _key < _len; _key++) {
+      args[_key] = arguments[_key];
+    }
+    for (var a of args) {
+      if (typeof a === 'number') res.push(Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["numberToBytesBE"])(a, 2));else if (typeof a === 'string') res.push(Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["asciiToBytes"])(a));else {
+        Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(a);
+        res.push(Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["numberToBytesBE"])(a.length, 2), a);
+      }
+    }
+    // No wipe here, since will modify actual bytes
+    return Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["concatBytes"])(...res);
+  }
+  var inputBytes = (title, bytes) => {
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(bytes, undefined, title);
+    // RFC 9497 §1.2 limits PrivateInput/PublicInput to 2^16 - 1 bytes because these values are
+    // length-prefixed with two bytes before use throughout the protocol.
+    if (bytes.length > 0xffff) throw new Error("\"".concat(title, "\" expected Uint8Array of length <= 65535, got length=").concat(bytes.length));
+    return bytes;
+  };
+  var hashInput = function hashInput() {
+    for (var _len2 = arguments.length, bytes = new Array(_len2), _key2 = 0; _key2 < _len2; _key2++) {
+      bytes[_key2] = arguments[_key2];
+    }
+    return hash(encode(...bytes, 'Finalize'));
+  };
+  function getTranscripts(B, C, D, ctx) {
+    var Bm = B.toBytes();
+    var seed = hash(encode(Bm, Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["concatBytes"])(Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["asciiToBytes"])('Seed-'), ctx)));
+    var res = [];
+    for (var i = 0; i < C.length; i++) {
+      var Ci = C[i].toBytes();
+      var Di = D[i].toBytes();
+      var di = hashToScalarPrefixed(encode(seed, i, Ci, Di, 'Composite'), ctx);
+      res.push(di);
+    }
+    return res;
+  }
+  function computeComposites(B, C, D, ctx) {
+    var T = getTranscripts(B, C, D, ctx);
+    var M = msm(C, T);
+    var Z = msm(D, T);
+    return {
+      M,
+      Z
+    };
+  }
+  function computeCompositesFast(k, B, C, D, ctx) {
+    var T = getTranscripts(B, C, D, ctx);
+    var M = msm(C, T);
+    // RFC 9497 §2.2.1 ComputeCompositesFast derives weights from both C and D in getTranscripts(),
+    // then uses the server shortcut Z = k * M instead of a second MSM over D.
+    var Z = M.multiply(k);
+    return {
+      M,
+      Z
+    };
+  }
+  function challengeTranscript(B, M, Z, t2, t3, ctx) {
+    var _map = [B, M, Z, t2, t3].map(i => i.toBytes()),
+      _map2 = _slicedToArray(_map, 5),
+      Bm = _map2[0],
+      a0 = _map2[1],
+      a1 = _map2[2],
+      a2 = _map2[3],
+      a3 = _map2[4];
+    return hashToScalarPrefixed(encode(Bm, a0, a1, a2, a3, 'Challenge'), ctx);
+  }
+  function generateProof(ctx, k, B, C, D, rng) {
+    var _computeCompositesFas = computeCompositesFast(k, B, C, D, ctx),
+      M = _computeCompositesFas.M,
+      Z = _computeCompositesFas.Z;
+    var r = randomScalar(rng);
+    var t2 = Point.BASE.multiply(r);
+    var t3 = M.multiply(r);
+    var c = challengeTranscript(B, M, Z, t2, t3, ctx);
+    var s = Fn.sub(r, Fn.mul(c, k)); // r - c*k
+    return Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["concatBytes"])(...[c, s].map(i => Fn.toBytes(i)));
+  }
+  function verifyProof(ctx, B, C, D, proof) {
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(proof, 2 * Fn.BYTES);
+    var _computeComposites = computeComposites(B, C, D, ctx),
+      M = _computeComposites.M,
+      Z = _computeComposites.Z;
+    var _map3 = [proof.subarray(0, Fn.BYTES), proof.subarray(Fn.BYTES)].map(f => Fn.fromBytes(f)),
+      _map4 = _slicedToArray(_map3, 2),
+      c = _map4[0],
+      s = _map4[1];
+    var t2 = Point.BASE.multiply(s).add(B.multiply(c)); // s*G + c*B
+    var t3 = M.multiply(s).add(Z.multiply(c)); // s*M + c*Z
+    var expectedC = challengeTranscript(B, M, Z, t2, t3, ctx);
+    if (!Fn.eql(c, expectedC)) throw new Error('proof verification failed');
+  }
+  function generateKeyPair() {
+    var skS = randomScalar();
+    var pkS = Point.BASE.multiply(skS);
+    return {
+      secretKey: Fn.toBytes(skS),
+      publicKey: pkS.toBytes()
+    };
+  }
+  function _deriveKeyPair(ctx, seed, info) {
+    // RFC 9497 §3.2.1 defines `seed[32]`; reject other sizes here because this public API already
+    // documents a 32-byte seed instead of generic input keying material.
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(seed, 32, 'seed');
+    info = inputBytes('keyInfo', info);
+    var dst = Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["concatBytes"])(Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["asciiToBytes"])('DeriveKeyPair'), ctx);
+    var msg = Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["concatBytes"])(seed, encode(info), Uint8Array.of(0));
+    for (var counter = 0; counter <= 255; counter++) {
+      msg[msg.length - 1] = counter;
+      var skS = opts.hashToScalar(msg, {
+        DST: dst
+      });
+      if (Fn.is0(skS)) continue; // should not happen
+      return {
+        secretKey: Fn.toBytes(skS),
+        publicKey: Point.BASE.multiply(skS).toBytes()
+      };
+    }
+    throw new Error('Cannot derive key');
+  }
+  var wirePoint = (label, bytes) => {
+    var point = Point.fromBytes(bytes);
+    // RFC 9497 §3.3 says applications MUST reject group-identity Elements received over the wire
+    // after deserialization, even if the suite decoder itself accepts the identity encoding.
+    if (point.equals(Point.ZERO)) throw new Error(label + ' point at infinity');
+    return point;
+  };
+  function _blind(ctx, input) {
+    var rng = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : _utils_js__WEBPACK_IMPORTED_MODULE_0__["randomBytes"];
+    input = inputBytes('input', input);
+    var blind = randomScalar(rng);
+    var inputPoint = hashToGroup(input, ctx);
+    if (inputPoint.equals(Point.ZERO)) throw new Error('Input point at infinity');
+    var blinded = inputPoint.multiply(blind);
+    return {
+      blind: Fn.toBytes(blind),
+      blinded: blinded.toBytes()
+    };
+  }
+  function _evaluate(ctx, secretKey, input) {
+    input = inputBytes('input', input);
+    var skS = Fn.fromBytes(secretKey);
+    var inputPoint = hashToGroup(input, ctx);
+    if (inputPoint.equals(Point.ZERO)) throw new Error('Input point at infinity');
+    var unblinded = inputPoint.multiply(skS).toBytes();
+    return hashInput(input, unblinded);
+  }
+  var oprf = Object.freeze({
+    generateKeyPair,
+    deriveKeyPair: (seed, keyInfo) => _deriveKeyPair(ctxOPRF, seed, keyInfo),
+    blind: function blind(input) {
+      var rng = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : _utils_js__WEBPACK_IMPORTED_MODULE_0__["randomBytes"];
+      return _blind(ctxOPRF, input, rng);
+    },
+    blindEvaluate(secretKey, blindedPoint) {
+      var skS = Fn.fromBytes(secretKey);
+      var elm = wirePoint('blinded', blindedPoint);
+      return elm.multiply(skS).toBytes();
+    },
+    finalize(input, blindBytes, evaluatedBytes) {
+      input = inputBytes('input', input);
+      var blind = Fn.fromBytes(blindBytes);
+      var evalPoint = wirePoint('evaluated', evaluatedBytes);
+      var unblinded = evalPoint.multiply(Fn.inv(blind)).toBytes();
+      return hashInput(input, unblinded);
+    },
+    evaluate: (secretKey, input) => _evaluate(ctxOPRF, secretKey, input)
+  });
+  var voprf = Object.freeze({
+    generateKeyPair,
+    deriveKeyPair: (seed, keyInfo) => _deriveKeyPair(ctxVOPRF, seed, keyInfo),
+    blind: function blind(input) {
+      var rng = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : _utils_js__WEBPACK_IMPORTED_MODULE_0__["randomBytes"];
+      return _blind(ctxVOPRF, input, rng);
+    },
+    blindEvaluateBatch(secretKey, publicKey, blinded) {
+      var rng = arguments.length > 3 && arguments[3] !== undefined ? arguments[3] : _utils_js__WEBPACK_IMPORTED_MODULE_0__["randomBytes"];
+      if (!Array.isArray(blinded)) throw new Error('expected array');
+      var skS = Fn.fromBytes(secretKey);
+      var pkS = wirePoint('public key', publicKey);
+      var blindedPoints = blinded.map(i => wirePoint('blinded', i));
+      var evaluated = blindedPoints.map(i => i.multiply(skS));
+      var proof = generateProof(ctxVOPRF, skS, pkS, blindedPoints, evaluated, rng);
+      return {
+        evaluated: evaluated.map(i => i.toBytes()),
+        proof
+      };
+    },
+    blindEvaluate(secretKey, publicKey, blinded) {
+      var rng = arguments.length > 3 && arguments[3] !== undefined ? arguments[3] : _utils_js__WEBPACK_IMPORTED_MODULE_0__["randomBytes"];
+      var res = this.blindEvaluateBatch(secretKey, publicKey, [blinded], rng);
+      return {
+        evaluated: res.evaluated[0],
+        proof: res.proof
+      };
+    },
+    finalizeBatch(items, publicKey, proof) {
+      if (!Array.isArray(items)) throw new Error('expected array');
+      var pkS = wirePoint('public key', publicKey);
+      var blindedPoints = items.map(i => wirePoint('blinded', i.blinded));
+      var evalPoints = items.map(i => wirePoint('evaluated', i.evaluated));
+      verifyProof(ctxVOPRF, pkS, blindedPoints, evalPoints, proof);
+      return items.map(i => oprf.finalize(i.input, i.blind, i.evaluated));
+    },
+    finalize(input, blind, evaluated, blinded, publicKey, proof) {
+      return this.finalizeBatch([{
+        input,
+        blind,
+        evaluated,
+        blinded
+      }], publicKey, proof)[0];
+    },
+    evaluate: (secretKey, input) => _evaluate(ctxVOPRF, secretKey, input)
+  });
+  // NOTE: info is domain separation
+  var poprf = info => {
+    info = inputBytes('info', info);
+    var m = hashToScalarPrefixed(encode('Info', info), ctxPOPRF);
+    var T = Point.BASE.multiply(m);
+    return Object.freeze({
+      generateKeyPair,
+      deriveKeyPair: (seed, keyInfo) => _deriveKeyPair(ctxPOPRF, seed, keyInfo),
+      blind(input, publicKey) {
+        var rng = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : _utils_js__WEBPACK_IMPORTED_MODULE_0__["randomBytes"];
+        input = inputBytes('input', input);
+        var pkS = wirePoint('public key', publicKey);
+        var tweakedKey = T.add(pkS);
+        if (tweakedKey.equals(Point.ZERO)) throw new Error('tweakedKey point at infinity');
+        var blind = randomScalar(rng);
+        var inputPoint = hashToGroup(input, ctxPOPRF);
+        if (inputPoint.equals(Point.ZERO)) throw new Error('Input point at infinity');
+        var blindedPoint = inputPoint.multiply(blind);
+        return {
+          blind: Fn.toBytes(blind),
+          blinded: blindedPoint.toBytes(),
+          tweakedKey: tweakedKey.toBytes()
+        };
+      },
+      blindEvaluateBatch(secretKey, blinded) {
+        var rng = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : _utils_js__WEBPACK_IMPORTED_MODULE_0__["randomBytes"];
+        if (!Array.isArray(blinded)) throw new Error('expected array');
+        var skS = Fn.fromBytes(secretKey);
+        var t = Fn.add(skS, m);
+        // "Hence, this error can be a signal for the server to replace its
+        // private key". We throw inside; this should be impossible.
+        var invT = Fn.inv(t);
+        var blindedPoints = blinded.map(i => wirePoint('blinded', i));
+        var evalPoints = blindedPoints.map(i => i.multiply(invT));
+        var tweakedKey = Point.BASE.multiply(t);
+        var proof = generateProof(ctxPOPRF, t, tweakedKey, evalPoints, blindedPoints, rng);
+        return {
+          evaluated: evalPoints.map(i => i.toBytes()),
+          proof
+        };
+      },
+      blindEvaluate(secretKey, blinded) {
+        var rng = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : _utils_js__WEBPACK_IMPORTED_MODULE_0__["randomBytes"];
+        var res = this.blindEvaluateBatch(secretKey, [blinded], rng);
+        return {
+          evaluated: res.evaluated[0],
+          proof: res.proof
+        };
+      },
+      finalizeBatch(items, proof, tweakedKey) {
+        if (!Array.isArray(items)) throw new Error('expected array');
+        var inputs = items.map(i => inputBytes('input', i.input));
+        var evalPoints = items.map(i => wirePoint('evaluated', i.evaluated));
+        verifyProof(ctxPOPRF, wirePoint('tweakedKey', tweakedKey), evalPoints, items.map(i => wirePoint('blinded', i.blinded)), proof);
+        return items.map((i, j) => {
+          var blind = Fn.fromBytes(i.blind);
+          var point = evalPoints[j].multiply(Fn.inv(blind)).toBytes();
+          return hashInput(inputs[j], info, point);
+        });
+      },
+      finalize(input, blind, evaluated, blinded, proof, tweakedKey) {
+        return this.finalizeBatch([{
+          input,
+          blind,
+          evaluated,
+          blinded
+        }], proof, tweakedKey)[0];
+      },
+      evaluate(secretKey, input) {
+        input = inputBytes('input', input);
+        var skS = Fn.fromBytes(secretKey);
+        var inputPoint = hashToGroup(input, ctxPOPRF);
+        if (inputPoint.equals(Point.ZERO)) throw new Error('Input point at infinity');
+        var t = Fn.add(skS, m);
+        var invT = Fn.inv(t);
+        var unblinded = inputPoint.multiply(invT).toBytes();
+        return hashInput(input, info, unblinded);
+      }
+    });
+  };
+  var res = {
+    name,
+    oprf,
+    voprf,
+    poprf,
+    __tests: Object.freeze({
+      Fn
+    })
+  };
+  return Object.freeze(res);
+}
+
+/***/ }),
+
+/***/ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/ed25519.js":
+/*!*******************************************************************!*\
+  !*** ./src/onlykey-fido2/onlykey/vendor/@noble/curves/ed25519.js ***!
+  \*******************************************************************/
+/*! exports provided: ed25519, ed25519ctx, ed25519ph, ed25519_FROST, x25519, _map_to_curve_elligator2_curve25519, ed25519_hasher, ristretto255, ristretto255_hasher, ristretto255_oprf, ristretto255_FROST, ED25519_TORSION_SUBGROUP */
+/***/ (function(module, __webpack_exports__, __webpack_require__) {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "ed25519", function() { return ed25519; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "ed25519ctx", function() { return ed25519ctx; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "ed25519ph", function() { return ed25519ph; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "ed25519_FROST", function() { return ed25519_FROST; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "x25519", function() { return x25519; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "_map_to_curve_elligator2_curve25519", function() { return _map_to_curve_elligator2_curve25519; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "ed25519_hasher", function() { return ed25519_hasher; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "ristretto255", function() { return ristretto255; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "ristretto255_hasher", function() { return ristretto255_hasher; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "ristretto255_oprf", function() { return ristretto255_oprf; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "ristretto255_FROST", function() { return ristretto255_FROST; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "ED25519_TORSION_SUBGROUP", function() { return ED25519_TORSION_SUBGROUP; });
+/* harmony import */ var _noble_hashes_sha2_js__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! @noble/hashes/sha2.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/hashes/sha2.js");
+/* harmony import */ var _noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(/*! @noble/hashes/utils.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/hashes/utils.js");
+/* harmony import */ var _abstract_curve_js__WEBPACK_IMPORTED_MODULE_2__ = __webpack_require__(/*! ./abstract/curve.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/abstract/curve.js");
+/* harmony import */ var _abstract_edwards_js__WEBPACK_IMPORTED_MODULE_3__ = __webpack_require__(/*! ./abstract/edwards.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/abstract/edwards.js");
+/* harmony import */ var _abstract_frost_js__WEBPACK_IMPORTED_MODULE_4__ = __webpack_require__(/*! ./abstract/frost.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/abstract/frost.js");
+/* harmony import */ var _abstract_hash_to_curve_js__WEBPACK_IMPORTED_MODULE_5__ = __webpack_require__(/*! ./abstract/hash-to-curve.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/abstract/hash-to-curve.js");
+/* harmony import */ var _abstract_modular_js__WEBPACK_IMPORTED_MODULE_6__ = __webpack_require__(/*! ./abstract/modular.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/abstract/modular.js");
+/* harmony import */ var _abstract_montgomery_js__WEBPACK_IMPORTED_MODULE_7__ = __webpack_require__(/*! ./abstract/montgomery.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/abstract/montgomery.js");
+/* harmony import */ var _abstract_oprf_js__WEBPACK_IMPORTED_MODULE_8__ = __webpack_require__(/*! ./abstract/oprf.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/abstract/oprf.js");
+/* harmony import */ var _utils_js__WEBPACK_IMPORTED_MODULE_9__ = __webpack_require__(/*! ./utils.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/utils.js");
+var _RistrettoPoint2;
+function _defineProperty(e, r, t) { return (r = _toPropertyKey(r)) in e ? Object.defineProperty(e, r, { value: t, enumerable: !0, configurable: !0, writable: !0 }) : e[r] = t, e; }
+function _toPropertyKey(t) { var i = _toPrimitive(t, "string"); return "symbol" == typeof i ? i : i + ""; }
+function _toPrimitive(t, r) { if ("object" != typeof t || !t) return t; var e = t[Symbol.toPrimitive]; if (void 0 !== e) { var i = e.call(t, r || "default"); if ("object" != typeof i) return i; throw new TypeError("@@toPrimitive must return a primitive value."); } return ("string" === r ? String : Number)(t); }
+function _slicedToArray(r, e) { return _arrayWithHoles(r) || _iterableToArrayLimit(r, e) || _unsupportedIterableToArray(r, e) || _nonIterableRest(); }
+function _nonIterableRest() { throw new TypeError("Invalid attempt to destructure non-iterable instance.\nIn order to be iterable, non-array objects must have a [Symbol.iterator]() method."); }
+function _unsupportedIterableToArray(r, a) { if (r) { if ("string" == typeof r) return _arrayLikeToArray(r, a); var t = {}.toString.call(r).slice(8, -1); return "Object" === t && r.constructor && (t = r.constructor.name), "Map" === t || "Set" === t ? Array.from(r) : "Arguments" === t || /^(?:Ui|I)nt(?:8|16|32)(?:Clamped)?Array$/.test(t) ? _arrayLikeToArray(r, a) : void 0; } }
+function _arrayLikeToArray(r, a) { (null == a || a > r.length) && (a = r.length); for (var e = 0, n = Array(a); e < a; e++) n[e] = r[e]; return n; }
+function _iterableToArrayLimit(r, l) { var t = null == r ? null : "undefined" != typeof Symbol && r[Symbol.iterator] || r["@@iterator"]; if (null != t) { var e, n, i, u, a = [], f = !0, o = !1; try { if (i = (t = t.call(r)).next, 0 === l) { if (Object(t) !== t) return; f = !1; } else for (; !(f = (e = i.call(t)).done) && (a.push(e.value), a.length !== l); f = !0); } catch (r) { o = !0, n = r; } finally { try { if (!f && null != t.return && (u = t.return(), Object(u) !== u)) return; } finally { if (o) throw n; } } return a; } }
+function _arrayWithHoles(r) { if (Array.isArray(r)) return r; }
+/**
+ * ed25519 Twisted Edwards curve with following addons:
+ * - X25519 ECDH
+ * - Ristretto cofactor elimination
+ * - Elligator hash-to-group / point indistinguishability
+ * @module
+ */
+/*! noble-curves - MIT License (c) 2022 Paul Miller (paulmillr.com) */
+
+
+
+
+
+
+
+
+
+
+// prettier-ignore
+var _0n = /* @__PURE__ */BigInt(0),
+  _1n = /* @__PURE__ */BigInt(1),
+  _2n = /* @__PURE__ */BigInt(2),
+  _3n = /* @__PURE__ */BigInt(3);
+// prettier-ignore
+var _5n = /* @__PURE__ */BigInt(5),
+  _8n = /* @__PURE__ */BigInt(8);
+// P = 2n**255n - 19n
+var ed25519_CURVE_p = /* @__PURE__ */BigInt('0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffed');
+// N = 2n**252n + 27742317777372353535851937790883648493n
+// a = Fp.create(BigInt(-1))
+// d = -121665/121666 a.k.a. Fp.neg(121665 * Fp.inv(121666))
+var ed25519_CURVE = /* @__PURE__ */(() => ({
+  p: ed25519_CURVE_p,
+  n: BigInt('0x1000000000000000000000000000000014def9dea2f79cd65812631a5cf5d3ed'),
+  h: _8n,
+  a: BigInt('0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffec'),
+  d: BigInt('0x52036cee2b6ffe738cc740797779e89800700a4d4141d8ab75eb4dca135978a3'),
+  Gx: BigInt('0x216936d3cd6e53fec0a4e231fdd6dc5c692cc7609525a7b2c9562d608f25d51a'),
+  Gy: BigInt('0x6666666666666666666666666666666666666666666666666666666666666658')
+}))();
+function ed25519_pow_2_252_3(x) {
+  // prettier-ignore
+  var _10n = BigInt(10),
+    _20n = BigInt(20),
+    _40n = BigInt(40),
+    _80n = BigInt(80);
+  var P = ed25519_CURVE_p;
+  var x2 = x * x % P;
+  var b2 = x2 * x % P; // x^3, 11
+  var b4 = Object(_abstract_modular_js__WEBPACK_IMPORTED_MODULE_6__["pow2"])(b2, _2n, P) * b2 % P; // x^15, 1111
+  var b5 = Object(_abstract_modular_js__WEBPACK_IMPORTED_MODULE_6__["pow2"])(b4, _1n, P) * x % P; // x^31
+  var b10 = Object(_abstract_modular_js__WEBPACK_IMPORTED_MODULE_6__["pow2"])(b5, _5n, P) * b5 % P;
+  var b20 = Object(_abstract_modular_js__WEBPACK_IMPORTED_MODULE_6__["pow2"])(b10, _10n, P) * b10 % P;
+  var b40 = Object(_abstract_modular_js__WEBPACK_IMPORTED_MODULE_6__["pow2"])(b20, _20n, P) * b20 % P;
+  var b80 = Object(_abstract_modular_js__WEBPACK_IMPORTED_MODULE_6__["pow2"])(b40, _40n, P) * b40 % P;
+  var b160 = Object(_abstract_modular_js__WEBPACK_IMPORTED_MODULE_6__["pow2"])(b80, _80n, P) * b80 % P;
+  var b240 = Object(_abstract_modular_js__WEBPACK_IMPORTED_MODULE_6__["pow2"])(b160, _80n, P) * b80 % P;
+  var b250 = Object(_abstract_modular_js__WEBPACK_IMPORTED_MODULE_6__["pow2"])(b240, _10n, P) * b10 % P;
+  var pow_p_5_8 = Object(_abstract_modular_js__WEBPACK_IMPORTED_MODULE_6__["pow2"])(b250, _2n, P) * x % P;
+  // ^ This is x^((p-5)/8); multiply by x once more to get x^((p+3)/8).
+  return {
+    pow_p_5_8,
+    b2
+  };
+}
+// Mutates and returns the provided 32-byte buffer in place.
+function adjustScalarBytes(bytes) {
+  // Section 5: For X25519, in order to decode 32 random bytes as an integer scalar,
+  // set the three least significant bits of the first byte
+  bytes[0] &= 248; // 0b1111_1000
+  // and the most significant bit of the last to zero,
+  bytes[31] &= 127; // 0b0111_1111
+  // set the second most significant bit of the last byte to 1
+  bytes[31] |= 64; // 0b0100_0000
+  return bytes;
+}
+// √(-1) aka √(a) aka 2^((p-1)/4)
+// Fp.sqrt(Fp.neg(1))
+var ED25519_SQRT_M1 = /* @__PURE__ */BigInt('19681161376707505956807079304988542015446066515923890162744021073123829784752');
+// sqrt(u/v). Returns `{ isValid, value }`; on non-squares `value` is still a
+// dummy root-shaped field element so callers can stay constant-time.
+function uvRatio(u, v) {
+  var P = ed25519_CURVE_p;
+  var v3 = Object(_abstract_modular_js__WEBPACK_IMPORTED_MODULE_6__["mod"])(v * v * v, P); // v³
+  var v7 = Object(_abstract_modular_js__WEBPACK_IMPORTED_MODULE_6__["mod"])(v3 * v3 * v, P); // v⁷
+  // (p+3)/8 and (p-5)/8
+  var pow = ed25519_pow_2_252_3(u * v7).pow_p_5_8;
+  var x = Object(_abstract_modular_js__WEBPACK_IMPORTED_MODULE_6__["mod"])(u * v3 * pow, P); // (uv³)(uv⁷)^(p-5)/8
+  var vx2 = Object(_abstract_modular_js__WEBPACK_IMPORTED_MODULE_6__["mod"])(v * x * x, P); // vx²
+  var root1 = x; // First root candidate
+  var root2 = Object(_abstract_modular_js__WEBPACK_IMPORTED_MODULE_6__["mod"])(x * ED25519_SQRT_M1, P); // Second root candidate
+  var useRoot1 = vx2 === u; // If vx² = u (mod p), x is a square root
+  var useRoot2 = vx2 === Object(_abstract_modular_js__WEBPACK_IMPORTED_MODULE_6__["mod"])(-u, P); // If vx² = -u, set x <-- x * 2^((p-1)/4)
+  var noRoot = vx2 === Object(_abstract_modular_js__WEBPACK_IMPORTED_MODULE_6__["mod"])(-u * ED25519_SQRT_M1, P); // There is no valid root, vx² = -u√(-1)
+  if (useRoot1) x = root1;
+  if (useRoot2 || noRoot) x = root2; // We return root2 anyway, for const-time
+  if (Object(_abstract_modular_js__WEBPACK_IMPORTED_MODULE_6__["isNegativeLE"])(x, P)) x = Object(_abstract_modular_js__WEBPACK_IMPORTED_MODULE_6__["mod"])(-x, P);
+  return {
+    isValid: useRoot1 || useRoot2,
+    value: x
+  };
+}
+var ed25519_Point = /* @__PURE__ */Object(_abstract_edwards_js__WEBPACK_IMPORTED_MODULE_3__["edwards"])(ed25519_CURVE, {
+  uvRatio
+});
+// Public field alias stays stricter than the RFC 8032 Appendix A sample code:
+// `Fp.inv(0)` throws instead of returning `0`.
+var Fp = /* @__PURE__ */(() => ed25519_Point.Fp)();
+var Fn = /* @__PURE__ */(() => ed25519_Point.Fn)();
+// RFC 8032 `dom2` helper for ctx/ph variants only. Plain Ed25519 keeps the
+// empty-domain path in `ed()` and would be wrong if routed through this helper.
+function ed25519_domain(data, ctx, phflag) {
+  if (ctx.length > 255) throw new Error('Context is too big');
+  return Object(_noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_1__["concatBytes"])(Object(_utils_js__WEBPACK_IMPORTED_MODULE_9__["asciiToBytes"])('SigEd25519 no Ed25519 collisions'), new Uint8Array([phflag ? 1 : 0, ctx.length]), ctx, data);
+}
+function ed(opts) {
+  // Ed25519 keeps ZIP-215 default verification semantics for consensus compatibility.
+  return Object(_abstract_edwards_js__WEBPACK_IMPORTED_MODULE_3__["eddsa"])(ed25519_Point, _noble_hashes_sha2_js__WEBPACK_IMPORTED_MODULE_0__["sha512"], Object.assign({
+    adjustScalarBytes,
+    zip215: true
+  }, opts));
+}
+/**
+ * ed25519 curve with EdDSA signatures.
+ * Seeded `keygen(seed)` / `utils.randomSecretKey(seed)` reuse the provided
+ * 32-byte seed buffer instead of copying it.
+ * @example
+ * Generate one Ed25519 keypair, sign a message, and verify it.
+ *
+ * ```js
+ * import { ed25519 } from '@noble/curves/ed25519.js';
+ * const { secretKey, publicKey } = ed25519.keygen();
+ * // const publicKey = ed25519.getPublicKey(secretKey);
+ * const msg = new TextEncoder().encode('hello noble');
+ * const sig = ed25519.sign(msg, secretKey);
+ * const isValid = ed25519.verify(sig, msg, publicKey); // ZIP215
+ * // RFC8032 / FIPS 186-5
+ * const isValid2 = ed25519.verify(sig, msg, publicKey, { zip215: false });
+ * ```
+ */
+var ed25519 = /* @__PURE__ */ed({});
+/**
+ * Context version of ed25519 (ctx for domain separation). See {@link ed25519}
+ * Seeded `keygen(seed)` / `utils.randomSecretKey(seed)` reuse the provided
+ * 32-byte seed buffer instead of copying it.
+ * @example
+ * Sign and verify with Ed25519ctx under one explicit context.
+ *
+ * ```ts
+ * const context = new TextEncoder().encode('docs');
+ * const { secretKey, publicKey } = ed25519ctx.keygen();
+ * const msg = new TextEncoder().encode('hello noble');
+ * const sig = ed25519ctx.sign(msg, secretKey, { context });
+ * const isValid = ed25519ctx.verify(sig, msg, publicKey, { context });
+ * ```
+ */
+var ed25519ctx = /* @__PURE__ */ed({
+  domain: ed25519_domain
+});
+/**
+ * Prehashed version of ed25519. See {@link ed25519}
+ * Seeded `keygen(seed)` / `utils.randomSecretKey(seed)` reuse the provided
+ * 32-byte seed buffer instead of copying it.
+ * @example
+ * Use the prehashed Ed25519 variant for one message.
+ *
+ * ```ts
+ * const { secretKey, publicKey } = ed25519ph.keygen();
+ * const msg = new TextEncoder().encode('hello noble');
+ * const sig = ed25519ph.sign(msg, secretKey);
+ * const isValid = ed25519ph.verify(sig, msg, publicKey);
+ * ```
+ */
+var ed25519ph = /* @__PURE__ */ed({
+  domain: ed25519_domain,
+  prehash: _noble_hashes_sha2_js__WEBPACK_IMPORTED_MODULE_0__["sha512"]
+});
+/**
+ * FROST threshold signatures over ed25519. RFC 9591.
+ * @example
+ * Create one trusted-dealer package for 2-of-3 ed25519 signing.
+ *
+ * ```ts
+ * const alice = ed25519_FROST.Identifier.derive('alice@example.com');
+ * const bob = ed25519_FROST.Identifier.derive('bob@example.com');
+ * const carol = ed25519_FROST.Identifier.derive('carol@example.com');
+ * const deal = ed25519_FROST.trustedDealer({ min: 2, max: 3 }, [alice, bob, carol]);
+ * ```
+ */
+var ed25519_FROST = /* @__PURE__ */(() => Object(_abstract_frost_js__WEBPACK_IMPORTED_MODULE_4__["createFROST"])({
+  name: 'FROST-ED25519-SHA512-v1',
+  Point: ed25519_Point,
+  validatePoint: p => {
+    p.assertValidity();
+    if (!p.isTorsionFree()) throw new Error('bad point: not torsion-free');
+  },
+  hash: _noble_hashes_sha2_js__WEBPACK_IMPORTED_MODULE_0__["sha512"],
+  // RFC 9591 keeps H2 undecorated here for RFC 8032 compatibility. In createFROST(),
+  // `H2: ''` becomes an empty DST prefix; the built-in hashToScalar fallback treats
+  // that the same as omitted DST, even though custom hooks can still observe the empty bag.
+  H2: ''
+}))();
+/**
+ * ECDH using curve25519 aka x25519.
+ * `getSharedSecret()` rejects low-order peer inputs by default, and seeded
+ * `keygen(seed)` reuses the provided 32-byte seed buffer instead of copying it.
+ * @example
+ * Derive one shared secret between two X25519 peers.
+ *
+ * ```js
+ * import { x25519 } from '@noble/curves/ed25519.js';
+ * const alice = x25519.keygen();
+ * const bob = x25519.keygen();
+ * const shared = x25519.getSharedSecret(alice.secretKey, bob.publicKey);
+ * ```
+ */
+var x25519 = /* @__PURE__ */(() => {
+  var P = ed25519_CURVE_p;
+  return Object(_abstract_montgomery_js__WEBPACK_IMPORTED_MODULE_7__["montgomery"])({
+    P,
+    type: 'x25519',
+    powPminus2: x => {
+      // x^(p-2) aka x^(2^255-21)
+      var _ed25519_pow_2_252_ = ed25519_pow_2_252_3(x),
+        pow_p_5_8 = _ed25519_pow_2_252_.pow_p_5_8,
+        b2 = _ed25519_pow_2_252_.b2;
+      return Object(_abstract_modular_js__WEBPACK_IMPORTED_MODULE_6__["mod"])(Object(_abstract_modular_js__WEBPACK_IMPORTED_MODULE_6__["pow2"])(pow_p_5_8, _3n, P) * b2, P);
+    },
+    adjustScalarBytes
+  });
+})();
+// Hash To Curve Elligator2 Map (NOTE: different from ristretto255 elligator)
+// RFC 9380 Appendix G.2.2 / Err4730 requires `sgn0(c1) = 0` for the Edwards
+// map constant below, so use the even root explicitly.
+// 1. c1 = (q + 3) / 8 # Integer arithmetic
+var ELL2_C1 = /* @__PURE__ */(() => (ed25519_CURVE_p + _3n) / _8n)();
+var ELL2_C2 = /* @__PURE__ */(() => Fp.pow(_2n, ELL2_C1))(); // 2. c2 = 2^c1
+var ELL2_C3 = /* @__PURE__ */(() => Fp.sqrt(Fp.neg(Fp.ONE)))(); // 3. c3 = sqrt(-1)
+/**
+ * RFC 9380 method `map_to_curve_elligator2_curve25519`. Experimental name: may be renamed later.
+ * @private
+ */
+// prettier-ignore
+function _map_to_curve_elligator2_curve25519(u) {
+  var ELL2_C4 = (ed25519_CURVE_p - _5n) / _8n; // 4. c4 = (q - 5) / 8       # Integer arithmetic
+  var ELL2_J = BigInt(486662);
+  var tv1 = Fp.sqr(u); //  1.  tv1 = u^2
+  tv1 = Fp.mul(tv1, _2n); //  2.  tv1 = 2 * tv1
+  // 3. xd = tv1 + 1 # Nonzero: -1 is square (mod p), tv1 is not
+  var xd = Fp.add(tv1, Fp.ONE);
+  var x1n = Fp.neg(ELL2_J); //  4.  x1n = -J              # x1 = x1n / xd = -J / (1 + 2 * u^2)
+  var tv2 = Fp.sqr(xd); //  5.  tv2 = xd^2
+  var gxd = Fp.mul(tv2, xd); //  6.  gxd = tv2 * xd        # gxd = xd^3
+  var gx1 = Fp.mul(tv1, ELL2_J); //  7.  gx1 = J * tv1         # x1n + J * xd
+  gx1 = Fp.mul(gx1, x1n); //  8.  gx1 = gx1 * x1n       # x1n^2 + J * x1n * xd
+  gx1 = Fp.add(gx1, tv2); //  9.  gx1 = gx1 + tv2       # x1n^2 + J * x1n * xd + xd^2
+  gx1 = Fp.mul(gx1, x1n); //  10. gx1 = gx1 * x1n       # x1n^3 + J * x1n^2 * xd + x1n * xd^2
+  var tv3 = Fp.sqr(gxd); //  11. tv3 = gxd^2
+  tv2 = Fp.sqr(tv3); //  12. tv2 = tv3^2           # gxd^4
+  tv3 = Fp.mul(tv3, gxd); //  13. tv3 = tv3 * gxd       # gxd^3
+  tv3 = Fp.mul(tv3, gx1); //  14. tv3 = tv3 * gx1       # gx1 * gxd^3
+  tv2 = Fp.mul(tv2, tv3); //  15. tv2 = tv2 * tv3       # gx1 * gxd^7
+  var y11 = Fp.pow(tv2, ELL2_C4); //  16. y11 = tv2^c4        # (gx1 * gxd^7)^((p - 5) / 8)
+  y11 = Fp.mul(y11, tv3); //  17. y11 = y11 * tv3       # gx1*gxd^3*(gx1*gxd^7)^((p-5)/8)
+  var y12 = Fp.mul(y11, ELL2_C3); //  18. y12 = y11 * c3
+  tv2 = Fp.sqr(y11); //  19. tv2 = y11^2
+  tv2 = Fp.mul(tv2, gxd); //  20. tv2 = tv2 * gxd
+  var e1 = Fp.eql(tv2, gx1); //  21.  e1 = tv2 == gx1
+  // 22. y1 = CMOV(y12, y11, e1) # If g(x1) is square, this is its sqrt
+  var y1 = Fp.cmov(y12, y11, e1);
+  var x2n = Fp.mul(x1n, tv1); //  23. x2n = x1n * tv1       # x2 = x2n / xd = 2 * u^2 * x1n / xd
+  var y21 = Fp.mul(y11, u); //  24. y21 = y11 * u
+  y21 = Fp.mul(y21, ELL2_C2); //  25. y21 = y21 * c2
+  var y22 = Fp.mul(y21, ELL2_C3); //  26. y22 = y21 * c3
+  var gx2 = Fp.mul(gx1, tv1); //  27. gx2 = gx1 * tv1       # g(x2) = gx2 / gxd = 2 * u^2 * g(x1)
+  tv2 = Fp.sqr(y21); //  28. tv2 = y21^2
+  tv2 = Fp.mul(tv2, gxd); //  29. tv2 = tv2 * gxd
+  var e2 = Fp.eql(tv2, gx2); //  30.  e2 = tv2 == gx2
+  // 31. y2 = CMOV(y22, y21, e2) # If g(x2) is square, this is its sqrt
+  var y2 = Fp.cmov(y22, y21, e2);
+  tv2 = Fp.sqr(y1); //  32. tv2 = y1^2
+  tv2 = Fp.mul(tv2, gxd); //  33. tv2 = tv2 * gxd
+  var e3 = Fp.eql(tv2, gx1); //  34.  e3 = tv2 == gx1
+  var xn = Fp.cmov(x2n, x1n, e3); //  35.  xn = CMOV(x2n, x1n, e3)  # If e3, x = x1, else x = x2
+  var y = Fp.cmov(y2, y1, e3); //  36.   y = CMOV(y2, y1, e3)    # If e3, y = y1, else y = y2
+  var e4 = Fp.isOdd(y); //  37.  e4 = sgn0(y) == 1        # Fix sign of y
+  y = Fp.cmov(y, Fp.neg(y), e3 !== e4); //  38.   y = CMOV(y, -y, e3 XOR e4)
+  return {
+    xMn: xn,
+    xMd: xd,
+    yMn: y,
+    yMd: _1n
+  }; //  39. return (xn, xd, y, 1)
+}
+// sgn0(c1) MUST equal 0
+var ELL2_C1_EDWARDS = /* @__PURE__ */(() => Object(_abstract_modular_js__WEBPACK_IMPORTED_MODULE_6__["FpSqrtEven"])(Fp, Fp.neg(BigInt(486664))))();
+function map_to_curve_elligator2_edwards25519(u) {
+  // 1. (xMn, xMd, yMn, yMd) = map_to_curve_elligator2_curve25519(u)
+  var _map_to_curve_elligat = _map_to_curve_elligator2_curve25519(u),
+    xMn = _map_to_curve_elligat.xMn,
+    xMd = _map_to_curve_elligat.xMd,
+    yMn = _map_to_curve_elligat.yMn,
+    yMd = _map_to_curve_elligat.yMd;
+  // map_to_curve_elligator2_curve25519(u)
+  var xn = Fp.mul(xMn, yMd); //  2.  xn = xMn * yMd
+  xn = Fp.mul(xn, ELL2_C1_EDWARDS); //  3.  xn = xn * c1
+  var xd = Fp.mul(xMd, yMn); //  4.  xd = xMd * yMn    # xn / xd = c1 * xM / yM
+  var yn = Fp.sub(xMn, xMd); //  5.  yn = xMn - xMd
+  // 6. yd = xMn + xMd # (n / d - 1) / (n / d + 1) = (n - d) / (n + d)
+  var yd = Fp.add(xMn, xMd);
+  var tv1 = Fp.mul(xd, yd); //  7. tv1 = xd * yd
+  var e = Fp.eql(tv1, Fp.ZERO); //  8.   e = tv1 == 0
+  xn = Fp.cmov(xn, Fp.ZERO, e); //  9.  xn = CMOV(xn, 0, e)
+  xd = Fp.cmov(xd, Fp.ONE, e); //  10. xd = CMOV(xd, 1, e)
+  yn = Fp.cmov(yn, Fp.ONE, e); //  11. yn = CMOV(yn, 1, e)
+  yd = Fp.cmov(yd, Fp.ONE, e); //  12. yd = CMOV(yd, 1, e)
+  var _FpInvertBatch = Object(_abstract_modular_js__WEBPACK_IMPORTED_MODULE_6__["FpInvertBatch"])(Fp, [xd, yd], true),
+    _FpInvertBatch2 = _slicedToArray(_FpInvertBatch, 2),
+    xd_inv = _FpInvertBatch2[0],
+    yd_inv = _FpInvertBatch2[1]; // batch division
+  // Noble normalizes the RFC rational representation to affine `{ x, y }`
+  // before returning from the internal helper.
+  return {
+    x: Fp.mul(xn, xd_inv),
+    y: Fp.mul(yn, yd_inv)
+  }; //  13. return (xn, xd, yn, yd)
+}
+/**
+ * Hashing to ed25519 points / field. RFC 9380 methods.
+ * Public `mapToCurve()` returns the cofactor-cleared subgroup point; the
+ * internal map callback below consumes one field element bigint, not `[bigint]`.
+ * @example
+ * Hash one message onto the ed25519 curve.
+ *
+ * ```ts
+ * const point = ed25519_hasher.hashToCurve(new TextEncoder().encode('hello noble'));
+ * ```
+ */
+var ed25519_hasher = /* @__PURE__ */(() => Object(_abstract_hash_to_curve_js__WEBPACK_IMPORTED_MODULE_5__["createHasher"])(ed25519_Point, scalars => map_to_curve_elligator2_edwards25519(scalars[0]), {
+  DST: 'edwards25519_XMD:SHA-512_ELL2_RO_',
+  encodeDST: 'edwards25519_XMD:SHA-512_ELL2_NU_',
+  p: ed25519_CURVE_p,
+  m: 1,
+  k: 128,
+  expand: 'xmd',
+  hash: _noble_hashes_sha2_js__WEBPACK_IMPORTED_MODULE_0__["sha512"]
+}))();
+// √(-1) aka √(a) aka 2^((p-1)/4)
+var SQRT_M1 = ED25519_SQRT_M1;
+// √(ad - 1)
+var SQRT_AD_MINUS_ONE = /* @__PURE__ */BigInt('25063068953384623474111414158702152701244531502492656460079210482610430750235');
+// 1 / √(a-d)
+var INVSQRT_A_MINUS_D = /* @__PURE__ */BigInt('54469307008909316920995813868745141605393597292927456921205312896311721017578');
+// 1-d²
+var ONE_MINUS_D_SQ = /* @__PURE__ */BigInt('1159843021668779879193775521855586647937357759715417654439879720876111806838');
+// (d-1)²
+var D_MINUS_ONE_SQ = /* @__PURE__ */BigInt('40440834346308536858101042469323190826248399146238708352240133220865137265952');
+// `SQRT_RATIO_M1(1, number)` specialization. Returns `{ isValid, value }`,
+// where non-squares get the nonnegative `sqrt(SQRT_M1 / number)` branch.
+var invertSqrt = number => uvRatio(_1n, number);
+var MAX_255B = /* @__PURE__ */BigInt('0x7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff');
+// RFC 9496 §4.3.4 MAP parser: masks bit 255 and reduces modulo p for element
+// derivation. The decode path has the opposite contract and rejects that bit.
+var bytes255ToNumberLE = bytes => Fp.create(Object(_utils_js__WEBPACK_IMPORTED_MODULE_9__["bytesToNumberLE"])(bytes) & MAX_255B);
+/**
+ * Computes Elligator map for Ristretto255.
+ * Primary formula source is RFC 9496 §4.3.4 MAP; RFC 9380 Appendix B builds
+ * `hash_to_ristretto255` on top of this helper.
+ * Returns an internal Edwards representative, not a public `_RistrettoPoint`.
+ */
+function calcElligatorRistrettoMap(r0) {
+  var d = ed25519_CURVE.d;
+  var P = ed25519_CURVE_p;
+  var mod = n => Fp.create(n);
+  var r = mod(SQRT_M1 * r0 * r0); // 1
+  var Ns = mod((r + _1n) * ONE_MINUS_D_SQ); // 2
+  var c = BigInt(-1); // 3
+  var D = mod((c - d * r) * mod(r + d)); // 4
+  var _uvRatio = uvRatio(Ns, D),
+    Ns_D_is_sq = _uvRatio.isValid,
+    s = _uvRatio.value; // 5
+  var s_ = mod(s * r0); // 6
+  if (!Object(_abstract_modular_js__WEBPACK_IMPORTED_MODULE_6__["isNegativeLE"])(s_, P)) s_ = mod(-s_);
+  if (!Ns_D_is_sq) s = s_; // 7
+  if (!Ns_D_is_sq) c = r; // 8
+  var Nt = mod(c * (r - _1n) * D_MINUS_ONE_SQ - D); // 9
+  var s2 = s * s;
+  var W0 = mod((s + s) * D); // 10
+  var W1 = mod(Nt * SQRT_AD_MINUS_ONE); // 11
+  var W2 = mod(_1n - s2); // 12
+  var W3 = mod(_1n + s2); // 13
+  return new ed25519_Point(mod(W0 * W3), mod(W2 * W1), mod(W1 * W3), mod(W0 * W2));
+}
+/**
+ * Wrapper over Edwards Point for ristretto255.
+ *
+ * Each ed25519/EdwardsPoint has 8 different equivalent points. This can be
+ * a source of bugs for protocols like ring signatures. Ristretto was created to solve this.
+ * Ristretto point operates in X:Y:Z:T extended coordinates like EdwardsPoint,
+ * but it should work in its own namespace: do not combine those two.
+ * See [RFC9496](https://www.rfc-editor.org/rfc/rfc9496).
+ */
+class _RistrettoPoint extends _abstract_edwards_js__WEBPACK_IMPORTED_MODULE_3__["PrimeEdwardsPoint"] {
+  constructor(ep) {
+    super(ep);
+  }
+  /**
+   * Create one Ristretto255 point from affine Edwards coordinates.
+   * This wraps the internal Edwards representative directly and is not a
+   * canonical ristretto255 decoding path.
+   * Use `toBytes()` / `fromBytes()` if canonical ristretto255 bytes matter.
+   */
+  static fromAffine(ap) {
+    return new _RistrettoPoint(ed25519_Point.fromAffine(ap));
+  }
+  assertSame(other) {
+    if (!(other instanceof _RistrettoPoint)) throw new Error('RistrettoPoint expected');
+  }
+  init(ep) {
+    return new _RistrettoPoint(ep);
+  }
+  static fromBytes(bytes) {
+    Object(_noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_1__["abytes"])(bytes, 32);
+    var a = ed25519_CURVE.a,
+      d = ed25519_CURVE.d;
+    var P = ed25519_CURVE_p;
+    var mod = n => Fp.create(n);
+    var s = bytes255ToNumberLE(bytes);
+    // 1. Check that s_bytes is the canonical encoding of a field element, or else abort.
+    // 3. Check that s is non-negative, or else abort
+    if (!Object(_utils_js__WEBPACK_IMPORTED_MODULE_9__["equalBytes"])(Fp.toBytes(s), bytes) || Object(_abstract_modular_js__WEBPACK_IMPORTED_MODULE_6__["isNegativeLE"])(s, P)) throw new Error('invalid ristretto255 encoding 1');
+    var s2 = mod(s * s);
+    var u1 = mod(_1n + a * s2); // 4 (a is -1)
+    var u2 = mod(_1n - a * s2); // 5
+    var u1_2 = mod(u1 * u1);
+    var u2_2 = mod(u2 * u2);
+    var v = mod(a * d * u1_2 - u2_2); // 6
+    var _invertSqrt = invertSqrt(mod(v * u2_2)),
+      isValid = _invertSqrt.isValid,
+      I = _invertSqrt.value; // 7
+    var Dx = mod(I * u2); // 8
+    var Dy = mod(I * Dx * v); // 9
+    var x = mod((s + s) * Dx); // 10
+    if (Object(_abstract_modular_js__WEBPACK_IMPORTED_MODULE_6__["isNegativeLE"])(x, P)) x = mod(-x); // 10
+    var y = mod(u1 * Dy); // 11
+    var t = mod(x * y); // 12
+    if (!isValid || Object(_abstract_modular_js__WEBPACK_IMPORTED_MODULE_6__["isNegativeLE"])(t, P) || y === _0n) throw new Error('invalid ristretto255 encoding 2');
+    return new _RistrettoPoint(new ed25519_Point(x, y, _1n, t));
+  }
+  /**
+   * Converts ristretto-encoded string to ristretto point.
+   * Described in [RFC9496](https://www.rfc-editor.org/rfc/rfc9496#name-decode).
+   * @param hex - Ristretto-encoded 32 bytes. Not every 32-byte string is valid ristretto encoding
+   */
+  static fromHex(hex) {
+    return _RistrettoPoint.fromBytes(Object(_noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_1__["hexToBytes"])(hex));
+  }
+  /**
+   * Encodes ristretto point to Uint8Array.
+   * Described in [RFC9496](https://www.rfc-editor.org/rfc/rfc9496#name-encode).
+   */
+  toBytes() {
+    var _this$ep = this.ep,
+      X = _this$ep.X,
+      Y = _this$ep.Y,
+      Z = _this$ep.Z,
+      T = _this$ep.T;
+    var P = ed25519_CURVE_p;
+    var mod = n => Fp.create(n);
+    var u1 = mod(mod(Z + Y) * mod(Z - Y)); // 1
+    var u2 = mod(X * Y); // 2
+    // Square root always exists
+    var u2sq = mod(u2 * u2);
+    var _invertSqrt2 = invertSqrt(mod(u1 * u2sq)),
+      invsqrt = _invertSqrt2.value; // 3
+    var D1 = mod(invsqrt * u1); // 4
+    var D2 = mod(invsqrt * u2); // 5
+    var zInv = mod(D1 * D2 * T); // 6
+    var D; // 7
+    if (Object(_abstract_modular_js__WEBPACK_IMPORTED_MODULE_6__["isNegativeLE"])(T * zInv, P)) {
+      var _x = mod(Y * SQRT_M1);
+      var _y = mod(X * SQRT_M1);
+      X = _x;
+      Y = _y;
+      D = mod(D1 * INVSQRT_A_MINUS_D);
+    } else {
+      D = D2; // 8
+    }
+    if (Object(_abstract_modular_js__WEBPACK_IMPORTED_MODULE_6__["isNegativeLE"])(X * zInv, P)) Y = mod(-Y); // 9
+    var s = mod((Z - Y) * D); // 10 (check footer's note, no sqrt(-a))
+    if (Object(_abstract_modular_js__WEBPACK_IMPORTED_MODULE_6__["isNegativeLE"])(s, P)) s = mod(-s);
+    return Fp.toBytes(s); // 11
+  }
+  /**
+   * Compares two Ristretto points.
+   * Described in [RFC9496](https://www.rfc-editor.org/rfc/rfc9496#name-equals).
+   */
+  equals(other) {
+    this.assertSame(other);
+    var _this$ep2 = this.ep,
+      X1 = _this$ep2.X,
+      Y1 = _this$ep2.Y;
+    var _other$ep = other.ep,
+      X2 = _other$ep.X,
+      Y2 = _other$ep.Y;
+    var mod = n => Fp.create(n);
+    // (x1 * y2 == y1 * x2) | (y1 * y2 == x1 * x2)
+    var one = mod(X1 * Y2) === mod(Y1 * X2);
+    var two = mod(Y1 * Y2) === mod(X1 * X2);
+    return one || two;
+  }
+  is0() {
+    return this.equals(_RistrettoPoint.ZERO);
+  }
+}
+_RistrettoPoint2 = _RistrettoPoint;
+// Do NOT change syntax: the following gymnastics is done,
+// because typescript strips comments, which makes bundlers disable tree-shaking.
+// prettier-ignore
+_defineProperty(_RistrettoPoint, "BASE", /* @__PURE__ */(() => new _RistrettoPoint2(ed25519_Point.BASE))());
+// prettier-ignore
+_defineProperty(_RistrettoPoint, "ZERO", /* @__PURE__ */(() => new _RistrettoPoint2(ed25519_Point.ZERO))());
+// prettier-ignore
+_defineProperty(_RistrettoPoint, "Fp", /* @__PURE__ */(() => Fp)());
+// prettier-ignore
+_defineProperty(_RistrettoPoint, "Fn", /* @__PURE__ */(() => Fn)());
+Object.freeze(_RistrettoPoint.BASE);
+Object.freeze(_RistrettoPoint.ZERO);
+Object.freeze(_RistrettoPoint.prototype);
+Object.freeze(_RistrettoPoint);
+/** Prime-order Ristretto255 group bundle. */
+var ristretto255 = /* @__PURE__ */Object.freeze({
+  Point: _RistrettoPoint
+});
+/**
+ * Hashing to ristretto255 points / field. RFC 9380 methods.
+ * `hashToCurve()` is RFC 9380 Appendix B, `deriveToCurve()` is the RFC 9496
+ * §4.3.4 element-derivation building block, and `hashToScalar()` is a
+ * library-specific helper for OPRF-style use.
+ * @example
+ * Hash one message onto ristretto255.
+ *
+ * ```ts
+ * const point = ristretto255_hasher.hashToCurve(new TextEncoder().encode('hello noble'));
+ * ```
+ */
+var ristretto255_hasher = Object.freeze({
+  Point: _RistrettoPoint,
+  /**
+  * Spec: https://www.rfc-editor.org/rfc/rfc9380.html#name-hashing-to-ristretto255. Caveats:
+  * * There are no test vectors
+  * * encodeToCurve / mapToCurve is undefined
+  * * mapToCurve would be `calcElligatorRistrettoMap(scalars[0])`, not ristretto255_map!
+  * * hashToScalar is undefined too, so we just use OPRF implementation
+  * * We cannot re-use 'createHasher', because ristretto255_map is different algorithm/RFC
+    (os2ip -> bytes255ToNumberLE)
+  * * mapToCurve == calcElligatorRistrettoMap, hashToCurve == ristretto255_map
+  * * hashToScalar is undefined in RFC9380 for ristretto, so we use the OPRF
+    version here. Using `bytes255ToNumblerLE` will create a different result
+    if we use `bytes255ToNumberLE` as os2ip
+  * * current version is closest to spec.
+  */
+  hashToCurve(msg, options) {
+    // == 'hash_to_ristretto255'
+    // Preserve explicit empty/invalid DST overrides so expand_message_xmd() can reject them.
+    var DST = (options === null || options === void 0 ? void 0 : options.DST) === undefined ? 'ristretto255_XMD:SHA-512_R255MAP_RO_' : options.DST;
+    var xmd = Object(_abstract_hash_to_curve_js__WEBPACK_IMPORTED_MODULE_5__["expand_message_xmd"])(msg, DST, 64, _noble_hashes_sha2_js__WEBPACK_IMPORTED_MODULE_0__["sha512"]);
+    // NOTE: RFC 9380 incorrectly calls this function `ristretto255_map`.
+    // In RFC 9496, `map` was the per-point function inside the construction.
+    // That also led to confusion that `ristretto255_map` is `mapToCurve`.
+    // It is not: it is the older hash-to-curve construction.
+    return ristretto255_hasher.deriveToCurve(xmd);
+  },
+  hashToScalar(msg) {
+    var options = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : {
+      DST: _abstract_hash_to_curve_js__WEBPACK_IMPORTED_MODULE_5__["_DST_scalar"]
+    };
+    var xmd = Object(_abstract_hash_to_curve_js__WEBPACK_IMPORTED_MODULE_5__["expand_message_xmd"])(msg, options.DST, 64, _noble_hashes_sha2_js__WEBPACK_IMPORTED_MODULE_0__["sha512"]);
+    return Fn.create(Object(_utils_js__WEBPACK_IMPORTED_MODULE_9__["bytesToNumberLE"])(xmd));
+  },
+  /**
+   * HashToCurve-like construction based on RFC 9496 (Element Derivation).
+   * Converts 64 uniform random bytes into a curve point.
+   *
+   * WARNING: This represents an older hash-to-curve construction from before
+   * RFC 9380 was finalized.
+   * It was later reused as a component in the newer
+   * `hash_to_ristretto255` function defined in RFC 9380.
+   */
+  deriveToCurve(bytes) {
+    // https://www.rfc-editor.org/rfc/rfc9496.html#name-element-derivation
+    Object(_noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_1__["abytes"])(bytes, 64);
+    var r1 = bytes255ToNumberLE(bytes.subarray(0, 32));
+    var R1 = calcElligatorRistrettoMap(r1);
+    var r2 = bytes255ToNumberLE(bytes.subarray(32, 64));
+    var R2 = calcElligatorRistrettoMap(r2);
+    return new _RistrettoPoint(R1.add(R2));
+  }
+});
+/**
+ * ristretto255 OPRF/VOPRF/POPRF bundle, defined in RFC 9497.
+ * @example
+ * Run one blind/evaluate/finalize OPRF round over ristretto255.
+ *
+ * ```ts
+ * const input = new TextEncoder().encode('hello noble');
+ * const keys = ristretto255_oprf.oprf.generateKeyPair();
+ * const blind = ristretto255_oprf.oprf.blind(input);
+ * const evaluated = ristretto255_oprf.oprf.blindEvaluate(keys.secretKey, blind.blinded);
+ * const output = ristretto255_oprf.oprf.finalize(input, blind.blind, evaluated);
+ * ```
+ */
+var ristretto255_oprf = /* @__PURE__ */(() => Object(_abstract_oprf_js__WEBPACK_IMPORTED_MODULE_8__["createOPRF"])({
+  name: 'ristretto255-SHA512',
+  Point: _RistrettoPoint,
+  hash: _noble_hashes_sha2_js__WEBPACK_IMPORTED_MODULE_0__["sha512"],
+  hashToGroup: ristretto255_hasher.hashToCurve,
+  hashToScalar: ristretto255_hasher.hashToScalar
+}))();
+/**
+ * FROST threshold signatures over ristretto255. RFC 9591.
+ * @example
+ * Create one trusted-dealer package for 2-of-3 ristretto255 signing.
+ *
+ * ```ts
+ * const alice = ristretto255_FROST.Identifier.derive('alice@example.com');
+ * const bob = ristretto255_FROST.Identifier.derive('bob@example.com');
+ * const carol = ristretto255_FROST.Identifier.derive('carol@example.com');
+ * const deal = ristretto255_FROST.trustedDealer({ min: 2, max: 3 }, [alice, bob, carol]);
+ * ```
+ */
+var ristretto255_FROST = /* @__PURE__ */(() => Object(_abstract_frost_js__WEBPACK_IMPORTED_MODULE_4__["createFROST"])({
+  name: 'FROST-RISTRETTO255-SHA512-v1',
+  Point: _RistrettoPoint,
+  validatePoint: p => {
+    // Prime-order wrappers are torsion-free at the abstract-group level.
+    p.assertValidity();
+  },
+  hash: _noble_hashes_sha2_js__WEBPACK_IMPORTED_MODULE_0__["sha512"]
+}))();
+/**
+ * Weird / bogus points, useful for debugging.
+ * All 8 ed25519 points of 8-torsion subgroup can be generated from the point
+ * T = `26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05`.
+ * The subgroup generated by `T` is `{ O, T, 2T, 3T, 4T, 5T, 6T, 7T }`; the
+ * array below is that set, not the powers in that exact index order.
+ * @example
+ * Decode one known torsion point for debugging.
+ *
+ * ```ts
+ * import { ED25519_TORSION_SUBGROUP, ed25519 } from '@noble/curves/ed25519.js';
+ * const point = ed25519.Point.fromHex(ED25519_TORSION_SUBGROUP[1]);
+ * ```
+ */
+var ED25519_TORSION_SUBGROUP = /* @__PURE__ */Object.freeze(['0100000000000000000000000000000000000000000000000000000000000000', 'c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a', '0000000000000000000000000000000000000000000000000000000000000080', '26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05', 'ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f', '26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc85', '0000000000000000000000000000000000000000000000000000000000000000', 'c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac03fa']);
+
+/***/ }),
+
+/***/ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/utils.js":
+/*!*****************************************************************!*\
+  !*** ./src/onlykey-fido2/onlykey/vendor/@noble/curves/utils.js ***!
+  \*****************************************************************/
+/*! exports provided: abytes, anumber, bytesToHex, concatBytes, hexToBytes, isBytes, randomBytes, abool, abignumber, asafenumber, numberToHexUnpadded, hexToNumber, bytesToNumberBE, bytesToNumberLE, numberToBytesBE, numberToBytesLE, numberToVarBytesBE, equalBytes, copyBytes, asciiToBytes, inRange, aInRange, bitLen, bitGet, bitSet, bitMask, createHmacDrbg, validateObject, notImplemented */
+/***/ (function(module, __webpack_exports__, __webpack_require__) {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "abytes", function() { return abytes; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "anumber", function() { return anumber; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "bytesToHex", function() { return bytesToHex; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "concatBytes", function() { return concatBytes; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "hexToBytes", function() { return hexToBytes; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "isBytes", function() { return isBytes; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "randomBytes", function() { return randomBytes; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "abool", function() { return abool; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "abignumber", function() { return abignumber; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "asafenumber", function() { return asafenumber; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "numberToHexUnpadded", function() { return numberToHexUnpadded; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "hexToNumber", function() { return hexToNumber; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "bytesToNumberBE", function() { return bytesToNumberBE; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "bytesToNumberLE", function() { return bytesToNumberLE; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "numberToBytesBE", function() { return numberToBytesBE; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "numberToBytesLE", function() { return numberToBytesLE; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "numberToVarBytesBE", function() { return numberToVarBytesBE; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "equalBytes", function() { return equalBytes; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "copyBytes", function() { return copyBytes; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "asciiToBytes", function() { return asciiToBytes; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "inRange", function() { return inRange; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "aInRange", function() { return aInRange; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "bitLen", function() { return bitLen; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "bitGet", function() { return bitGet; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "bitSet", function() { return bitSet; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "bitMask", function() { return bitMask; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "createHmacDrbg", function() { return createHmacDrbg; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "validateObject", function() { return validateObject; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "notImplemented", function() { return notImplemented; });
+/* harmony import */ var _noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! @noble/hashes/utils.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/hashes/utils.js");
+function _slicedToArray(r, e) { return _arrayWithHoles(r) || _iterableToArrayLimit(r, e) || _unsupportedIterableToArray(r, e) || _nonIterableRest(); }
+function _nonIterableRest() { throw new TypeError("Invalid attempt to destructure non-iterable instance.\nIn order to be iterable, non-array objects must have a [Symbol.iterator]() method."); }
+function _unsupportedIterableToArray(r, a) { if (r) { if ("string" == typeof r) return _arrayLikeToArray(r, a); var t = {}.toString.call(r).slice(8, -1); return "Object" === t && r.constructor && (t = r.constructor.name), "Map" === t || "Set" === t ? Array.from(r) : "Arguments" === t || /^(?:Ui|I)nt(?:8|16|32)(?:Clamped)?Array$/.test(t) ? _arrayLikeToArray(r, a) : void 0; } }
+function _arrayLikeToArray(r, a) { (null == a || a > r.length) && (a = r.length); for (var e = 0, n = Array(a); e < a; e++) n[e] = r[e]; return n; }
+function _iterableToArrayLimit(r, l) { var t = null == r ? null : "undefined" != typeof Symbol && r[Symbol.iterator] || r["@@iterator"]; if (null != t) { var e, n, i, u, a = [], f = !0, o = !1; try { if (i = (t = t.call(r)).next, 0 === l) { if (Object(t) !== t) return; f = !1; } else for (; !(f = (e = i.call(t)).done) && (a.push(e.value), a.length !== l); f = !0); } catch (r) { o = !0, n = r; } finally { try { if (!f && null != t.return && (u = t.return(), Object(u) !== u)) return; } finally { if (o) throw n; } } return a; } }
+function _arrayWithHoles(r) { if (Array.isArray(r)) return r; }
+/**
+ * Hex, bytes and number utilities.
+ * @module
+ */
+/*! noble-curves - MIT License (c) 2022 Paul Miller (paulmillr.com) */
+
+/**
+ * Validates that a value is a byte array.
+ * @param value - Value to validate.
+ * @param length - Optional exact byte length.
+ * @param title - Optional field name.
+ * @returns Original byte array.
+ * @example
+ * Reject non-byte input before passing data into curve code.
+ *
+ * ```ts
+ * abytes(new Uint8Array(1));
+ * ```
+ */
+var abytes = (value, length, title) => Object(_noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(value, length, title);
+/**
+ * Validates that a value is a non-negative safe integer.
+ * @param n - Value to validate.
+ * @param title - Optional field name.
+ * @example
+ * Validate a numeric length before allocating buffers.
+ *
+ * ```ts
+ * anumber(1);
+ * ```
+ */
+var anumber = _noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__["anumber"];
+/**
+ * Encodes bytes as lowercase hex.
+ * @param bytes - Bytes to encode.
+ * @returns Lowercase hex string.
+ * @example
+ * Serialize bytes as hex for logging or fixtures.
+ *
+ * ```ts
+ * bytesToHex(Uint8Array.of(1, 2, 3));
+ * ```
+ */
+var bytesToHex = _noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__["bytesToHex"];
+/**
+ * Concatenates byte arrays.
+ * @param arrays - Byte arrays to join.
+ * @returns Concatenated bytes.
+ * @example
+ * Join domain-separated chunks into one buffer.
+ *
+ * ```ts
+ * concatBytes(Uint8Array.of(1), Uint8Array.of(2));
+ * ```
+ */
+var concatBytes = function concatBytes() {
+  return Object(_noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__["concatBytes"])(...arguments);
+};
+/**
+ * Decodes lowercase or uppercase hex into bytes.
+ * @param hex - Hex string to decode.
+ * @returns Decoded bytes.
+ * @example
+ * Parse fixture hex into bytes before hashing.
+ *
+ * ```ts
+ * hexToBytes('0102');
+ * ```
+ */
+var hexToBytes = hex => Object(_noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__["hexToBytes"])(hex);
+/**
+ * Checks whether a value is a Uint8Array.
+ * @param a - Value to inspect.
+ * @returns `true` when `a` is a Uint8Array.
+ * @example
+ * Branch on byte input before decoding it.
+ *
+ * ```ts
+ * isBytes(new Uint8Array(1));
+ * ```
+ */
+var isBytes = _noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__["isBytes"];
+/**
+ * Reads random bytes from the platform CSPRNG.
+ * @param bytesLength - Number of random bytes to read.
+ * @returns Fresh random bytes.
+ * @example
+ * Generate a random seed for a keypair.
+ *
+ * ```ts
+ * randomBytes(2);
+ * ```
+ */
+var randomBytes = bytesLength => Object(_noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__["randomBytes"])(bytesLength);
+var _0n = /* @__PURE__ */BigInt(0);
+var _1n = /* @__PURE__ */BigInt(1);
+/**
+ * Validates that a flag is boolean.
+ * @param value - Value to validate.
+ * @param title - Optional field name.
+ * @returns Original value.
+ * @throws On wrong argument types. {@link TypeError}
+ * @example
+ * Reject non-boolean option flags early.
+ *
+ * ```ts
+ * abool(true);
+ * ```
+ */
+function abool(value) {
+  var title = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : '';
+  if (typeof value !== 'boolean') {
+    var prefix = title && "\"".concat(title, "\" ");
+    throw new TypeError(prefix + 'expected boolean, got type=' + typeof value);
+  }
+  return value;
+}
+/**
+ * Validates that a value is a non-negative bigint or safe integer.
+ * @param n - Value to validate.
+ * @returns The same validated value.
+ * @throws On wrong argument ranges or values. {@link RangeError}
+ * @example
+ * Validate one integer-like value before serializing it.
+ *
+ * ```ts
+ * abignumber(1n);
+ * ```
+ */
+function abignumber(n) {
+  if (typeof n === 'bigint') {
+    if (!isPosBig(n)) throw new RangeError('positive bigint expected, got ' + n);
+  } else anumber(n);
+  return n;
+}
+/**
+ * Validates that a value is a safe integer.
+ * @param value - Integer to validate.
+ * @param title - Optional field name.
+ * @throws On wrong argument types. {@link TypeError}
+ * @throws On wrong argument ranges or values. {@link RangeError}
+ * @example
+ * Validate a window size before scalar arithmetic uses it.
+ *
+ * ```ts
+ * asafenumber(1);
+ * ```
+ */
+function asafenumber(value) {
+  var title = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : '';
+  if (typeof value !== 'number') {
+    var prefix = title && "\"".concat(title, "\" ");
+    throw new TypeError(prefix + 'expected number, got type=' + typeof value);
+  }
+  if (!Number.isSafeInteger(value)) {
+    var _prefix = title && "\"".concat(title, "\" ");
+    throw new RangeError(_prefix + 'expected safe integer, got ' + value);
+  }
+}
+/**
+ * Encodes a bigint into even-length big-endian hex.
+ * The historical "unpadded" name only means "no fixed-width field padding"; odd-length hex still
+ * gets one leading zero nibble so the result always represents whole bytes.
+ * @param num - Number to encode.
+ * @returns Big-endian hex string.
+ * @throws On wrong argument ranges or values. {@link RangeError}
+ * @example
+ * Encode a scalar into hex without a `0x` prefix.
+ *
+ * ```ts
+ * numberToHexUnpadded(255n);
+ * ```
+ */
+function numberToHexUnpadded(num) {
+  var hex = abignumber(num).toString(16);
+  return hex.length & 1 ? '0' + hex : hex;
+}
+/**
+ * Parses a big-endian hex string into bigint.
+ * Accepts odd-length hex through the native `BigInt('0x' + hex)` parser and currently surfaces the
+ * same native `SyntaxError` for malformed hex instead of wrapping it in a library-specific error.
+ * @param hex - Hex string without `0x`.
+ * @returns Parsed bigint value.
+ * @throws On wrong argument types. {@link TypeError}
+ * @example
+ * Parse a scalar from fixture hex.
+ *
+ * ```ts
+ * hexToNumber('ff');
+ * ```
+ */
+function hexToNumber(hex) {
+  if (typeof hex !== 'string') throw new TypeError('hex string expected, got ' + typeof hex);
+  return hex === '' ? _0n : BigInt('0x' + hex); // Big Endian
+}
+// BE: Big Endian, LE: Little Endian
+/**
+ * Parses big-endian bytes into bigint.
+ * @param bytes - Bytes in big-endian order.
+ * @returns Parsed bigint value.
+ * @throws On wrong argument types. {@link TypeError}
+ * @example
+ * Read a scalar encoded in network byte order.
+ *
+ * ```ts
+ * bytesToNumberBE(Uint8Array.of(1, 0));
+ * ```
+ */
+function bytesToNumberBE(bytes) {
+  return hexToNumber(Object(_noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__["bytesToHex"])(bytes));
+}
+/**
+ * Parses little-endian bytes into bigint.
+ * @param bytes - Bytes in little-endian order.
+ * @returns Parsed bigint value.
+ * @throws On wrong argument types. {@link TypeError}
+ * @example
+ * Read a scalar encoded in little-endian form.
+ *
+ * ```ts
+ * bytesToNumberLE(Uint8Array.of(1, 0));
+ * ```
+ */
+function bytesToNumberLE(bytes) {
+  return hexToNumber(Object(_noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__["bytesToHex"])(copyBytes(Object(_noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(bytes)).reverse()));
+}
+/**
+ * Encodes a bigint into fixed-length big-endian bytes.
+ * @param n - Number to encode.
+ * @param len - Output length in bytes. Must be greater than zero.
+ * @returns Big-endian byte array.
+ * @throws On wrong argument ranges or values. {@link RangeError}
+ * @example
+ * Serialize a scalar into a 32-byte field element.
+ *
+ * ```ts
+ * numberToBytesBE(255n, 2);
+ * ```
+ */
+function numberToBytesBE(n, len) {
+  Object(_noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__["anumber"])(len);
+  if (len === 0) throw new RangeError('zero length');
+  n = abignumber(n);
+  var hex = n.toString(16);
+  // Detect overflow before hex parsing so oversized values don't leak the shared odd-hex error.
+  if (hex.length > len * 2) throw new RangeError('number too large');
+  return Object(_noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__["hexToBytes"])(hex.padStart(len * 2, '0'));
+}
+/**
+ * Encodes a bigint into fixed-length little-endian bytes.
+ * @param n - Number to encode.
+ * @param len - Output length in bytes.
+ * @returns Little-endian byte array.
+ * @throws On wrong argument ranges or values. {@link RangeError}
+ * @example
+ * Serialize a scalar for little-endian protocols.
+ *
+ * ```ts
+ * numberToBytesLE(255n, 2);
+ * ```
+ */
+function numberToBytesLE(n, len) {
+  return numberToBytesBE(n, len).reverse();
+}
+// Unpadded, rarely used
+/**
+ * Encodes a bigint into variable-length big-endian bytes.
+ * @param n - Number to encode.
+ * @returns Variable-length big-endian bytes.
+ * @throws On wrong argument ranges or values. {@link RangeError}
+ * @example
+ * Serialize a bigint without fixed-width padding.
+ *
+ * ```ts
+ * numberToVarBytesBE(255n);
+ * ```
+ */
+function numberToVarBytesBE(n) {
+  return Object(_noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__["hexToBytes"])(numberToHexUnpadded(abignumber(n)));
+}
+// Compares 2 u8a-s in kinda constant time
+/**
+ * Compares two byte arrays in constant-ish time.
+ * @param a - Left byte array.
+ * @param b - Right byte array.
+ * @returns `true` when bytes match.
+ * @example
+ * Compare two encoded points without early exit.
+ *
+ * ```ts
+ * equalBytes(Uint8Array.of(1), Uint8Array.of(1));
+ * ```
+ */
+function equalBytes(a, b) {
+  a = abytes(a);
+  b = abytes(b);
+  if (a.length !== b.length) return false;
+  var diff = 0;
+  for (var i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+  return diff === 0;
+}
+/**
+ * Copies Uint8Array. We can't use u8a.slice(), because u8a can be Buffer,
+ * and Buffer#slice creates mutable copy. Never use Buffers!
+ * @param bytes - Bytes to copy.
+ * @returns Detached copy.
+ * @example
+ * Make an isolated copy before mutating serialized bytes.
+ *
+ * ```ts
+ * copyBytes(Uint8Array.of(1, 2, 3));
+ * ```
+ */
+function copyBytes(bytes) {
+  // `Uint8Array.from(...)` would also accept arrays / other typed arrays. Keep this helper strict
+  // because callers use it at byte-validation boundaries before mutating the detached copy.
+  return Uint8Array.from(abytes(bytes));
+}
+/**
+ * Decodes 7-bit ASCII string to Uint8Array, throws on non-ascii symbols
+ * Should be safe to use for things expected to be ASCII.
+ * Returns exact same result as `TextEncoder` for ASCII or throws.
+ * @param ascii - ASCII input text.
+ * @returns Encoded bytes.
+ * @throws On wrong argument types. {@link TypeError}
+ * @example
+ * Encode an ASCII domain-separation tag.
+ *
+ * ```ts
+ * asciiToBytes('ABC');
+ * ```
+ */
+function asciiToBytes(ascii) {
+  if (typeof ascii !== 'string') throw new TypeError('ascii string expected, got ' + typeof ascii);
+  return Uint8Array.from(ascii, (c, i) => {
+    var charCode = c.charCodeAt(0);
+    if (c.length !== 1 || charCode > 127) {
+      throw new RangeError("string contains non-ASCII character \"".concat(ascii[i], "\" with code ").concat(charCode, " at position ").concat(i));
+    }
+    return charCode;
+  });
+}
+// Historical name: this accepts non-negative bigints, including zero.
+var isPosBig = n => typeof n === 'bigint' && _0n <= n;
+/**
+ * Checks whether a bigint lies inside a half-open range.
+ * @param n - Candidate value.
+ * @param min - Inclusive lower bound.
+ * @param max - Exclusive upper bound.
+ * @returns `true` when the value is inside the range.
+ * @example
+ * Check whether a candidate scalar fits the field order.
+ *
+ * ```ts
+ * inRange(2n, 1n, 3n);
+ * ```
+ */
+function inRange(n, min, max) {
+  return isPosBig(n) && isPosBig(min) && isPosBig(max) && min <= n && n < max;
+}
+/**
+ * Asserts `min <= n < max`. NOTE: upper bound is exclusive.
+ * @param title - Value label for error messages.
+ * @param n - Candidate value.
+ * @param min - Inclusive lower bound.
+ * @param max - Exclusive upper bound.
+ * Wrong-type inputs are not separated from out-of-range values here: they still flow through the
+ * shared `RangeError` path because this is only a throwing wrapper around `inRange(...)`.
+ * @throws On wrong argument ranges or values. {@link RangeError}
+ * @example
+ * Assert that a bigint stays within one half-open range.
+ *
+ * ```ts
+ * aInRange('x', 2n, 1n, 256n);
+ * ```
+ */
+function aInRange(title, n, min, max) {
+  // Why min <= n < max and not a (min < n < max) OR b (min <= n <= max)?
+  // consider P=256n, min=0n, max=P
+  // - a for min=0 would require -1:          `inRange('x', x, -1n, P)`
+  // - b would commonly require subtraction:  `inRange('x', x, 0n, P - 1n)`
+  // - our way is the cleanest:               `inRange('x', x, 0n, P)
+  if (!inRange(n, min, max)) throw new RangeError('expected valid ' + title + ': ' + min + ' <= n < ' + max + ', got ' + n);
+}
+// Bit operations
+/**
+ * Calculates amount of bits in a bigint.
+ * Same as `n.toString(2).length`
+ * TODO: merge with nLength in modular
+ * @param n - Value to inspect.
+ * @returns Bit length.
+ * @throws If the value is negative. {@link Error}
+ * @example
+ * Measure the bit length of a scalar before serialization.
+ *
+ * ```ts
+ * bitLen(8n);
+ * ```
+ */
+function bitLen(n) {
+  // Size callers in this repo only use non-negative orders / scalars, so negative inputs are a
+  // contract bug and must not silently collapse to zero bits.
+  if (n < _0n) throw new Error('expected non-negative bigint, got ' + n);
+  var len;
+  for (len = 0; n > _0n; n >>= _1n, len += 1);
+  return len;
+}
+/**
+ * Gets single bit at position.
+ * NOTE: first bit position is 0 (same as arrays)
+ * Same as `!!+Array.from(n.toString(2)).reverse()[pos]`
+ * @param n - Source value.
+ * @param pos - Bit position. Negative positions are passed through to raw
+ *   bigint shift semantics; because the mask is built as `1n << pos`,
+ *   they currently collapse to `0n` and make the helper a no-op.
+ * @returns Bit as bigint.
+ * @example
+ * Gets single bit at position.
+ *
+ * ```ts
+ * bitGet(5n, 0);
+ * ```
+ */
+function bitGet(n, pos) {
+  return n >> BigInt(pos) & _1n;
+}
+/**
+ * Sets single bit at position.
+ * @param n - Source value.
+ * @param pos - Bit position. Negative positions are passed through to raw bigint shift semantics,
+ *   so they currently behave like left shifts.
+ * @param value - Whether the bit should be set.
+ * @returns Updated bigint.
+ * @example
+ * Sets single bit at position.
+ *
+ * ```ts
+ * bitSet(0n, 1, true);
+ * ```
+ */
+function bitSet(n, pos, value) {
+  var mask = _1n << BigInt(pos);
+  // Clearing needs AND-not here; OR with zero leaves an already-set bit untouched.
+  return value ? n | mask : n & ~mask;
+}
+/**
+ * Calculate mask for N bits. Not using ** operator with bigints because of old engines.
+ * Same as BigInt(`0b${Array(i).fill('1').join('')}`)
+ * @param n - Number of bits. Negative widths are currently passed through to raw bigint shift
+ *   semantics and therefore produce `-1n`.
+ * @returns Bitmask value.
+ * @example
+ * Calculate mask for N bits.
+ *
+ * ```ts
+ * bitMask(4);
+ * ```
+ */
+var bitMask = n => (_1n << BigInt(n)) - _1n;
+/**
+ * Minimal HMAC-DRBG from NIST 800-90 for RFC6979 sigs.
+ * @param hashLen - Hash output size in bytes. Callers are expected to pass a positive length; `0`
+ *   is not rejected here and would make the internal generate loop non-progressing.
+ * @param qByteLen - Requested output size in bytes. Callers are expected to pass a positive length.
+ * @param hmacFn - HMAC implementation.
+ * @returns Function that will call DRBG until the predicate returns anything
+ *   other than `undefined`.
+ * @throws On wrong argument types. {@link TypeError}
+ * @example
+ * Build a deterministic nonce generator for RFC6979-style signing.
+ *
+ * ```ts
+ * import { createHmacDrbg } from '@noble/curves/utils.js';
+ * import { hmac } from '@noble/hashes/hmac.js';
+ * import { sha256 } from '@noble/hashes/sha2.js';
+ * const drbg = createHmacDrbg(32, 32, (key, msg) => hmac(sha256, key, msg));
+ * const seed = new Uint8Array(32);
+ * drbg(seed, (bytes) => bytes);
+ * ```
+ */
+function createHmacDrbg(hashLen, qByteLen, hmacFn) {
+  Object(_noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__["anumber"])(hashLen, 'hashLen');
+  Object(_noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__["anumber"])(qByteLen, 'qByteLen');
+  if (typeof hmacFn !== 'function') throw new TypeError('hmacFn must be a function');
+  // creates Uint8Array
+  var u8n = len => new Uint8Array(len);
+  var NULL = Uint8Array.of();
+  var byte0 = Uint8Array.of(0x00);
+  var byte1 = Uint8Array.of(0x01);
+  var _maxDrbgIters = 1000;
+  // Step B, Step C: set hashLen to 8*ceil(hlen/8).
+  // Minimal non-full-spec HMAC-DRBG from NIST 800-90 for RFC6979 signatures.
+  var v = u8n(hashLen);
+  // Steps B and C of RFC6979 3.2.
+  var k = u8n(hashLen);
+  var i = 0; // Iterations counter, will throw when over 1000
+  var reset = () => {
+    v.fill(1);
+    k.fill(0);
+    i = 0;
+  };
+  // hmac(k)(v, ...values)
+  var h = function h() {
+    for (var _len = arguments.length, msgs = new Array(_len), _key = 0; _key < _len; _key++) {
+      msgs[_key] = arguments[_key];
+    }
+    return hmacFn(k, concatBytes(v, ...msgs));
+  };
+  var reseed = function reseed() {
+    var seed = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : NULL;
+    // HMAC-DRBG reseed() function. Steps D-G
+    k = h(byte0, seed); // k = hmac(k || v || 0x00 || seed)
+    v = h(); // v = hmac(k || v)
+    if (seed.length === 0) return;
+    k = h(byte1, seed); // k = hmac(k || v || 0x01 || seed)
+    v = h(); // v = hmac(k || v)
+  };
+  var gen = () => {
+    // HMAC-DRBG generate() function
+    if (i++ >= _maxDrbgIters) throw new Error('drbg: tried max amount of iterations');
+    var len = 0;
+    var out = [];
+    while (len < qByteLen) {
+      v = h();
+      var sl = v.slice();
+      out.push(sl);
+      len += v.length;
+    }
+    return concatBytes(...out);
+  };
+  var genUntil = (seed, pred) => {
+    reset();
+    reseed(seed); // Steps D-G
+    var res = undefined; // Step H: grind until the predicate accepts a candidate.
+    // Falsy values like 0 are valid outputs.
+    while ((res = pred(gen())) === undefined) reseed();
+    reset();
+    return res;
+  };
+  return genUntil;
+}
+/**
+ * Validates declared required and optional field types on a plain object.
+ * Extra keys are intentionally ignored because many callers validate only the subset they use from
+ * richer option bags or runtime objects.
+ * @param object - Object to validate.
+ * @param fields - Required field types.
+ * @param optFields - Optional field types.
+ * @throws On wrong argument types. {@link TypeError}
+ * @example
+ * Check user options before building a curve helper.
+ *
+ * ```ts
+ * validateObject({ flag: true }, { flag: 'boolean' });
+ * ```
+ */
+function validateObject(object) {
+  var fields = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : {};
+  var optFields = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : {};
+  if (Object.prototype.toString.call(object) !== '[object Object]') throw new TypeError('expected valid options object');
+  function checkField(fieldName, expectedType, isOpt) {
+    // Config/data fields must be explicit own properties, but runtime objects such as Field
+    // instances intentionally satisfy required method slots via their shared prototype.
+    if (!isOpt && expectedType !== 'function' && !Object.hasOwn(object, fieldName)) throw new TypeError("param \"".concat(fieldName, "\" is invalid: expected own property"));
+    var val = object[fieldName];
+    if (isOpt && val === undefined) return;
+    var current = typeof val;
+    if (current !== expectedType || val === null) throw new TypeError("param \"".concat(fieldName, "\" is invalid: expected ").concat(expectedType, ", got ").concat(current));
+  }
+  var iter = (f, isOpt) => Object.entries(f).forEach(_ref => {
+    var _ref2 = _slicedToArray(_ref, 2),
+      k = _ref2[0],
+      v = _ref2[1];
+    return checkField(k, v, isOpt);
+  });
+  iter(fields, false);
+  iter(optFields, true);
+}
+/**
+ * Throws not implemented error.
+ * @returns Never returns.
+ * @throws If the unfinished code path is reached. {@link Error}
+ * @example
+ * Surface the placeholder error from an unfinished code path.
+ *
+ * ```ts
+ * try {
+ *   notImplemented();
+ * } catch {}
+ * ```
+ */
+var notImplemented = () => {
+  throw new Error('not implemented');
+};
+
+/***/ }),
+
+/***/ "./src/onlykey-fido2/onlykey/vendor/@noble/hashes/_md.js":
+/*!***************************************************************!*\
+  !*** ./src/onlykey-fido2/onlykey/vendor/@noble/hashes/_md.js ***!
+  \***************************************************************/
+/*! exports provided: Chi, Maj, HashMD, SHA256_IV, SHA224_IV, SHA384_IV, SHA512_IV */
+/***/ (function(module, __webpack_exports__, __webpack_require__) {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "Chi", function() { return Chi; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "Maj", function() { return Maj; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "HashMD", function() { return HashMD; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "SHA256_IV", function() { return SHA256_IV; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "SHA224_IV", function() { return SHA224_IV; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "SHA384_IV", function() { return SHA384_IV; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "SHA512_IV", function() { return SHA512_IV; });
+/* harmony import */ var _utils_js__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! ./utils.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/hashes/utils.js");
+function _defineProperty(e, r, t) { return (r = _toPropertyKey(r)) in e ? Object.defineProperty(e, r, { value: t, enumerable: !0, configurable: !0, writable: !0 }) : e[r] = t, e; }
+function _toPropertyKey(t) { var i = _toPrimitive(t, "string"); return "symbol" == typeof i ? i : i + ""; }
+function _toPrimitive(t, r) { if ("object" != typeof t || !t) return t; var e = t[Symbol.toPrimitive]; if (void 0 !== e) { var i = e.call(t, r || "default"); if ("object" != typeof i) return i; throw new TypeError("@@toPrimitive must return a primitive value."); } return ("string" === r ? String : Number)(t); }
+/**
+ * Internal Merkle-Damgard hash utils.
+ * @module
+ */
+
+/**
+ * Shared 32-bit conditional boolean primitive reused by SHA-256, SHA-1, and MD5 `F`.
+ * Returns bits from `b` when `a` is set, otherwise from `c`.
+ * The XOR form is equivalent to MD5's `F(X,Y,Z) = XY v not(X)Z` because the masked terms never
+ * set the same bit.
+ * @param a - selector word
+ * @param b - word chosen when selector bit is set
+ * @param c - word chosen when selector bit is clear
+ * @returns Mixed 32-bit word.
+ * @example
+ * Combine three words with the shared 32-bit choice primitive.
+ * ```ts
+ * Chi(0xffffffff, 0x12345678, 0x87654321);
+ * ```
+ */
+function Chi(a, b, c) {
+  return a & b ^ ~a & c;
+}
+/**
+ * Shared 32-bit majority primitive reused by SHA-256 and SHA-1.
+ * Returns bits shared by at least two inputs.
+ * @param a - first input word
+ * @param b - second input word
+ * @param c - third input word
+ * @returns Mixed 32-bit word.
+ * @example
+ * Combine three words with the shared 32-bit majority primitive.
+ * ```ts
+ * Maj(0xffffffff, 0x12345678, 0x87654321);
+ * ```
+ */
+function Maj(a, b, c) {
+  return a & b ^ a & c ^ b & c;
+}
+/**
+ * Merkle-Damgard hash construction base class.
+ * Could be used to create MD5, RIPEMD, SHA1, SHA2.
+ * Accepts only byte-aligned `Uint8Array` input, even when the underlying spec describes bit
+ * strings with partial-byte tails.
+ * @param blockLen - internal block size in bytes
+ * @param outputLen - digest size in bytes
+ * @param padOffset - trailing length field size in bytes
+ * @param isLE - whether length and state words are encoded in little-endian
+ * @example
+ * Use a concrete subclass to get the shared Merkle-Damgard update/digest flow.
+ * ```ts
+ * import { _SHA1 } from '@noble/hashes/legacy.js';
+ * const hash = new _SHA1();
+ * hash.update(new Uint8Array([97, 98, 99]));
+ * hash.digest();
+ * ```
+ */
+class HashMD {
+  constructor(blockLen, outputLen, padOffset, isLE) {
+    _defineProperty(this, "blockLen", void 0);
+    _defineProperty(this, "outputLen", void 0);
+    _defineProperty(this, "canXOF", false);
+    _defineProperty(this, "padOffset", void 0);
+    _defineProperty(this, "isLE", void 0);
+    // For partial updates less than block size
+    _defineProperty(this, "buffer", void 0);
+    _defineProperty(this, "view", void 0);
+    _defineProperty(this, "finished", false);
+    _defineProperty(this, "length", 0);
+    _defineProperty(this, "pos", 0);
+    _defineProperty(this, "destroyed", false);
+    this.blockLen = blockLen;
+    this.outputLen = outputLen;
+    this.padOffset = padOffset;
+    this.isLE = isLE;
+    this.buffer = new Uint8Array(blockLen);
+    this.view = Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["createView"])(this.buffer);
+  }
+  update(data) {
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["aexists"])(this);
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(data);
+    var view = this.view,
+      buffer = this.buffer,
+      blockLen = this.blockLen;
+    var len = data.length;
+    for (var pos = 0; pos < len;) {
+      var take = Math.min(blockLen - this.pos, len - pos);
+      // Fast path only when there is no buffered partial block: `take === blockLen` implies
+      // `this.pos === 0`, so we can process full blocks directly from the input view.
+      if (take === blockLen) {
+        var dataView = Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["createView"])(data);
+        for (; blockLen <= len - pos; pos += blockLen) this.process(dataView, pos);
+        continue;
+      }
+      buffer.set(data.subarray(pos, pos + take), this.pos);
+      this.pos += take;
+      pos += take;
+      if (this.pos === blockLen) {
+        this.process(view, 0);
+        this.pos = 0;
+      }
+    }
+    this.length += data.length;
+    this.roundClean();
+    return this;
+  }
+  digestInto(out) {
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["aexists"])(this);
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["aoutput"])(out, this);
+    this.finished = true;
+    // Padding
+    // We can avoid allocation of buffer for padding completely if it
+    // was previously not allocated here. But it won't change performance.
+    var buffer = this.buffer,
+      view = this.view,
+      blockLen = this.blockLen,
+      isLE = this.isLE;
+    var pos = this.pos;
+    // append the bit '1' to the message
+    buffer[pos++] = 0b10000000;
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["clean"])(this.buffer.subarray(pos));
+    // we have less than padOffset left in buffer, so we cannot put length in
+    // current block, need process it and pad again
+    if (this.padOffset > blockLen - pos) {
+      this.process(view, 0);
+      pos = 0;
+    }
+    // Pad until full block byte with zeros
+    for (var i = pos; i < blockLen; i++) buffer[i] = 0;
+    // `padOffset` reserves the whole length field. For SHA-384/512 the high 64 bits stay zero from
+    // the padding fill above, and JS will overflow before user input can make that half non-zero.
+    // So we only need to write the low 64 bits here.
+    view.setBigUint64(blockLen - 8, BigInt(this.length * 8), isLE);
+    this.process(view, 0);
+    var oview = Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["createView"])(out);
+    var len = this.outputLen;
+    // NOTE: we do division by 4 later, which must be fused in single op with modulo by JIT
+    if (len % 4) throw new Error('_sha2: outputLen must be aligned to 32bit');
+    var outLen = len / 4;
+    var state = this.get();
+    if (outLen > state.length) throw new Error('_sha2: outputLen bigger than state');
+    for (var _i = 0; _i < outLen; _i++) oview.setUint32(4 * _i, state[_i], isLE);
+  }
+  digest() {
+    var buffer = this.buffer,
+      outputLen = this.outputLen;
+    this.digestInto(buffer);
+    // Copy before destroy(): subclasses wipe `buffer` during cleanup, but `digest()` must return
+    // fresh bytes to the caller.
+    var res = buffer.slice(0, outputLen);
+    this.destroy();
+    return res;
+  }
+  _cloneInto(to) {
+    to || (to = new this.constructor());
+    to.set(...this.get());
+    var blockLen = this.blockLen,
+      buffer = this.buffer,
+      length = this.length,
+      finished = this.finished,
+      destroyed = this.destroyed,
+      pos = this.pos;
+    to.destroyed = destroyed;
+    to.finished = finished;
+    to.length = length;
+    to.pos = pos;
+    // Only partial-block bytes need copying: when `length % blockLen === 0`, `pos === 0` and
+    // later `update()` / `digestInto()` overwrite `to.buffer` from the start before reading it.
+    if (length % blockLen) to.buffer.set(buffer);
+    return to;
+  }
+  clone() {
+    return this._cloneInto();
+  }
+}
+/**
+ * Initial SHA-2 state: fractional parts of square roots of first 16 primes 2..53.
+ * Check out `test/misc/sha2-gen-iv.js` for recomputation guide.
+ */
+/** Initial SHA256 state from RFC 6234 §6.1: the first 32 bits of the fractional parts of the
+ * square roots of the first eight prime numbers. Exported as a shared table; callers must treat
+ * it as read-only because constructors copy words from it by index. */
+var SHA256_IV = /* @__PURE__ */Uint32Array.from([0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19]);
+/** Initial SHA224 state `H(0)` from RFC 6234 §6.1. Exported as a shared table; callers must
+ * treat it as read-only because constructors copy words from it by index. */
+var SHA224_IV = /* @__PURE__ */Uint32Array.from([0xc1059ed8, 0x367cd507, 0x3070dd17, 0xf70e5939, 0xffc00b31, 0x68581511, 0x64f98fa7, 0xbefa4fa4]);
+/** Initial SHA384 state from RFC 6234 §6.3: eight RFC 64-bit `H(0)` words stored as sixteen
+ * big-endian 32-bit halves. Derived from the fractional parts of the square roots of the ninth
+ * through sixteenth prime numbers. Exported as a shared table; callers must treat it as read-only
+ * because constructors copy halves from it by index. */
+var SHA384_IV = /* @__PURE__ */Uint32Array.from([0xcbbb9d5d, 0xc1059ed8, 0x629a292a, 0x367cd507, 0x9159015a, 0x3070dd17, 0x152fecd8, 0xf70e5939, 0x67332667, 0xffc00b31, 0x8eb44a87, 0x68581511, 0xdb0c2e0d, 0x64f98fa7, 0x47b5481d, 0xbefa4fa4]);
+/** Initial SHA512 state from RFC 6234 §6.3: eight RFC 64-bit `H(0)` words stored as sixteen
+ * big-endian 32-bit halves. Derived from the fractional parts of the square roots of the first
+ * eight prime numbers. Exported as a shared table; callers must treat it as read-only because
+ * constructors copy halves from it by index. */
+var SHA512_IV = /* @__PURE__ */Uint32Array.from([0x6a09e667, 0xf3bcc908, 0xbb67ae85, 0x84caa73b, 0x3c6ef372, 0xfe94f82b, 0xa54ff53a, 0x5f1d36f1, 0x510e527f, 0xade682d1, 0x9b05688c, 0x2b3e6c1f, 0x1f83d9ab, 0xfb41bd6b, 0x5be0cd19, 0x137e2179]);
+
+/***/ }),
+
+/***/ "./src/onlykey-fido2/onlykey/vendor/@noble/hashes/_u64.js":
+/*!****************************************************************!*\
+  !*** ./src/onlykey-fido2/onlykey/vendor/@noble/hashes/_u64.js ***!
+  \****************************************************************/
+/*! exports provided: add, add3H, add3L, add4H, add4L, add5H, add5L, fromBig, rotlBH, rotlBL, rotlSH, rotlSL, rotr32H, rotr32L, rotrBH, rotrBL, rotrSH, rotrSL, shrSH, shrSL, split, toBig, default */
+/***/ (function(module, __webpack_exports__, __webpack_require__) {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "add", function() { return add; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "add3H", function() { return add3H; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "add3L", function() { return add3L; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "add4H", function() { return add4H; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "add4L", function() { return add4L; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "add5H", function() { return add5H; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "add5L", function() { return add5L; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "fromBig", function() { return fromBig; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "rotlBH", function() { return rotlBH; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "rotlBL", function() { return rotlBL; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "rotlSH", function() { return rotlSH; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "rotlSL", function() { return rotlSL; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "rotr32H", function() { return rotr32H; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "rotr32L", function() { return rotr32L; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "rotrBH", function() { return rotrBH; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "rotrBL", function() { return rotrBL; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "rotrSH", function() { return rotrSH; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "rotrSL", function() { return rotrSL; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "shrSH", function() { return shrSH; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "shrSL", function() { return shrSL; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "split", function() { return split; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "toBig", function() { return toBig; });
+var U32_MASK64 = /* @__PURE__ */BigInt(2 ** 32 - 1);
+var _32n = /* @__PURE__ */BigInt(32);
+// Split bigint into two 32-bit halves. With `le=true`, returned fields become `{ h: low, l: high
+// }` to match little-endian word order rather than the property names.
+function fromBig(n) {
+  var le = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : false;
+  if (le) return {
+    h: Number(n & U32_MASK64),
+    l: Number(n >> _32n & U32_MASK64)
+  };
+  return {
+    h: Number(n >> _32n & U32_MASK64) | 0,
+    l: Number(n & U32_MASK64) | 0
+  };
+}
+// Split bigint list into `[highWords, lowWords]` when `le=false`; with `le=true`, the first array
+// holds the low halves because `fromBig(...)` swaps the semantic meaning of `h` and `l`.
+function split(lst) {
+  var le = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : false;
+  var len = lst.length;
+  var Ah = new Uint32Array(len);
+  var Al = new Uint32Array(len);
+  for (var i = 0; i < len; i++) {
+    var _fromBig = fromBig(lst[i], le),
+      h = _fromBig.h,
+      l = _fromBig.l;
+    var _ref = [h, l];
+    Ah[i] = _ref[0];
+    Al[i] = _ref[1];
+  }
+  return [Ah, Al];
+}
+// Combine explicit `(high, low)` 32-bit halves into a bigint; `>>> 0` normalizes signed JS
+// bitwise results back to uint32 first, and little-endian callers must swap.
+var toBig = (h, l) => BigInt(h >>> 0) << _32n | BigInt(l >>> 0);
+// High 32-bit half of a 64-bit logical right shift for `s` in `0..31`.
+var shrSH = (h, _l, s) => h >>> s;
+// Low 32-bit half of a 64-bit logical right shift, valid for `s` in `1..31`.
+var shrSL = (h, l, s) => h << 32 - s | l >>> s;
+// High 32-bit half of a 64-bit right rotate, valid for `s` in `1..31`.
+var rotrSH = (h, l, s) => h >>> s | l << 32 - s;
+// Low 32-bit half of a 64-bit right rotate, valid for `s` in `1..31`.
+var rotrSL = (h, l, s) => h << 32 - s | l >>> s;
+// High 32-bit half of a 64-bit right rotate, valid for `s` in `33..63`; `32` uses `rotr32*`.
+var rotrBH = (h, l, s) => h << 64 - s | l >>> s - 32;
+// Low 32-bit half of a 64-bit right rotate, valid for `s` in `33..63`; `32` uses `rotr32*`.
+var rotrBL = (h, l, s) => h >>> s - 32 | l << 64 - s;
+// High 32-bit half of a 64-bit right rotate for `s === 32`; this is just the swapped low half.
+var rotr32H = (_h, l) => l;
+// Low 32-bit half of a 64-bit right rotate for `s === 32`; this is just the swapped high half.
+var rotr32L = (h, _l) => h;
+// High 32-bit half of a 64-bit left rotate, valid for `s` in `1..31`.
+var rotlSH = (h, l, s) => h << s | l >>> 32 - s;
+// Low 32-bit half of a 64-bit left rotate, valid for `s` in `1..31`.
+var rotlSL = (h, l, s) => l << s | h >>> 32 - s;
+// High 32-bit half of a 64-bit left rotate, valid for `s` in `33..63`; `32` uses `rotr32*`.
+var rotlBH = (h, l, s) => l << s - 32 | h >>> 64 - s;
+// Low 32-bit half of a 64-bit left rotate, valid for `s` in `33..63`; `32` uses `rotr32*`.
+var rotlBL = (h, l, s) => h << s - 32 | l >>> 64 - s;
+// Add two split 64-bit words and return the split `{ h, l }` sum.
+// JS uses 32-bit signed integers for bitwise operations, so we cannot simply shift the carry out
+// of the low sum and instead use division.
+function add(Ah, Al, Bh, Bl) {
+  var l = (Al >>> 0) + (Bl >>> 0);
+  return {
+    h: Ah + Bh + (l / 2 ** 32 | 0) | 0,
+    l: l | 0
+  };
+}
+// Addition with more than 2 elements
+// Unmasked low-word accumulator for 3-way addition; pass the raw result into `add3H(...)`.
+var add3L = (Al, Bl, Cl) => (Al >>> 0) + (Bl >>> 0) + (Cl >>> 0);
+// High-word finalize step for 3-way addition; `low` must be the untruncated output of `add3L(...)`.
+var add3H = (low, Ah, Bh, Ch) => Ah + Bh + Ch + (low / 2 ** 32 | 0) | 0;
+// Unmasked low-word accumulator for 4-way addition; pass the raw result into `add4H(...)`.
+var add4L = (Al, Bl, Cl, Dl) => (Al >>> 0) + (Bl >>> 0) + (Cl >>> 0) + (Dl >>> 0);
+// High-word finalize step for 4-way addition; `low` must be the untruncated output of `add4L(...)`.
+var add4H = (low, Ah, Bh, Ch, Dh) => Ah + Bh + Ch + Dh + (low / 2 ** 32 | 0) | 0;
+// Unmasked low-word accumulator for 5-way addition; pass the raw result into `add5H(...)`.
+var add5L = (Al, Bl, Cl, Dl, El) => (Al >>> 0) + (Bl >>> 0) + (Cl >>> 0) + (Dl >>> 0) + (El >>> 0);
+// High-word finalize step for 5-way addition; `low` must be the untruncated output of `add5L(...)`.
+var add5H = (low, Ah, Bh, Ch, Dh, Eh) => Ah + Bh + Ch + Dh + Eh + (low / 2 ** 32 | 0) | 0;
+// prettier-ignore
+
+// Canonical grouped namespace for callers that prefer one object.
+// Named exports stay for direct imports.
+// prettier-ignore
+var u64 = {
+  fromBig,
+  split,
+  toBig,
+  shrSH,
+  shrSL,
+  rotrSH,
+  rotrSL,
+  rotrBH,
+  rotrBL,
+  rotr32H,
+  rotr32L,
+  rotlSH,
+  rotlSL,
+  rotlBH,
+  rotlBL,
+  add,
+  add3L,
+  add3H,
+  add4L,
+  add4H,
+  add5H,
+  add5L
+};
+// Default export mirrors named `u64` for compatibility with object-style imports.
+/* harmony default export */ __webpack_exports__["default"] = (u64);
+
+/***/ }),
+
+/***/ "./src/onlykey-fido2/onlykey/vendor/@noble/hashes/hkdf.js":
+/*!****************************************************************!*\
+  !*** ./src/onlykey-fido2/onlykey/vendor/@noble/hashes/hkdf.js ***!
+  \****************************************************************/
+/*! exports provided: extract, expand, hkdf */
+/***/ (function(module, __webpack_exports__, __webpack_require__) {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "extract", function() { return extract; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "expand", function() { return expand; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "hkdf", function() { return hkdf; });
+/* harmony import */ var _hmac_js__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! ./hmac.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/hashes/hmac.js");
+/* harmony import */ var _utils_js__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(/*! ./utils.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/hashes/utils.js");
+/**
+ * HKDF (RFC 5869): extract + expand in one step.
+ * See {@link https://soatok.blog/2021/11/17/understanding-hkdf/}.
+ * @module
+ */
+
+
+/**
+ * HKDF-extract from spec. Less important part. `HKDF-Extract(IKM, salt) -> PRK`
+ * Arguments position differs from spec (IKM is first one, since it is not optional)
+ * Local validation only checks `hash`; `ikm` / `salt` byte validation is delegated to `hmac()`.
+ * @param hash - hash function that would be used (e.g. sha256)
+ * @param ikm - input keying material, the initial key
+ * @param salt - optional salt value (a non-secret random value)
+ * @returns Pseudorandom key derived from input keying material.
+ * @example
+ * Run the HKDF extract step.
+ * ```ts
+ * import { extract } from '@noble/hashes/hkdf.js';
+ * import { sha256 } from '@noble/hashes/sha2.js';
+ * extract(sha256, new Uint8Array([1, 2, 3]), new Uint8Array([4, 5, 6]));
+ * ```
+ */
+function extract(hash, ikm, salt) {
+  Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["ahash"])(hash);
+  // NOTE: some libraries treat zero-length array as 'not provided';
+  // we don't, since we have undefined as 'not provided'
+  // https://github.com/RustCrypto/KDFs/issues/15
+  if (salt === undefined) salt = new Uint8Array(hash.outputLen);
+  return Object(_hmac_js__WEBPACK_IMPORTED_MODULE_0__["hmac"])(hash, salt, ikm);
+}
+// Shared mutable scratch byte for the RFC 5869 block counter `N`.
+// Safe to reuse because `expand()` is synchronous and resets it with `clean(...)` before returning.
+var HKDF_COUNTER = /* @__PURE__ */Uint8Array.of(0);
+// Shared RFC 5869 empty string for both `info === undefined` and the first-block `T(0)` input.
+var EMPTY_BUFFER = /* @__PURE__ */Uint8Array.of();
+/**
+ * HKDF-expand from the spec. The most important part. `HKDF-Expand(PRK, info, L) -> OKM`
+ * @param hash - hash function that would be used (e.g. sha256)
+ * @param prk - a pseudorandom key of at least HashLen octets
+ *   (usually, the output from the extract step)
+ * @param info - optional context and application specific information (can be a zero-length string)
+ * @param length - length of output keying material in bytes.
+ *   RFC 5869 §2.3 allows `0..255*HashLen`, so `0` returns an empty OKM.
+ * @returns Output keying material with the requested length.
+ * @throws If the requested output length exceeds the HKDF limit
+ *   for the selected hash. {@link Error}
+ * @example
+ * Run the HKDF expand step.
+ * ```ts
+ * import { expand } from '@noble/hashes/hkdf.js';
+ * import { sha256 } from '@noble/hashes/sha2.js';
+ * expand(sha256, new Uint8Array(32), new Uint8Array([1, 2, 3]), 16);
+ * ```
+ */
+function expand(hash, prk, info) {
+  var length = arguments.length > 3 && arguments[3] !== undefined ? arguments[3] : 32;
+  Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["ahash"])(hash);
+  Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["anumber"])(length, 'length');
+  Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["abytes"])(prk, undefined, 'prk');
+  var olen = hash.outputLen;
+  // RFC 5869 §2.3: PRK is "a pseudorandom key of at least HashLen octets".
+  if (prk.length < olen) throw new Error('"prk" must be at least HashLen octets');
+  // RFC 5869 §2.3 only bounds `L` by `<= 255*HashLen`; `L=0` is valid and yields empty OKM.
+  if (length > 255 * olen) throw new Error('Length must be <= 255*HashLen');
+  var blocks = Math.ceil(length / olen);
+  if (info === undefined) info = EMPTY_BUFFER;else Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["abytes"])(info, undefined, 'info');
+  // first L(ength) octets of T
+  var okm = new Uint8Array(blocks * olen);
+  // Re-use HMAC instance between blocks
+  var HMAC = _hmac_js__WEBPACK_IMPORTED_MODULE_0__["hmac"].create(hash, prk);
+  var HMACTmp = HMAC._cloneInto();
+  var T = new Uint8Array(HMAC.outputLen);
+  for (var counter = 0; counter < blocks; counter++) {
+    HKDF_COUNTER[0] = counter + 1;
+    // T(0) = empty string (zero length)
+    // T(N) = HMAC-Hash(PRK, T(N-1) | info | N)
+    HMACTmp.update(counter === 0 ? EMPTY_BUFFER : T).update(info).update(HKDF_COUNTER).digestInto(T);
+    okm.set(T, olen * counter);
+    HMAC._cloneInto(HMACTmp);
+  }
+  HMAC.destroy();
+  HMACTmp.destroy();
+  Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["clean"])(T, HKDF_COUNTER);
+  return okm.slice(0, length);
+}
+/**
+ * HKDF (RFC 5869): derive keys from an initial input.
+ * Combines hkdf_extract + hkdf_expand in one step
+ * @param hash - hash function that would be used (e.g. sha256)
+ * @param ikm - input keying material, the initial key
+ * @param salt - optional salt value (a non-secret random value)
+ * @param info - optional context and application specific information bytes
+ * @param length - length of output keying material in bytes.
+ *   RFC 5869 §2.3 allows `0..255*HashLen`, so `0` returns an empty OKM.
+ * @returns Output keying material derived from the input key.
+ * @throws If the requested output length exceeds the HKDF limit
+ *   for the selected hash. {@link Error}
+ * @example
+ * HKDF (RFC 5869): derive keys from an initial input.
+ * ```ts
+ * import { hkdf } from '@noble/hashes/hkdf.js';
+ * import { sha256 } from '@noble/hashes/sha2.js';
+ * import { randomBytes, utf8ToBytes } from '@noble/hashes/utils.js';
+ * const inputKey = randomBytes(32);
+ * const salt = randomBytes(32);
+ * const info = utf8ToBytes('application-key');
+ * const okm = hkdf(sha256, inputKey, salt, info, 32);
+ * ```
+ */
+var hkdf = (hash, ikm, salt, info, length) => expand(hash, extract(hash, ikm, salt), info, length);
+
+/***/ }),
+
+/***/ "./src/onlykey-fido2/onlykey/vendor/@noble/hashes/hmac.js":
+/*!****************************************************************!*\
+  !*** ./src/onlykey-fido2/onlykey/vendor/@noble/hashes/hmac.js ***!
+  \****************************************************************/
+/*! exports provided: _HMAC, hmac */
+/***/ (function(module, __webpack_exports__, __webpack_require__) {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "_HMAC", function() { return _HMAC; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "hmac", function() { return hmac; });
+/* harmony import */ var _utils_js__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! ./utils.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/hashes/utils.js");
+function _defineProperty(e, r, t) { return (r = _toPropertyKey(r)) in e ? Object.defineProperty(e, r, { value: t, enumerable: !0, configurable: !0, writable: !0 }) : e[r] = t, e; }
+function _toPropertyKey(t) { var i = _toPrimitive(t, "string"); return "symbol" == typeof i ? i : i + ""; }
+function _toPrimitive(t, r) { if ("object" != typeof t || !t) return t; var e = t[Symbol.toPrimitive]; if (void 0 !== e) { var i = e.call(t, r || "default"); if ("object" != typeof i) return i; throw new TypeError("@@toPrimitive must return a primitive value."); } return ("string" === r ? String : Number)(t); }
+/**
+ * HMAC: RFC2104 message authentication code.
+ * @module
+ */
+
+/**
+ * Internal class for HMAC.
+ * Accepts any byte key, although RFC 2104 §3 recommends keys at least
+ * `HashLen` bytes long.
+ */
+class _HMAC {
+  constructor(hash, key) {
+    _defineProperty(this, "oHash", void 0);
+    _defineProperty(this, "iHash", void 0);
+    _defineProperty(this, "blockLen", void 0);
+    _defineProperty(this, "outputLen", void 0);
+    _defineProperty(this, "canXOF", false);
+    _defineProperty(this, "finished", false);
+    _defineProperty(this, "destroyed", false);
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["ahash"])(hash);
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(key, undefined, 'key');
+    this.iHash = hash.create();
+    if (typeof this.iHash.update !== 'function') throw new Error('Expected instance of class which extends utils.Hash');
+    this.blockLen = this.iHash.blockLen;
+    this.outputLen = this.iHash.outputLen;
+    var blockLen = this.blockLen;
+    var pad = new Uint8Array(blockLen);
+    // blockLen can be bigger than outputLen
+    pad.set(key.length > blockLen ? hash.create().update(key).digest() : key);
+    for (var i = 0; i < pad.length; i++) pad[i] ^= 0x36;
+    this.iHash.update(pad);
+    // By doing update (processing of the first block) of the outer hash here,
+    // we can re-use it between multiple calls via clone.
+    this.oHash = hash.create();
+    // Undo internal XOR && apply outer XOR
+    for (var _i = 0; _i < pad.length; _i++) pad[_i] ^= 0x36 ^ 0x5c;
+    this.oHash.update(pad);
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["clean"])(pad);
+  }
+  update(buf) {
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["aexists"])(this);
+    this.iHash.update(buf);
+    return this;
+  }
+  digestInto(out) {
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["aexists"])(this);
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_0__["aoutput"])(out, this);
+    this.finished = true;
+    var buf = out.subarray(0, this.outputLen);
+    // Reuse the first outputLen bytes for the inner digest; the outer hash consumes them before
+    // overwriting that same prefix with the final tag, leaving any oversized tail untouched.
+    this.iHash.digestInto(buf);
+    this.oHash.update(buf);
+    this.oHash.digestInto(buf);
+    this.destroy();
+  }
+  digest() {
+    var out = new Uint8Array(this.oHash.outputLen);
+    this.digestInto(out);
+    return out;
+  }
+  _cloneInto(to) {
+    // Create new instance without calling constructor since the key
+    // is already in state and we don't know it.
+    to || (to = Object.create(Object.getPrototypeOf(this), {}));
+    var oHash = this.oHash,
+      iHash = this.iHash,
+      finished = this.finished,
+      destroyed = this.destroyed,
+      blockLen = this.blockLen,
+      outputLen = this.outputLen;
+    to = to;
+    to.finished = finished;
+    to.destroyed = destroyed;
+    to.blockLen = blockLen;
+    to.outputLen = outputLen;
+    to.oHash = oHash._cloneInto(to.oHash);
+    to.iHash = iHash._cloneInto(to.iHash);
+    return to;
+  }
+  clone() {
+    return this._cloneInto();
+  }
+  destroy() {
+    this.destroyed = true;
+    this.oHash.destroy();
+    this.iHash.destroy();
+  }
+}
+var hmac = /* @__PURE__ */(() => {
+  var hmac_ = (hash, key, message) => new _HMAC(hash, key).update(message).digest();
+  hmac_.create = (hash, key) => new _HMAC(hash, key);
+  return hmac_;
+})();
+
+/***/ }),
+
+/***/ "./src/onlykey-fido2/onlykey/vendor/@noble/hashes/sha2.js":
+/*!****************************************************************!*\
+  !*** ./src/onlykey-fido2/onlykey/vendor/@noble/hashes/sha2.js ***!
+  \****************************************************************/
+/*! exports provided: _SHA256, _SHA224, _SHA512, _SHA384, _SHA512_224, _SHA512_256, sha256, sha224, sha512, sha384, sha512_256, sha512_224 */
+/***/ (function(module, __webpack_exports__, __webpack_require__) {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "_SHA256", function() { return _SHA256; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "_SHA224", function() { return _SHA224; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "_SHA512", function() { return _SHA512; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "_SHA384", function() { return _SHA384; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "_SHA512_224", function() { return _SHA512_224; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "_SHA512_256", function() { return _SHA512_256; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "sha256", function() { return sha256; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "sha224", function() { return sha224; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "sha512", function() { return sha512; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "sha384", function() { return sha384; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "sha512_256", function() { return sha512_256; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "sha512_224", function() { return sha512_224; });
+/* harmony import */ var _md_js__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! ./_md.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/hashes/_md.js");
+/* harmony import */ var _u64_js__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(/*! ./_u64.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/hashes/_u64.js");
+/* harmony import */ var _utils_js__WEBPACK_IMPORTED_MODULE_2__ = __webpack_require__(/*! ./utils.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/hashes/utils.js");
+function _defineProperty(e, r, t) { return (r = _toPropertyKey(r)) in e ? Object.defineProperty(e, r, { value: t, enumerable: !0, configurable: !0, writable: !0 }) : e[r] = t, e; }
+function _toPropertyKey(t) { var i = _toPrimitive(t, "string"); return "symbol" == typeof i ? i : i + ""; }
+function _toPrimitive(t, r) { if ("object" != typeof t || !t) return t; var e = t[Symbol.toPrimitive]; if (void 0 !== e) { var i = e.call(t, r || "default"); if ("object" != typeof i) return i; throw new TypeError("@@toPrimitive must return a primitive value."); } return ("string" === r ? String : Number)(t); }
+/**
+ * SHA2 hash function. A.k.a. sha256, sha384, sha512, sha512_224, sha512_256.
+ * SHA256 is the fastest hash implementable in JS, even faster than Blake3.
+ * Check out {@link https://www.rfc-editor.org/rfc/rfc4634 | RFC 4634} and
+ * {@link https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.180-4.pdf | FIPS 180-4}.
+ * @module
+ */
+
+
+
+/**
+ * SHA-224 / SHA-256 round constants from RFC 6234 §5.1: the first 32 bits
+ * of the cube roots of the first 64 primes (2..311).
+ */
+// prettier-ignore
+var SHA256_K = /* @__PURE__ */Uint32Array.from([0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2]);
+/** Reusable SHA-224 / SHA-256 message schedule buffer `W_t` from RFC 6234 §6.2 step 1. */
+var SHA256_W = /* @__PURE__ */new Uint32Array(64);
+/** Internal SHA-224 / SHA-256 compression engine from RFC 6234 §6.2. */
+class SHA2_32B extends _md_js__WEBPACK_IMPORTED_MODULE_0__["HashMD"] {
+  constructor(outputLen) {
+    super(64, outputLen, 8, false);
+  }
+  get() {
+    var A = this.A,
+      B = this.B,
+      C = this.C,
+      D = this.D,
+      E = this.E,
+      F = this.F,
+      G = this.G,
+      H = this.H;
+    return [A, B, C, D, E, F, G, H];
+  }
+  // prettier-ignore
+  set(A, B, C, D, E, F, G, H) {
+    this.A = A | 0;
+    this.B = B | 0;
+    this.C = C | 0;
+    this.D = D | 0;
+    this.E = E | 0;
+    this.F = F | 0;
+    this.G = G | 0;
+    this.H = H | 0;
+  }
+  process(view, offset) {
+    // Extend the first 16 words into the remaining 48 words w[16..63] of the message schedule array
+    for (var i = 0; i < 16; i++, offset += 4) SHA256_W[i] = view.getUint32(offset, false);
+    for (var _i = 16; _i < 64; _i++) {
+      var W15 = SHA256_W[_i - 15];
+      var W2 = SHA256_W[_i - 2];
+      var s0 = Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["rotr"])(W15, 7) ^ Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["rotr"])(W15, 18) ^ W15 >>> 3;
+      var s1 = Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["rotr"])(W2, 17) ^ Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["rotr"])(W2, 19) ^ W2 >>> 10;
+      SHA256_W[_i] = s1 + SHA256_W[_i - 7] + s0 + SHA256_W[_i - 16] | 0;
+    }
+    // Compression function main loop, 64 rounds
+    var A = this.A,
+      B = this.B,
+      C = this.C,
+      D = this.D,
+      E = this.E,
+      F = this.F,
+      G = this.G,
+      H = this.H;
+    for (var _i2 = 0; _i2 < 64; _i2++) {
+      var sigma1 = Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["rotr"])(E, 6) ^ Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["rotr"])(E, 11) ^ Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["rotr"])(E, 25);
+      var T1 = H + sigma1 + Object(_md_js__WEBPACK_IMPORTED_MODULE_0__["Chi"])(E, F, G) + SHA256_K[_i2] + SHA256_W[_i2] | 0;
+      var sigma0 = Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["rotr"])(A, 2) ^ Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["rotr"])(A, 13) ^ Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["rotr"])(A, 22);
+      var T2 = sigma0 + Object(_md_js__WEBPACK_IMPORTED_MODULE_0__["Maj"])(A, B, C) | 0;
+      H = G;
+      G = F;
+      F = E;
+      E = D + T1 | 0;
+      D = C;
+      C = B;
+      B = A;
+      A = T1 + T2 | 0;
+    }
+    // Add the compressed chunk to the current hash value
+    A = A + this.A | 0;
+    B = B + this.B | 0;
+    C = C + this.C | 0;
+    D = D + this.D | 0;
+    E = E + this.E | 0;
+    F = F + this.F | 0;
+    G = G + this.G | 0;
+    H = H + this.H | 0;
+    this.set(A, B, C, D, E, F, G, H);
+  }
+  roundClean() {
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["clean"])(SHA256_W);
+  }
+  destroy() {
+    // HashMD callers route post-destroy usability through `destroyed`; zeroizing alone still leaves
+    // update()/digest() callable on reused instances.
+    this.destroyed = true;
+    this.set(0, 0, 0, 0, 0, 0, 0, 0);
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["clean"])(this.buffer);
+  }
+}
+/** Internal SHA-256 hash class grounded in RFC 6234 §6.2. */
+class _SHA256 extends SHA2_32B {
+  constructor() {
+    super(32);
+    // We cannot use array here since array allows indexing by variable
+    // which means optimizer/compiler cannot use registers.
+    _defineProperty(this, "A", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA256_IV"][0] | 0);
+    _defineProperty(this, "B", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA256_IV"][1] | 0);
+    _defineProperty(this, "C", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA256_IV"][2] | 0);
+    _defineProperty(this, "D", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA256_IV"][3] | 0);
+    _defineProperty(this, "E", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA256_IV"][4] | 0);
+    _defineProperty(this, "F", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA256_IV"][5] | 0);
+    _defineProperty(this, "G", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA256_IV"][6] | 0);
+    _defineProperty(this, "H", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA256_IV"][7] | 0);
+  }
+}
+/** Internal SHA-224 hash class grounded in RFC 6234 §6.2 and §8.5. */
+class _SHA224 extends SHA2_32B {
+  constructor() {
+    super(28);
+    _defineProperty(this, "A", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA224_IV"][0] | 0);
+    _defineProperty(this, "B", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA224_IV"][1] | 0);
+    _defineProperty(this, "C", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA224_IV"][2] | 0);
+    _defineProperty(this, "D", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA224_IV"][3] | 0);
+    _defineProperty(this, "E", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA224_IV"][4] | 0);
+    _defineProperty(this, "F", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA224_IV"][5] | 0);
+    _defineProperty(this, "G", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA224_IV"][6] | 0);
+    _defineProperty(this, "H", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA224_IV"][7] | 0);
+  }
+}
+// SHA2-512 is slower than sha256 in js because u64 operations are slow.
+// SHA-384 / SHA-512 round constants from RFC 6234 §5.2:
+// 80 full 64-bit words split into high/low halves.
+// prettier-ignore
+var K512 = /* @__PURE__ */(() => _u64_js__WEBPACK_IMPORTED_MODULE_1__["split"](['0x428a2f98d728ae22', '0x7137449123ef65cd', '0xb5c0fbcfec4d3b2f', '0xe9b5dba58189dbbc', '0x3956c25bf348b538', '0x59f111f1b605d019', '0x923f82a4af194f9b', '0xab1c5ed5da6d8118', '0xd807aa98a3030242', '0x12835b0145706fbe', '0x243185be4ee4b28c', '0x550c7dc3d5ffb4e2', '0x72be5d74f27b896f', '0x80deb1fe3b1696b1', '0x9bdc06a725c71235', '0xc19bf174cf692694', '0xe49b69c19ef14ad2', '0xefbe4786384f25e3', '0x0fc19dc68b8cd5b5', '0x240ca1cc77ac9c65', '0x2de92c6f592b0275', '0x4a7484aa6ea6e483', '0x5cb0a9dcbd41fbd4', '0x76f988da831153b5', '0x983e5152ee66dfab', '0xa831c66d2db43210', '0xb00327c898fb213f', '0xbf597fc7beef0ee4', '0xc6e00bf33da88fc2', '0xd5a79147930aa725', '0x06ca6351e003826f', '0x142929670a0e6e70', '0x27b70a8546d22ffc', '0x2e1b21385c26c926', '0x4d2c6dfc5ac42aed', '0x53380d139d95b3df', '0x650a73548baf63de', '0x766a0abb3c77b2a8', '0x81c2c92e47edaee6', '0x92722c851482353b', '0xa2bfe8a14cf10364', '0xa81a664bbc423001', '0xc24b8b70d0f89791', '0xc76c51a30654be30', '0xd192e819d6ef5218', '0xd69906245565a910', '0xf40e35855771202a', '0x106aa07032bbd1b8', '0x19a4c116b8d2d0c8', '0x1e376c085141ab53', '0x2748774cdf8eeb99', '0x34b0bcb5e19b48a8', '0x391c0cb3c5c95a63', '0x4ed8aa4ae3418acb', '0x5b9cca4f7763e373', '0x682e6ff3d6b2b8a3', '0x748f82ee5defb2fc', '0x78a5636f43172f60', '0x84c87814a1f0ab72', '0x8cc702081a6439ec', '0x90befffa23631e28', '0xa4506cebde82bde9', '0xbef9a3f7b2c67915', '0xc67178f2e372532b', '0xca273eceea26619c', '0xd186b8c721c0c207', '0xeada7dd6cde0eb1e', '0xf57d4f7fee6ed178', '0x06f067aa72176fba', '0x0a637dc5a2c898a6', '0x113f9804bef90dae', '0x1b710b35131c471b', '0x28db77f523047d84', '0x32caab7b40c72493', '0x3c9ebe0a15c9bebc', '0x431d67c49c100d4c', '0x4cc5d4becb3e42b6', '0x597f299cfc657e2a', '0x5fcb6fab3ad6faec', '0x6c44198c4a475817'].map(n => BigInt(n))))();
+var SHA512_Kh = /* @__PURE__ */(() => K512[0])();
+var SHA512_Kl = /* @__PURE__ */(() => K512[1])();
+// Reusable high-half schedule buffer for the RFC 6234 §6.4 64-bit `W_t` words.
+var SHA512_W_H = /* @__PURE__ */new Uint32Array(80);
+// Reusable low-half schedule buffer for the RFC 6234 §6.4 64-bit `W_t` words.
+var SHA512_W_L = /* @__PURE__ */new Uint32Array(80);
+/** Internal SHA-384 / SHA-512 compression engine from RFC 6234 §6.4. */
+class SHA2_64B extends _md_js__WEBPACK_IMPORTED_MODULE_0__["HashMD"] {
+  constructor(outputLen) {
+    super(128, outputLen, 16, false);
+  }
+  // prettier-ignore
+  get() {
+    var Ah = this.Ah,
+      Al = this.Al,
+      Bh = this.Bh,
+      Bl = this.Bl,
+      Ch = this.Ch,
+      Cl = this.Cl,
+      Dh = this.Dh,
+      Dl = this.Dl,
+      Eh = this.Eh,
+      El = this.El,
+      Fh = this.Fh,
+      Fl = this.Fl,
+      Gh = this.Gh,
+      Gl = this.Gl,
+      Hh = this.Hh,
+      Hl = this.Hl;
+    return [Ah, Al, Bh, Bl, Ch, Cl, Dh, Dl, Eh, El, Fh, Fl, Gh, Gl, Hh, Hl];
+  }
+  // prettier-ignore
+  set(Ah, Al, Bh, Bl, Ch, Cl, Dh, Dl, Eh, El, Fh, Fl, Gh, Gl, Hh, Hl) {
+    this.Ah = Ah | 0;
+    this.Al = Al | 0;
+    this.Bh = Bh | 0;
+    this.Bl = Bl | 0;
+    this.Ch = Ch | 0;
+    this.Cl = Cl | 0;
+    this.Dh = Dh | 0;
+    this.Dl = Dl | 0;
+    this.Eh = Eh | 0;
+    this.El = El | 0;
+    this.Fh = Fh | 0;
+    this.Fl = Fl | 0;
+    this.Gh = Gh | 0;
+    this.Gl = Gl | 0;
+    this.Hh = Hh | 0;
+    this.Hl = Hl | 0;
+  }
+  process(view, offset) {
+    // Extend the first 16 words into the remaining 64 words w[16..79] of the message schedule array
+    for (var i = 0; i < 16; i++, offset += 4) {
+      SHA512_W_H[i] = view.getUint32(offset);
+      SHA512_W_L[i] = view.getUint32(offset += 4);
+    }
+    for (var _i3 = 16; _i3 < 80; _i3++) {
+      // s0 := (w[i-15] rightrotate 1) xor (w[i-15] rightrotate 8) xor (w[i-15] rightshift 7)
+      var W15h = SHA512_W_H[_i3 - 15] | 0;
+      var W15l = SHA512_W_L[_i3 - 15] | 0;
+      var s0h = _u64_js__WEBPACK_IMPORTED_MODULE_1__["rotrSH"](W15h, W15l, 1) ^ _u64_js__WEBPACK_IMPORTED_MODULE_1__["rotrSH"](W15h, W15l, 8) ^ _u64_js__WEBPACK_IMPORTED_MODULE_1__["shrSH"](W15h, W15l, 7);
+      var s0l = _u64_js__WEBPACK_IMPORTED_MODULE_1__["rotrSL"](W15h, W15l, 1) ^ _u64_js__WEBPACK_IMPORTED_MODULE_1__["rotrSL"](W15h, W15l, 8) ^ _u64_js__WEBPACK_IMPORTED_MODULE_1__["shrSL"](W15h, W15l, 7);
+      // s1 := (w[i-2] rightrotate 19) xor (w[i-2] rightrotate 61) xor (w[i-2] rightshift 6)
+      var W2h = SHA512_W_H[_i3 - 2] | 0;
+      var W2l = SHA512_W_L[_i3 - 2] | 0;
+      var s1h = _u64_js__WEBPACK_IMPORTED_MODULE_1__["rotrSH"](W2h, W2l, 19) ^ _u64_js__WEBPACK_IMPORTED_MODULE_1__["rotrBH"](W2h, W2l, 61) ^ _u64_js__WEBPACK_IMPORTED_MODULE_1__["shrSH"](W2h, W2l, 6);
+      var s1l = _u64_js__WEBPACK_IMPORTED_MODULE_1__["rotrSL"](W2h, W2l, 19) ^ _u64_js__WEBPACK_IMPORTED_MODULE_1__["rotrBL"](W2h, W2l, 61) ^ _u64_js__WEBPACK_IMPORTED_MODULE_1__["shrSL"](W2h, W2l, 6);
+      // SHA512_W[i] = s0 + s1 + SHA512_W[i - 7] + SHA512_W[i - 16];
+      var SUMl = _u64_js__WEBPACK_IMPORTED_MODULE_1__["add4L"](s0l, s1l, SHA512_W_L[_i3 - 7], SHA512_W_L[_i3 - 16]);
+      var SUMh = _u64_js__WEBPACK_IMPORTED_MODULE_1__["add4H"](SUMl, s0h, s1h, SHA512_W_H[_i3 - 7], SHA512_W_H[_i3 - 16]);
+      SHA512_W_H[_i3] = SUMh | 0;
+      SHA512_W_L[_i3] = SUMl | 0;
+    }
+    var Ah = this.Ah,
+      Al = this.Al,
+      Bh = this.Bh,
+      Bl = this.Bl,
+      Ch = this.Ch,
+      Cl = this.Cl,
+      Dh = this.Dh,
+      Dl = this.Dl,
+      Eh = this.Eh,
+      El = this.El,
+      Fh = this.Fh,
+      Fl = this.Fl,
+      Gh = this.Gh,
+      Gl = this.Gl,
+      Hh = this.Hh,
+      Hl = this.Hl;
+    // Compression function main loop, 80 rounds
+    for (var _i4 = 0; _i4 < 80; _i4++) {
+      // S1 := (e rightrotate 14) xor (e rightrotate 18) xor (e rightrotate 41)
+      var sigma1h = _u64_js__WEBPACK_IMPORTED_MODULE_1__["rotrSH"](Eh, El, 14) ^ _u64_js__WEBPACK_IMPORTED_MODULE_1__["rotrSH"](Eh, El, 18) ^ _u64_js__WEBPACK_IMPORTED_MODULE_1__["rotrBH"](Eh, El, 41);
+      var sigma1l = _u64_js__WEBPACK_IMPORTED_MODULE_1__["rotrSL"](Eh, El, 14) ^ _u64_js__WEBPACK_IMPORTED_MODULE_1__["rotrSL"](Eh, El, 18) ^ _u64_js__WEBPACK_IMPORTED_MODULE_1__["rotrBL"](Eh, El, 41);
+      //const T1 = (H + sigma1 + Chi(E, F, G) + SHA256_K[i] + SHA256_W[i]) | 0;
+      var CHIh = Eh & Fh ^ ~Eh & Gh;
+      var CHIl = El & Fl ^ ~El & Gl;
+      // T1 = H + sigma1 + Chi(E, F, G) + SHA512_K[i] + SHA512_W[i]
+      // prettier-ignore
+      var T1ll = _u64_js__WEBPACK_IMPORTED_MODULE_1__["add5L"](Hl, sigma1l, CHIl, SHA512_Kl[_i4], SHA512_W_L[_i4]);
+      var T1h = _u64_js__WEBPACK_IMPORTED_MODULE_1__["add5H"](T1ll, Hh, sigma1h, CHIh, SHA512_Kh[_i4], SHA512_W_H[_i4]);
+      var T1l = T1ll | 0;
+      // S0 := (a rightrotate 28) xor (a rightrotate 34) xor (a rightrotate 39)
+      var sigma0h = _u64_js__WEBPACK_IMPORTED_MODULE_1__["rotrSH"](Ah, Al, 28) ^ _u64_js__WEBPACK_IMPORTED_MODULE_1__["rotrBH"](Ah, Al, 34) ^ _u64_js__WEBPACK_IMPORTED_MODULE_1__["rotrBH"](Ah, Al, 39);
+      var sigma0l = _u64_js__WEBPACK_IMPORTED_MODULE_1__["rotrSL"](Ah, Al, 28) ^ _u64_js__WEBPACK_IMPORTED_MODULE_1__["rotrBL"](Ah, Al, 34) ^ _u64_js__WEBPACK_IMPORTED_MODULE_1__["rotrBL"](Ah, Al, 39);
+      var MAJh = Ah & Bh ^ Ah & Ch ^ Bh & Ch;
+      var MAJl = Al & Bl ^ Al & Cl ^ Bl & Cl;
+      Hh = Gh | 0;
+      Hl = Gl | 0;
+      Gh = Fh | 0;
+      Gl = Fl | 0;
+      Fh = Eh | 0;
+      Fl = El | 0;
+      var _u64$add = _u64_js__WEBPACK_IMPORTED_MODULE_1__["add"](Dh | 0, Dl | 0, T1h | 0, T1l | 0);
+      Eh = _u64$add.h;
+      El = _u64$add.l;
+      Dh = Ch | 0;
+      Dl = Cl | 0;
+      Ch = Bh | 0;
+      Cl = Bl | 0;
+      Bh = Ah | 0;
+      Bl = Al | 0;
+      var All = _u64_js__WEBPACK_IMPORTED_MODULE_1__["add3L"](T1l, sigma0l, MAJl);
+      Ah = _u64_js__WEBPACK_IMPORTED_MODULE_1__["add3H"](All, T1h, sigma0h, MAJh);
+      Al = All | 0;
+    }
+    // Add the compressed chunk to the current hash value
+    var _u64$add2 = _u64_js__WEBPACK_IMPORTED_MODULE_1__["add"](this.Ah | 0, this.Al | 0, Ah | 0, Al | 0);
+    Ah = _u64$add2.h;
+    Al = _u64$add2.l;
+    var _u64$add3 = _u64_js__WEBPACK_IMPORTED_MODULE_1__["add"](this.Bh | 0, this.Bl | 0, Bh | 0, Bl | 0);
+    Bh = _u64$add3.h;
+    Bl = _u64$add3.l;
+    var _u64$add4 = _u64_js__WEBPACK_IMPORTED_MODULE_1__["add"](this.Ch | 0, this.Cl | 0, Ch | 0, Cl | 0);
+    Ch = _u64$add4.h;
+    Cl = _u64$add4.l;
+    var _u64$add5 = _u64_js__WEBPACK_IMPORTED_MODULE_1__["add"](this.Dh | 0, this.Dl | 0, Dh | 0, Dl | 0);
+    Dh = _u64$add5.h;
+    Dl = _u64$add5.l;
+    var _u64$add6 = _u64_js__WEBPACK_IMPORTED_MODULE_1__["add"](this.Eh | 0, this.El | 0, Eh | 0, El | 0);
+    Eh = _u64$add6.h;
+    El = _u64$add6.l;
+    var _u64$add7 = _u64_js__WEBPACK_IMPORTED_MODULE_1__["add"](this.Fh | 0, this.Fl | 0, Fh | 0, Fl | 0);
+    Fh = _u64$add7.h;
+    Fl = _u64$add7.l;
+    var _u64$add8 = _u64_js__WEBPACK_IMPORTED_MODULE_1__["add"](this.Gh | 0, this.Gl | 0, Gh | 0, Gl | 0);
+    Gh = _u64$add8.h;
+    Gl = _u64$add8.l;
+    var _u64$add9 = _u64_js__WEBPACK_IMPORTED_MODULE_1__["add"](this.Hh | 0, this.Hl | 0, Hh | 0, Hl | 0);
+    Hh = _u64$add9.h;
+    Hl = _u64$add9.l;
+    this.set(Ah, Al, Bh, Bl, Ch, Cl, Dh, Dl, Eh, El, Fh, Fl, Gh, Gl, Hh, Hl);
+  }
+  roundClean() {
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["clean"])(SHA512_W_H, SHA512_W_L);
+  }
+  destroy() {
+    // HashMD callers route post-destroy usability through `destroyed`; zeroizing alone still leaves
+    // update()/digest() callable on reused instances.
+    this.destroyed = true;
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["clean"])(this.buffer);
+    this.set(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+  }
+}
+/** Internal SHA-512 hash class grounded in RFC 6234 §6.3 and §6.4. */
+class _SHA512 extends SHA2_64B {
+  constructor() {
+    super(64);
+    _defineProperty(this, "Ah", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA512_IV"][0] | 0);
+    _defineProperty(this, "Al", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA512_IV"][1] | 0);
+    _defineProperty(this, "Bh", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA512_IV"][2] | 0);
+    _defineProperty(this, "Bl", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA512_IV"][3] | 0);
+    _defineProperty(this, "Ch", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA512_IV"][4] | 0);
+    _defineProperty(this, "Cl", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA512_IV"][5] | 0);
+    _defineProperty(this, "Dh", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA512_IV"][6] | 0);
+    _defineProperty(this, "Dl", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA512_IV"][7] | 0);
+    _defineProperty(this, "Eh", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA512_IV"][8] | 0);
+    _defineProperty(this, "El", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA512_IV"][9] | 0);
+    _defineProperty(this, "Fh", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA512_IV"][10] | 0);
+    _defineProperty(this, "Fl", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA512_IV"][11] | 0);
+    _defineProperty(this, "Gh", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA512_IV"][12] | 0);
+    _defineProperty(this, "Gl", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA512_IV"][13] | 0);
+    _defineProperty(this, "Hh", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA512_IV"][14] | 0);
+    _defineProperty(this, "Hl", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA512_IV"][15] | 0);
+  }
+}
+/** Internal SHA-384 hash class grounded in RFC 6234 §6.3 and §6.4. */
+class _SHA384 extends SHA2_64B {
+  constructor() {
+    super(48);
+    _defineProperty(this, "Ah", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA384_IV"][0] | 0);
+    _defineProperty(this, "Al", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA384_IV"][1] | 0);
+    _defineProperty(this, "Bh", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA384_IV"][2] | 0);
+    _defineProperty(this, "Bl", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA384_IV"][3] | 0);
+    _defineProperty(this, "Ch", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA384_IV"][4] | 0);
+    _defineProperty(this, "Cl", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA384_IV"][5] | 0);
+    _defineProperty(this, "Dh", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA384_IV"][6] | 0);
+    _defineProperty(this, "Dl", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA384_IV"][7] | 0);
+    _defineProperty(this, "Eh", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA384_IV"][8] | 0);
+    _defineProperty(this, "El", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA384_IV"][9] | 0);
+    _defineProperty(this, "Fh", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA384_IV"][10] | 0);
+    _defineProperty(this, "Fl", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA384_IV"][11] | 0);
+    _defineProperty(this, "Gh", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA384_IV"][12] | 0);
+    _defineProperty(this, "Gl", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA384_IV"][13] | 0);
+    _defineProperty(this, "Hh", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA384_IV"][14] | 0);
+    _defineProperty(this, "Hl", _md_js__WEBPACK_IMPORTED_MODULE_0__["SHA384_IV"][15] | 0);
+  }
+}
+/**
+ * Truncated SHA512/256 and SHA512/224.
+ * SHA512_IV is XORed with 0xa5a5a5a5a5a5a5a5, then used as "intermediary" IV of SHA512/t.
+ * Then t hashes string to produce result IV.
+ * See the repo-side derivation recipe in `test/misc/sha2-gen-iv.js`.
+ * These IV literals are checked against that script rather than a dedicated
+ * local RFC section.
+ */
+/** SHA-512/224 IV derived by the SHA-512/t recipe in `test/misc/sha2-gen-iv.js` and
+ * stored as sixteen big-endian 32-bit halves. */
+var T224_IV = /* @__PURE__ */Uint32Array.from([0x8c3d37c8, 0x19544da2, 0x73e19966, 0x89dcd4d6, 0x1dfab7ae, 0x32ff9c82, 0x679dd514, 0x582f9fcf, 0x0f6d2b69, 0x7bd44da8, 0x77e36f73, 0x04c48942, 0x3f9d85a8, 0x6a1d36c8, 0x1112e6ad, 0x91d692a1]);
+/** SHA-512/256 IV derived by the SHA-512/t recipe in `test/misc/sha2-gen-iv.js` and
+ * stored as sixteen big-endian 32-bit halves. */
+var T256_IV = /* @__PURE__ */Uint32Array.from([0x22312194, 0xfc2bf72c, 0x9f555fa3, 0xc84c64c2, 0x2393b86b, 0x6f53b151, 0x96387719, 0x5940eabd, 0x96283ee2, 0xa88effe3, 0xbe5e1e25, 0x53863992, 0x2b0199fc, 0x2c85b8aa, 0x0eb72ddc, 0x81c52ca2]);
+/** Internal SHA-512/224 hash class using the derived `T224_IV` and the shared
+ * RFC 6234 §6.4 compression engine. */
+class _SHA512_224 extends SHA2_64B {
+  constructor() {
+    super(28);
+    _defineProperty(this, "Ah", T224_IV[0] | 0);
+    _defineProperty(this, "Al", T224_IV[1] | 0);
+    _defineProperty(this, "Bh", T224_IV[2] | 0);
+    _defineProperty(this, "Bl", T224_IV[3] | 0);
+    _defineProperty(this, "Ch", T224_IV[4] | 0);
+    _defineProperty(this, "Cl", T224_IV[5] | 0);
+    _defineProperty(this, "Dh", T224_IV[6] | 0);
+    _defineProperty(this, "Dl", T224_IV[7] | 0);
+    _defineProperty(this, "Eh", T224_IV[8] | 0);
+    _defineProperty(this, "El", T224_IV[9] | 0);
+    _defineProperty(this, "Fh", T224_IV[10] | 0);
+    _defineProperty(this, "Fl", T224_IV[11] | 0);
+    _defineProperty(this, "Gh", T224_IV[12] | 0);
+    _defineProperty(this, "Gl", T224_IV[13] | 0);
+    _defineProperty(this, "Hh", T224_IV[14] | 0);
+    _defineProperty(this, "Hl", T224_IV[15] | 0);
+  }
+}
+/** Internal SHA-512/256 hash class using the derived `T256_IV` and the shared
+ * RFC 6234 §6.4 compression engine. */
+class _SHA512_256 extends SHA2_64B {
+  constructor() {
+    super(32);
+    _defineProperty(this, "Ah", T256_IV[0] | 0);
+    _defineProperty(this, "Al", T256_IV[1] | 0);
+    _defineProperty(this, "Bh", T256_IV[2] | 0);
+    _defineProperty(this, "Bl", T256_IV[3] | 0);
+    _defineProperty(this, "Ch", T256_IV[4] | 0);
+    _defineProperty(this, "Cl", T256_IV[5] | 0);
+    _defineProperty(this, "Dh", T256_IV[6] | 0);
+    _defineProperty(this, "Dl", T256_IV[7] | 0);
+    _defineProperty(this, "Eh", T256_IV[8] | 0);
+    _defineProperty(this, "El", T256_IV[9] | 0);
+    _defineProperty(this, "Fh", T256_IV[10] | 0);
+    _defineProperty(this, "Fl", T256_IV[11] | 0);
+    _defineProperty(this, "Gh", T256_IV[12] | 0);
+    _defineProperty(this, "Gl", T256_IV[13] | 0);
+    _defineProperty(this, "Hh", T256_IV[14] | 0);
+    _defineProperty(this, "Hl", T256_IV[15] | 0);
+  }
+}
+/**
+ * SHA2-256 hash function from RFC 4634. In JS it's the fastest: even faster than Blake3. Some info:
+ *
+ * - Trying 2^128 hashes would get 50% chance of collision, using birthday attack.
+ * - BTC network is doing 2^70 hashes/sec (2^95 hashes/year) as per 2025.
+ * - Each sha256 hash is executing 2^18 bit operations.
+ * - Good 2024 ASICs can do 200Th/sec with 3500 watts of power, corresponding to 2^36 hashes/joule.
+ * @param msg - message bytes to hash
+ * @returns Digest bytes.
+ * @example
+ * Hash a message with SHA2-256.
+ * ```ts
+ * sha256(new Uint8Array([97, 98, 99]));
+ * ```
+ */
+var sha256 = /* @__PURE__ */Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["createHasher"])(() => new _SHA256(), /* @__PURE__ */Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["oidNist"])(0x01));
+/**
+ * SHA2-224 hash function from RFC 4634.
+ * @param msg - message bytes to hash
+ * @returns Digest bytes.
+ * @example
+ * Hash a message with SHA2-224.
+ * ```ts
+ * sha224(new Uint8Array([97, 98, 99]));
+ * ```
+ */
+var sha224 = /* @__PURE__ */Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["createHasher"])(() => new _SHA224(), /* @__PURE__ */Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["oidNist"])(0x04));
+/**
+ * SHA2-512 hash function from RFC 4634.
+ * @param msg - message bytes to hash
+ * @returns Digest bytes.
+ * @example
+ * Hash a message with SHA2-512.
+ * ```ts
+ * sha512(new Uint8Array([97, 98, 99]));
+ * ```
+ */
+var sha512 = /* @__PURE__ */Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["createHasher"])(() => new _SHA512(), /* @__PURE__ */Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["oidNist"])(0x03));
+/**
+ * SHA2-384 hash function from RFC 4634.
+ * @param msg - message bytes to hash
+ * @returns Digest bytes.
+ * @example
+ * Hash a message with SHA2-384.
+ * ```ts
+ * sha384(new Uint8Array([97, 98, 99]));
+ * ```
+ */
+var sha384 = /* @__PURE__ */Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["createHasher"])(() => new _SHA384(), /* @__PURE__ */Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["oidNist"])(0x02));
+/**
+ * SHA2-512/256 "truncated" hash function, with improved resistance to length extension attacks.
+ * See the paper on {@link https://eprint.iacr.org/2010/548.pdf | truncated SHA512}.
+ * @param msg - message bytes to hash
+ * @returns Digest bytes.
+ * @example
+ * Hash a message with SHA2-512/256.
+ * ```ts
+ * sha512_256(new Uint8Array([97, 98, 99]));
+ * ```
+ */
+var sha512_256 = /* @__PURE__ */Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["createHasher"])(() => new _SHA512_256(), /* @__PURE__ */Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["oidNist"])(0x06));
+/**
+ * SHA2-512/224 "truncated" hash function, with improved resistance to length extension attacks.
+ * See the paper on {@link https://eprint.iacr.org/2010/548.pdf | truncated SHA512}.
+ * @param msg - message bytes to hash
+ * @returns Digest bytes.
+ * @example
+ * Hash a message with SHA2-512/224.
+ * ```ts
+ * sha512_224(new Uint8Array([97, 98, 99]));
+ * ```
+ */
+var sha512_224 = /* @__PURE__ */Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["createHasher"])(() => new _SHA512_224(), /* @__PURE__ */Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["oidNist"])(0x05));
+
+/***/ }),
+
+/***/ "./src/onlykey-fido2/onlykey/vendor/@noble/hashes/sha3.js":
+/*!****************************************************************!*\
+  !*** ./src/onlykey-fido2/onlykey/vendor/@noble/hashes/sha3.js ***!
+  \****************************************************************/
+/*! exports provided: keccakP, Keccak, sha3_224, sha3_256, sha3_384, sha3_512, keccak_224, keccak_256, keccak_384, keccak_512, shake128, shake256, shake128_32, shake256_64 */
+/***/ (function(module, __webpack_exports__, __webpack_require__) {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "keccakP", function() { return keccakP; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "Keccak", function() { return Keccak; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "sha3_224", function() { return sha3_224; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "sha3_256", function() { return sha3_256; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "sha3_384", function() { return sha3_384; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "sha3_512", function() { return sha3_512; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "keccak_224", function() { return keccak_224; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "keccak_256", function() { return keccak_256; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "keccak_384", function() { return keccak_384; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "keccak_512", function() { return keccak_512; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "shake128", function() { return shake128; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "shake256", function() { return shake256; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "shake128_32", function() { return shake128_32; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "shake256_64", function() { return shake256_64; });
+/* harmony import */ var _u64_js__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! ./_u64.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/hashes/_u64.js");
+/* harmony import */ var _utils_js__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(/*! ./utils.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/hashes/utils.js");
+function _defineProperty(e, r, t) { return (r = _toPropertyKey(r)) in e ? Object.defineProperty(e, r, { value: t, enumerable: !0, configurable: !0, writable: !0 }) : e[r] = t, e; }
+function _toPropertyKey(t) { var i = _toPrimitive(t, "string"); return "symbol" == typeof i ? i : i + ""; }
+function _toPrimitive(t, r) { if ("object" != typeof t || !t) return t; var e = t[Symbol.toPrimitive]; if (void 0 !== e) { var i = e.call(t, r || "default"); if ("object" != typeof i) return i; throw new TypeError("@@toPrimitive must return a primitive value."); } return ("string" === r ? String : Number)(t); }
+/**
+ * SHA3 (keccak) hash function, based on a new "Sponge function" design.
+ * Different from older hashes, the internal state is bigger than output size.
+ *
+ * Check out
+ * {@link https://nvlpubs.nist.gov/nistpubs/FIPS/NIST.FIPS.202.pdf | FIPS-202},
+ * {@link https://keccak.team/keccak.html | Website}, and
+ * {@link https://crypto.stackexchange.com/q/15727 | the differences between
+ * SHA-3 and Keccak}.
+ *
+ * Check out `sha3-addons` module for cSHAKE, k12, and others.
+ * @module
+ */
+
+// prettier-ignore
+
+// No __PURE__ annotations in sha3 header:
+// EVERYTHING is in fact used on every export.
+// Various per round constants calculations
+var _0n = BigInt(0);
+var _1n = BigInt(1);
+var _2n = BigInt(2);
+var _7n = BigInt(7);
+var _256n = BigInt(256);
+// FIPS 202 Algorithm 5 rc(): when the outgoing bit is 1, the 8-bit LFSR xors
+// taps 0, 4, 5, and 6, which compresses to the feedback mask `0x71`.
+var _0x71n = BigInt(0x71);
+var SHA3_PI = [];
+var SHA3_ROTL = [];
+var _SHA3_IOTA = []; // no pure annotation: var is always used
+for (var round = 0, R = _1n, x = 1, y = 0; round < 24; round++) {
+  // Pi
+  var _ref = [y, (2 * x + 3 * y) % 5];
+  x = _ref[0];
+  y = _ref[1];
+  SHA3_PI.push(2 * (5 * y + x));
+  // Rotational
+  SHA3_ROTL.push((round + 1) * (round + 2) / 2 % 64);
+  // Iota
+  var t = _0n;
+  for (var j = 0; j < 7; j++) {
+    R = (R << _1n ^ (R >> _7n) * _0x71n) % _256n;
+    if (R & _2n) t ^= _1n << (_1n << BigInt(j)) - _1n;
+  }
+  _SHA3_IOTA.push(t);
+}
+var IOTAS = Object(_u64_js__WEBPACK_IMPORTED_MODULE_0__["split"])(_SHA3_IOTA, true);
+// `split(..., true)` keeps the local little-endian lane-word layout used by
+// `state32`, so these `H` / `L` tables follow the file's first-word /
+// second-word lane slots rather than `_u64.ts`'s usual high/low naming.
+var SHA3_IOTA_H = IOTAS[0];
+var SHA3_IOTA_L = IOTAS[1];
+// Left rotation (without 0, 32, 64)
+var rotlH = (h, l, s) => s > 32 ? Object(_u64_js__WEBPACK_IMPORTED_MODULE_0__["rotlBH"])(h, l, s) : Object(_u64_js__WEBPACK_IMPORTED_MODULE_0__["rotlSH"])(h, l, s);
+var rotlL = (h, l, s) => s > 32 ? Object(_u64_js__WEBPACK_IMPORTED_MODULE_0__["rotlBL"])(h, l, s) : Object(_u64_js__WEBPACK_IMPORTED_MODULE_0__["rotlSL"])(h, l, s);
+/**
+ * `keccakf1600` internal permutation, additionally allows adjusting the round count.
+ * @param s - 5x5 Keccak state encoded as 25 lanes split into 50 uint32 words
+ *   in this file's local little-endian lane-word order
+ * @param rounds - number of rounds to execute
+ * @throws If `rounds` is outside the supported `1..24` range. {@link Error}
+ * @example
+ * Permute a Keccak state with the default 24 rounds.
+ * ```ts
+ * keccakP(new Uint32Array(50));
+ * ```
+ */
+function keccakP(s) {
+  var rounds = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : 24;
+  Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["anumber"])(rounds, 'rounds');
+  // This implementation precomputes only the standard Keccak-f[1600] 24-round Iota table.
+  if (rounds < 1 || rounds > 24) throw new Error('"rounds" expected integer 1..24');
+  var B = new Uint32Array(5 * 2);
+  // NOTE: all indices are x2 since we store state as u32 instead of u64 (bigints to slow in js)
+  for (var _round = 24 - rounds; _round < 24; _round++) {
+    // Theta θ
+    for (var _x = 0; _x < 10; _x++) B[_x] = s[_x] ^ s[_x + 10] ^ s[_x + 20] ^ s[_x + 30] ^ s[_x + 40];
+    for (var _x2 = 0; _x2 < 10; _x2 += 2) {
+      var idx1 = (_x2 + 8) % 10;
+      var idx0 = (_x2 + 2) % 10;
+      var B0 = B[idx0];
+      var B1 = B[idx0 + 1];
+      var Th = rotlH(B0, B1, 1) ^ B[idx1];
+      var Tl = rotlL(B0, B1, 1) ^ B[idx1 + 1];
+      for (var _y = 0; _y < 50; _y += 10) {
+        s[_x2 + _y] ^= Th;
+        s[_x2 + _y + 1] ^= Tl;
+      }
+    }
+    // Rho (ρ) and Pi (π)
+    var curH = s[2];
+    var curL = s[3];
+    for (var _t = 0; _t < 24; _t++) {
+      var shift = SHA3_ROTL[_t];
+      var _Th = rotlH(curH, curL, shift);
+      var _Tl = rotlL(curH, curL, shift);
+      var PI = SHA3_PI[_t];
+      curH = s[PI];
+      curL = s[PI + 1];
+      s[PI] = _Th;
+      s[PI + 1] = _Tl;
+    }
+    // Chi (χ)
+    // Same as:
+    // for (let x = 0; x < 10; x++) B[x] = s[y + x];
+    // for (let x = 0; x < 10; x++) s[y + x] ^= ~B[(x + 2) % 10] & B[(x + 4) % 10];
+    for (var _y2 = 0; _y2 < 50; _y2 += 10) {
+      var b0 = s[_y2],
+        b1 = s[_y2 + 1],
+        b2 = s[_y2 + 2],
+        b3 = s[_y2 + 3];
+      s[_y2] ^= ~s[_y2 + 2] & s[_y2 + 4];
+      s[_y2 + 1] ^= ~s[_y2 + 3] & s[_y2 + 5];
+      s[_y2 + 2] ^= ~s[_y2 + 4] & s[_y2 + 6];
+      s[_y2 + 3] ^= ~s[_y2 + 5] & s[_y2 + 7];
+      s[_y2 + 4] ^= ~s[_y2 + 6] & s[_y2 + 8];
+      s[_y2 + 5] ^= ~s[_y2 + 7] & s[_y2 + 9];
+      s[_y2 + 6] ^= ~s[_y2 + 8] & b0;
+      s[_y2 + 7] ^= ~s[_y2 + 9] & b1;
+      s[_y2 + 8] ^= ~b0 & b2;
+      s[_y2 + 9] ^= ~b1 & b3;
+    }
+    // Iota (ι)
+    s[0] ^= SHA3_IOTA_H[_round];
+    s[1] ^= SHA3_IOTA_L[_round];
+  }
+  Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["clean"])(B);
+}
+/**
+ * Keccak sponge function.
+ * @param blockLen - absorb/squeeze rate in bytes
+ * @param suffix - domain separation suffix byte
+ * @param outputLen - default digest length in bytes. This base sponge only
+ *   requires a non-negative integer; wrappers that need positive output
+ *   lengths must enforce that themselves.
+ * @param enableXOF - whether XOF output is allowed
+ * @param rounds - number of Keccak-f rounds
+ * @example
+ * Build a sponge state, absorb bytes, then finalize a digest.
+ * ```ts
+ * const hash = new Keccak(136, 0x06, 32);
+ * hash.update(new Uint8Array([1, 2, 3]));
+ * hash.digest();
+ * ```
+ */
+class Keccak {
+  // NOTE: we accept arguments in bytes instead of bits here.
+  constructor(blockLen, suffix, outputLen) {
+    var enableXOF = arguments.length > 3 && arguments[3] !== undefined ? arguments[3] : false;
+    var rounds = arguments.length > 4 && arguments[4] !== undefined ? arguments[4] : 24;
+    _defineProperty(this, "state", void 0);
+    _defineProperty(this, "pos", 0);
+    _defineProperty(this, "posOut", 0);
+    _defineProperty(this, "finished", false);
+    _defineProperty(this, "state32", void 0);
+    _defineProperty(this, "destroyed", false);
+    _defineProperty(this, "blockLen", void 0);
+    _defineProperty(this, "suffix", void 0);
+    _defineProperty(this, "outputLen", void 0);
+    _defineProperty(this, "canXOF", void 0);
+    _defineProperty(this, "enableXOF", false);
+    _defineProperty(this, "rounds", void 0);
+    this.blockLen = blockLen;
+    this.suffix = suffix;
+    this.outputLen = outputLen;
+    this.enableXOF = enableXOF;
+    this.canXOF = enableXOF;
+    this.rounds = rounds;
+    // Can be passed from user as dkLen
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["anumber"])(outputLen, 'outputLen');
+    // 1600 = 5x5 matrix of 64bit.  1600 bits === 200 bytes
+    // 0 < blockLen < 200
+    if (!(0 < blockLen && blockLen < 200)) throw new Error('only keccak-f1600 function is supported');
+    this.state = new Uint8Array(200);
+    this.state32 = Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["u32"])(this.state);
+  }
+  clone() {
+    return this._cloneInto();
+  }
+  keccak() {
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["swap32IfBE"])(this.state32);
+    keccakP(this.state32, this.rounds);
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["swap32IfBE"])(this.state32);
+    this.posOut = 0;
+    this.pos = 0;
+  }
+  update(data) {
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["aexists"])(this);
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["abytes"])(data);
+    var blockLen = this.blockLen,
+      state = this.state;
+    var len = data.length;
+    for (var pos = 0; pos < len;) {
+      var take = Math.min(blockLen - this.pos, len - pos);
+      for (var i = 0; i < take; i++) state[this.pos++] ^= data[pos++];
+      if (this.pos === blockLen) this.keccak();
+    }
+    return this;
+  }
+  finish() {
+    if (this.finished) return;
+    this.finished = true;
+    var state = this.state,
+      suffix = this.suffix,
+      pos = this.pos,
+      blockLen = this.blockLen;
+    // FIPS 202 appends the SHA3/SHAKE domain-separation suffix before pad10*1.
+    // These byte values already include the first padding bit, while the
+    // final `0x80` below supplies the closing `1` bit in the last rate byte.
+    state[pos] ^= suffix;
+    // If that combined suffix lands in the last rate byte and already sets
+    // bit 7, absorb it first so the final pad10*1 bit can be xored into a
+    // fresh block.
+    if ((suffix & 0x80) !== 0 && pos === blockLen - 1) this.keccak();
+    state[blockLen - 1] ^= 0x80;
+    this.keccak();
+  }
+  writeInto(out) {
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["aexists"])(this, false);
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["abytes"])(out);
+    this.finish();
+    var bufferOut = this.state;
+    var blockLen = this.blockLen;
+    for (var pos = 0, len = out.length; pos < len;) {
+      if (this.posOut >= blockLen) this.keccak();
+      var take = Math.min(blockLen - this.posOut, len - pos);
+      out.set(bufferOut.subarray(this.posOut, this.posOut + take), pos);
+      this.posOut += take;
+      pos += take;
+    }
+    return out;
+  }
+  xofInto(out) {
+    // Plain SHA3/Keccak usage with XOF is probably a mistake, but this base
+    // class is also reused by SHAKE/cSHAKE/KMAC/TupleHash/ParallelHash/
+    // TurboSHAKE/KangarooTwelve wrappers that intentionally enable XOF.
+    if (!this.enableXOF) throw new Error('XOF is not possible for this instance');
+    return this.writeInto(out);
+  }
+  xof(bytes) {
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["anumber"])(bytes);
+    return this.xofInto(new Uint8Array(bytes));
+  }
+  digestInto(out) {
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["aoutput"])(out, this);
+    if (this.finished) throw new Error('digest() was already called');
+    // `aoutput(...)` allows oversized buffers; digestInto() must fill only the advertised digest.
+    this.writeInto(out.subarray(0, this.outputLen));
+    this.destroy();
+  }
+  digest() {
+    var out = new Uint8Array(this.outputLen);
+    this.digestInto(out);
+    return out;
+  }
+  destroy() {
+    this.destroyed = true;
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["clean"])(this.state);
+  }
+  _cloneInto(to) {
+    var blockLen = this.blockLen,
+      suffix = this.suffix,
+      outputLen = this.outputLen,
+      rounds = this.rounds,
+      enableXOF = this.enableXOF;
+    to || (to = new Keccak(blockLen, suffix, outputLen, enableXOF, rounds));
+    // Reused destinations can come from a different rate/capacity variant, so clone must rewrite
+    // the sponge geometry as well as the state words.
+    to.blockLen = blockLen;
+    to.state32.set(this.state32);
+    to.pos = this.pos;
+    to.posOut = this.posOut;
+    to.finished = this.finished;
+    to.rounds = rounds;
+    // Suffix can change in cSHAKE
+    to.suffix = suffix;
+    to.outputLen = outputLen;
+    to.enableXOF = enableXOF;
+    // Clones must preserve the public capability bit too; `_KMAC` reuses this path and deep clone
+    // tests compare instance fields directly, so leaving `canXOF` behind makes the clone lie.
+    to.canXOF = this.canXOF;
+    to.destroyed = this.destroyed;
+    return to;
+  }
+}
+var genKeccak = function genKeccak(suffix, blockLen, outputLen) {
+  var info = arguments.length > 3 && arguments[3] !== undefined ? arguments[3] : {};
+  return Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["createHasher"])(() => new Keccak(blockLen, suffix, outputLen), info);
+};
+/**
+ * SHA3-224 hash function.
+ * @param msg - message bytes to hash
+ * @returns Digest bytes.
+ * @example
+ * Hash a message with SHA3-224.
+ * ```ts
+ * sha3_224(new Uint8Array([97, 98, 99]));
+ * ```
+ */
+var sha3_224 = /* @__PURE__ */genKeccak(0x06, 144, 28, /* @__PURE__ */Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["oidNist"])(0x07));
+/**
+ * SHA3-256 hash function. Different from keccak-256.
+ * @param msg - message bytes to hash
+ * @returns Digest bytes.
+ * @example
+ * Hash a message with SHA3-256.
+ * ```ts
+ * sha3_256(new Uint8Array([97, 98, 99]));
+ * ```
+ */
+var sha3_256 = /* @__PURE__ */genKeccak(0x06, 136, 32, /* @__PURE__ */Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["oidNist"])(0x08));
+/**
+ * SHA3-384 hash function.
+ * @param msg - message bytes to hash
+ * @returns Digest bytes.
+ * @example
+ * Hash a message with SHA3-384.
+ * ```ts
+ * sha3_384(new Uint8Array([97, 98, 99]));
+ * ```
+ */
+var sha3_384 = /* @__PURE__ */genKeccak(0x06, 104, 48, /* @__PURE__ */Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["oidNist"])(0x09));
+/**
+ * SHA3-512 hash function.
+ * @param msg - message bytes to hash
+ * @returns Digest bytes.
+ * @example
+ * Hash a message with SHA3-512.
+ * ```ts
+ * sha3_512(new Uint8Array([97, 98, 99]));
+ * ```
+ */
+var sha3_512 = /* @__PURE__ */genKeccak(0x06, 72, 64, /* @__PURE__ */Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["oidNist"])(0x0a));
+/**
+ * Keccak-224 hash function.
+ * @param msg - message bytes to hash
+ * @returns Digest bytes.
+ * @example
+ * Hash a message with Keccak-224.
+ * ```ts
+ * keccak_224(new Uint8Array([97, 98, 99]));
+ * ```
+ */
+var keccak_224 = /* @__PURE__ */genKeccak(0x01, 144, 28);
+/**
+ * Keccak-256 hash function. Different from SHA3-256.
+ * @param msg - message bytes to hash
+ * @returns Digest bytes.
+ * @example
+ * Hash a message with Keccak-256.
+ * ```ts
+ * keccak_256(new Uint8Array([97, 98, 99]));
+ * ```
+ */
+var keccak_256 = /* @__PURE__ */genKeccak(0x01, 136, 32);
+/**
+ * Keccak-384 hash function.
+ * @param msg - message bytes to hash
+ * @returns Digest bytes.
+ * @example
+ * Hash a message with Keccak-384.
+ * ```ts
+ * keccak_384(new Uint8Array([97, 98, 99]));
+ * ```
+ */
+var keccak_384 = /* @__PURE__ */genKeccak(0x01, 104, 48);
+/**
+ * Keccak-512 hash function.
+ * @param msg - message bytes to hash
+ * @returns Digest bytes.
+ * @example
+ * Hash a message with Keccak-512.
+ * ```ts
+ * keccak_512(new Uint8Array([97, 98, 99]));
+ * ```
+ */
+var keccak_512 = /* @__PURE__ */genKeccak(0x01, 72, 64);
+var genShake = function genShake(suffix, blockLen, outputLen) {
+  var info = arguments.length > 3 && arguments[3] !== undefined ? arguments[3] : {};
+  return Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["createHasher"])(function () {
+    var opts = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : {};
+    return new Keccak(blockLen, suffix, opts.dkLen === undefined ? outputLen : opts.dkLen, true);
+  }, info);
+};
+/**
+ * SHAKE128 XOF with 128-bit security and a 16-byte default output.
+ * @param msg - message bytes to hash
+ * @param opts - Optional output-length override. See {@link ShakeOpts}.
+ * @returns Digest bytes.
+ * @example
+ * Hash a message with SHAKE128.
+ * ```ts
+ * shake128(new Uint8Array([97, 98, 99]), { dkLen: 32 });
+ * ```
+ */
+var shake128 = /* @__PURE__ */
+genShake(0x1f, 168, 16, /* @__PURE__ */Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["oidNist"])(0x0b));
+/**
+ * SHAKE256 XOF with 256-bit security and a 32-byte default output.
+ * @param msg - message bytes to hash
+ * @param opts - Optional output-length override. See {@link ShakeOpts}.
+ * @returns Digest bytes.
+ * @example
+ * Hash a message with SHAKE256.
+ * ```ts
+ * shake256(new Uint8Array([97, 98, 99]), { dkLen: 64 });
+ * ```
+ */
+var shake256 = /* @__PURE__ */
+genShake(0x1f, 136, 32, /* @__PURE__ */Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["oidNist"])(0x0c));
+/**
+ * SHAKE128 XOF with 256-bit output (NIST version).
+ * @param msg - message bytes to hash
+ * @param opts - Optional output-length override. See {@link ShakeOpts}.
+ * @returns Digest bytes.
+ * @example
+ * Hash a message with SHAKE128 using a 32-byte default output.
+ * ```ts
+ * shake128_32(new Uint8Array([97, 98, 99]), { dkLen: 32 });
+ * ```
+ */
+var shake128_32 = /* @__PURE__ */
+genShake(0x1f, 168, 32, /* @__PURE__ */Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["oidNist"])(0x0b));
+/**
+ * SHAKE256 XOF with 512-bit output (NIST version).
+ * @param msg - message bytes to hash
+ * @param opts - Optional output-length override. See {@link ShakeOpts}.
+ * @returns Digest bytes.
+ * @example
+ * Hash a message with SHAKE256 using a 64-byte default output.
+ * ```ts
+ * shake256_64(new Uint8Array([97, 98, 99]), { dkLen: 64 });
+ * ```
+ */
+var shake256_64 = /* @__PURE__ */
+genShake(0x1f, 136, 64, /* @__PURE__ */Object(_utils_js__WEBPACK_IMPORTED_MODULE_1__["oidNist"])(0x0c));
+
+/***/ }),
+
+/***/ "./src/onlykey-fido2/onlykey/vendor/@noble/hashes/utils.js":
+/*!*****************************************************************!*\
+  !*** ./src/onlykey-fido2/onlykey/vendor/@noble/hashes/utils.js ***!
+  \*****************************************************************/
+/*! exports provided: isBytes, anumber, abytes, copyBytes, ahash, aexists, aoutput, u8, u32, clean, createView, rotr, rotl, isLE, byteSwap, swap8IfBE, byteSwap32, swap32IfBE, bytesToHex, hexToBytes, nextTick, asyncLoop, utf8ToBytes, kdfInputToBytes, concatBytes, checkOpts, createHasher, randomBytes, oidNist */
+/***/ (function(module, __webpack_exports__, __webpack_require__) {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "isBytes", function() { return isBytes; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "anumber", function() { return anumber; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "abytes", function() { return abytes; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "copyBytes", function() { return copyBytes; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "ahash", function() { return ahash; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "aexists", function() { return aexists; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "aoutput", function() { return aoutput; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "u8", function() { return u8; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "u32", function() { return u32; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "clean", function() { return clean; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "createView", function() { return createView; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "rotr", function() { return rotr; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "rotl", function() { return rotl; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "isLE", function() { return isLE; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "byteSwap", function() { return byteSwap; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "swap8IfBE", function() { return swap8IfBE; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "byteSwap32", function() { return byteSwap32; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "swap32IfBE", function() { return swap32IfBE; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "bytesToHex", function() { return bytesToHex; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "hexToBytes", function() { return hexToBytes; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "nextTick", function() { return nextTick; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "asyncLoop", function() { return asyncLoop; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "utf8ToBytes", function() { return utf8ToBytes; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "kdfInputToBytes", function() { return kdfInputToBytes; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "concatBytes", function() { return concatBytes; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "checkOpts", function() { return checkOpts; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "createHasher", function() { return createHasher; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "randomBytes", function() { return randomBytes; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "oidNist", function() { return oidNist; });
+function asyncGeneratorStep(n, t, e, r, o, a, c) { try { var i = n[a](c), u = i.value; } catch (n) { return void e(n); } i.done ? t(u) : Promise.resolve(u).then(r, o); }
+function _asyncToGenerator(n) { return function () { var t = this, e = arguments; return new Promise(function (r, o) { var a = n.apply(t, e); function _next(n) { asyncGeneratorStep(a, r, o, _next, _throw, "next", n); } function _throw(n) { asyncGeneratorStep(a, r, o, _next, _throw, "throw", n); } _next(void 0); }); }; }
+/**
+ * Checks if something is Uint8Array. Be careful: nodejs Buffer will return true.
+ * @param a - value to test
+ * @returns `true` when the value is a Uint8Array-compatible view.
+ * @example
+ * Check whether a value is a Uint8Array-compatible view.
+ * ```ts
+ * isBytes(new Uint8Array([1, 2, 3]));
+ * ```
+ */
+function isBytes(a) {
+  // Plain `instanceof Uint8Array` is too strict for some Buffer / proxy / cross-realm cases.
+  // The fallback still requires a real ArrayBuffer view, so plain
+  // JSON-deserialized `{ constructor: ... }` spoofing is rejected, and
+  // `BYTES_PER_ELEMENT === 1` keeps the fallback on byte-oriented views.
+  return a instanceof Uint8Array || ArrayBuffer.isView(a) && a.constructor.name === 'Uint8Array' && 'BYTES_PER_ELEMENT' in a && a.BYTES_PER_ELEMENT === 1;
+}
+/**
+ * Asserts something is a non-negative integer.
+ * @param n - number to validate
+ * @param title - label included in thrown errors
+ * @throws On wrong argument types. {@link TypeError}
+ * @throws On wrong argument ranges or values. {@link RangeError}
+ * @example
+ * Validate a non-negative integer option.
+ * ```ts
+ * anumber(32, 'length');
+ * ```
+ */
+function anumber(n) {
+  var title = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : '';
+  if (typeof n !== 'number') {
+    var prefix = title && "\"".concat(title, "\" ");
+    throw new TypeError("".concat(prefix, "expected number, got ").concat(typeof n));
+  }
+  if (!Number.isSafeInteger(n) || n < 0) {
+    var _prefix = title && "\"".concat(title, "\" ");
+    throw new RangeError("".concat(_prefix, "expected integer >= 0, got ").concat(n));
+  }
+}
+/**
+ * Asserts something is Uint8Array.
+ * @param value - value to validate
+ * @param length - optional exact length constraint
+ * @param title - label included in thrown errors
+ * @returns The validated byte array.
+ * @throws On wrong argument types. {@link TypeError}
+ * @throws On wrong argument ranges or values. {@link RangeError}
+ * @example
+ * Validate that a value is a byte array.
+ * ```ts
+ * abytes(new Uint8Array([1, 2, 3]));
+ * ```
+ */
+function abytes(value, length) {
+  var title = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : '';
+  var bytes = isBytes(value);
+  var len = value === null || value === void 0 ? void 0 : value.length;
+  var needsLen = length !== undefined;
+  if (!bytes || needsLen && len !== length) {
+    var prefix = title && "\"".concat(title, "\" ");
+    var ofLen = needsLen ? " of length ".concat(length) : '';
+    var got = bytes ? "length=".concat(len) : "type=".concat(typeof value);
+    var message = prefix + 'expected Uint8Array' + ofLen + ', got ' + got;
+    if (!bytes) throw new TypeError(message);
+    throw new RangeError(message);
+  }
+  return value;
+}
+/**
+ * Copies bytes into a fresh Uint8Array.
+ * Buffer-style slices can alias the same backing store, so callers that need ownership should copy.
+ * @param bytes - source bytes to clone
+ * @returns Freshly allocated copy of `bytes`.
+ * @throws On wrong argument types. {@link TypeError}
+ * @example
+ * Clone a byte array before mutating it.
+ * ```ts
+ * const copy = copyBytes(new Uint8Array([1, 2, 3]));
+ * ```
+ */
+function copyBytes(bytes) {
+  // `Uint8Array.from(...)` would also accept arrays / other typed arrays. Keep this helper strict
+  // because callers use it at byte-validation boundaries before mutating the detached copy.
+  return Uint8Array.from(abytes(bytes));
+}
+/**
+ * Asserts something is a wrapped hash constructor.
+ * @param h - hash constructor to validate
+ * @throws On wrong argument types or invalid hash wrapper shape. {@link TypeError}
+ * @throws On invalid hash metadata ranges or values. {@link RangeError}
+ * @throws If the hash metadata allows empty outputs or block sizes. {@link Error}
+ * @example
+ * Validate a callable hash wrapper.
+ * ```ts
+ * import { ahash } from '@noble/hashes/utils.js';
+ * import { sha256 } from '@noble/hashes/sha2.js';
+ * ahash(sha256);
+ * ```
+ */
+function ahash(h) {
+  if (typeof h !== 'function' || typeof h.create !== 'function') throw new TypeError('Hash must wrapped by utils.createHasher');
+  anumber(h.outputLen);
+  anumber(h.blockLen);
+  // HMAC and KDF callers treat these as real byte lengths; allowing zero lets fake wrappers pass
+  // validation and can produce empty outputs instead of failing fast.
+  if (h.outputLen < 1) throw new Error('"outputLen" must be >= 1');
+  if (h.blockLen < 1) throw new Error('"blockLen" must be >= 1');
+}
+/**
+ * Asserts a hash instance has not been destroyed or finished.
+ * @param instance - hash instance to validate
+ * @param checkFinished - whether to reject finalized instances
+ * @throws If the hash instance has already been destroyed or finalized. {@link Error}
+ * @example
+ * Validate that a hash instance is still usable.
+ * ```ts
+ * import { aexists } from '@noble/hashes/utils.js';
+ * import { sha256 } from '@noble/hashes/sha2.js';
+ * const hash = sha256.create();
+ * aexists(hash);
+ * ```
+ */
+function aexists(instance) {
+  var checkFinished = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : true;
+  if (instance.destroyed) throw new Error('Hash instance has been destroyed');
+  if (checkFinished && instance.finished) throw new Error('Hash#digest() has already been called');
+}
+/**
+ * Asserts output is a sufficiently-sized byte array.
+ * @param out - destination buffer
+ * @param instance - hash instance providing output length
+ * Oversized buffers are allowed; downstream code only promises to fill the first `outputLen` bytes.
+ * @throws On wrong argument types. {@link TypeError}
+ * @throws On wrong argument ranges or values. {@link RangeError}
+ * @example
+ * Validate a caller-provided digest buffer.
+ * ```ts
+ * import { aoutput } from '@noble/hashes/utils.js';
+ * import { sha256 } from '@noble/hashes/sha2.js';
+ * const hash = sha256.create();
+ * aoutput(new Uint8Array(hash.outputLen), hash);
+ * ```
+ */
+function aoutput(out, instance) {
+  abytes(out, undefined, 'digestInto() output');
+  var min = instance.outputLen;
+  if (out.length < min) {
+    throw new RangeError('"digestInto() output" expected to be of length >=' + min);
+  }
+}
+/**
+ * Casts a typed array view to Uint8Array.
+ * @param arr - source typed array
+ * @returns Uint8Array view over the same buffer.
+ * @example
+ * Reinterpret a typed array as bytes.
+ * ```ts
+ * u8(new Uint32Array([1, 2]));
+ * ```
+ */
+function u8(arr) {
+  return new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength);
+}
+/**
+ * Casts a typed array view to Uint32Array.
+ * `arr.byteOffset` must already be 4-byte aligned or the platform
+ * Uint32Array constructor will throw.
+ * @param arr - source typed array
+ * @returns Uint32Array view over the same buffer.
+ * @example
+ * Reinterpret a byte array as 32-bit words.
+ * ```ts
+ * u32(new Uint8Array(8));
+ * ```
+ */
+function u32(arr) {
+  return new Uint32Array(arr.buffer, arr.byteOffset, Math.floor(arr.byteLength / 4));
+}
+/**
+ * Zeroizes typed arrays in place. Warning: JS provides no guarantees.
+ * @param arrays - arrays to overwrite with zeros
+ * @example
+ * Zeroize sensitive buffers in place.
+ * ```ts
+ * clean(new Uint8Array([1, 2, 3]));
+ * ```
+ */
+function clean() {
+  for (var _len = arguments.length, arrays = new Array(_len), _key = 0; _key < _len; _key++) {
+    arrays[_key] = arguments[_key];
+  }
+  for (var i = 0; i < arrays.length; i++) {
+    arrays[i].fill(0);
+  }
+}
+/**
+ * Creates a DataView for byte-level manipulation.
+ * @param arr - source typed array
+ * @returns DataView over the same buffer region.
+ * @example
+ * Create a DataView over an existing buffer.
+ * ```ts
+ * createView(new Uint8Array(4));
+ * ```
+ */
+function createView(arr) {
+  return new DataView(arr.buffer, arr.byteOffset, arr.byteLength);
+}
+/**
+ * Rotate-right operation for uint32 values.
+ * @param word - source word
+ * @param shift - shift amount in bits
+ * @returns Rotated word.
+ * @example
+ * Rotate a 32-bit word to the right.
+ * ```ts
+ * rotr(0x12345678, 8);
+ * ```
+ */
+function rotr(word, shift) {
+  return word << 32 - shift | word >>> shift;
+}
+/**
+ * Rotate-left operation for uint32 values.
+ * @param word - source word
+ * @param shift - shift amount in bits
+ * @returns Rotated word.
+ * @example
+ * Rotate a 32-bit word to the left.
+ * ```ts
+ * rotl(0x12345678, 8);
+ * ```
+ */
+function rotl(word, shift) {
+  return word << shift | word >>> 32 - shift >>> 0;
+}
+/** Whether the current platform is little-endian. */
+var isLE = /* @__PURE__ */(() => new Uint8Array(new Uint32Array([0x11223344]).buffer)[0] === 0x44)();
+/**
+ * Byte-swap operation for uint32 values.
+ * @param word - source word
+ * @returns Word with reversed byte order.
+ * @example
+ * Reverse the byte order of a 32-bit word.
+ * ```ts
+ * byteSwap(0x11223344);
+ * ```
+ */
+function byteSwap(word) {
+  return word << 24 & 0xff000000 | word << 8 & 0xff0000 | word >>> 8 & 0xff00 | word >>> 24 & 0xff;
+}
+/**
+ * Conditionally byte-swaps one 32-bit word on big-endian platforms.
+ * @param n - source word
+ * @returns Original or byte-swapped word depending on platform endianness.
+ * @example
+ * Normalize a 32-bit word for host endianness.
+ * ```ts
+ * swap8IfBE(0x11223344);
+ * ```
+ */
+var swap8IfBE = isLE ? n => n : n => byteSwap(n) >>> 0;
+/**
+ * Byte-swaps every word of a Uint32Array in place.
+ * @param arr - array to mutate
+ * @returns The same array after mutation; callers pass live state arrays here.
+ * @example
+ * Reverse the byte order of every word in place.
+ * ```ts
+ * byteSwap32(new Uint32Array([0x11223344]));
+ * ```
+ */
+function byteSwap32(arr) {
+  for (var i = 0; i < arr.length; i++) {
+    arr[i] = byteSwap(arr[i]);
+  }
+  return arr;
+}
+/**
+ * Conditionally byte-swaps a Uint32Array on big-endian platforms.
+ * @param u - array to normalize for host endianness
+ * @returns Original or byte-swapped array depending on platform endianness.
+ *   On big-endian runtimes this mutates `u` in place via `byteSwap32(...)`.
+ * @example
+ * Normalize a word array for host endianness.
+ * ```ts
+ * swap32IfBE(new Uint32Array([0x11223344]));
+ * ```
+ */
+var swap32IfBE = isLE ? u => u : byteSwap32;
+// Built-in hex conversion https://caniuse.com/mdn-javascript_builtins_uint8array_fromhex
+var hasHexBuiltin = /* @__PURE__ */(() =>
+// @ts-ignore
+typeof Uint8Array.from([]).toHex === 'function' && typeof Uint8Array.fromHex === 'function')();
+// Array where index 0xf0 (240) is mapped to string 'f0'
+var hexes = /* @__PURE__ */Array.from({
+  length: 256
+}, (_, i) => i.toString(16).padStart(2, '0'));
+/**
+ * Convert byte array to hex string.
+ * Uses the built-in function when available and assumes it matches the tested
+ * fallback semantics.
+ * @param bytes - bytes to encode
+ * @returns Lowercase hexadecimal string.
+ * @throws On wrong argument types. {@link TypeError}
+ * @example
+ * Convert bytes to lowercase hexadecimal.
+ * ```ts
+ * bytesToHex(Uint8Array.from([0xca, 0xfe, 0x01, 0x23])); // 'cafe0123'
+ * ```
+ */
+function bytesToHex(bytes) {
+  abytes(bytes);
+  // @ts-ignore
+  if (hasHexBuiltin) return bytes.toHex();
+  // pre-caching improves the speed 6x
+  var hex = '';
+  for (var i = 0; i < bytes.length; i++) {
+    hex += hexes[bytes[i]];
+  }
+  return hex;
+}
+// We use optimized technique to convert hex string to byte array
+var asciis = {
+  _0: 48,
+  _9: 57,
+  A: 65,
+  F: 70,
+  a: 97,
+  f: 102
+};
+function asciiToBase16(ch) {
+  if (ch >= asciis._0 && ch <= asciis._9) return ch - asciis._0; // '2' => 50-48
+  if (ch >= asciis.A && ch <= asciis.F) return ch - (asciis.A - 10); // 'B' => 66-(65-10)
+  if (ch >= asciis.a && ch <= asciis.f) return ch - (asciis.a - 10); // 'b' => 98-(97-10)
+  return;
+}
+/**
+ * Convert hex string to byte array. Uses built-in function, when available.
+ * @param hex - hexadecimal string to decode
+ * @returns Decoded bytes.
+ * @throws On wrong argument types. {@link TypeError}
+ * @throws On wrong argument ranges or values. {@link RangeError}
+ * @example
+ * Decode lowercase hexadecimal into bytes.
+ * ```ts
+ * hexToBytes('cafe0123'); // Uint8Array.from([0xca, 0xfe, 0x01, 0x23])
+ * ```
+ */
+function hexToBytes(hex) {
+  if (typeof hex !== 'string') throw new TypeError('hex string expected, got ' + typeof hex);
+  if (hasHexBuiltin) {
+    try {
+      return Uint8Array.fromHex(hex);
+    } catch (error) {
+      if (error instanceof SyntaxError) throw new RangeError(error.message);
+      throw error;
+    }
+  }
+  var hl = hex.length;
+  var al = hl / 2;
+  if (hl % 2) throw new RangeError('hex string expected, got unpadded hex of length ' + hl);
+  var array = new Uint8Array(al);
+  for (var ai = 0, hi = 0; ai < al; ai++, hi += 2) {
+    var n1 = asciiToBase16(hex.charCodeAt(hi));
+    var n2 = asciiToBase16(hex.charCodeAt(hi + 1));
+    if (n1 === undefined || n2 === undefined) {
+      var char = hex[hi] + hex[hi + 1];
+      throw new RangeError('hex string expected, got non-hex character "' + char + '" at index ' + hi);
+    }
+    array[ai] = n1 * 16 + n2; // multiply first octet, e.g. 'a3' => 10*16+3 => 160 + 3 => 163
+  }
+  return array;
+}
+/**
+ * There is no setImmediate in browser and setTimeout is slow.
+ * This yields to the Promise/microtask scheduler queue, not to timers or the
+ * full macrotask event loop.
+ * @example
+ * Yield to the next scheduler tick.
+ * ```ts
+ * await nextTick();
+ * ```
+ */
+var nextTick = /*#__PURE__*/function () {
+  var _ref = _asyncToGenerator(function* () {});
+  return function nextTick() {
+    return _ref.apply(this, arguments);
+  };
+}();
+/**
+ * Returns control to the Promise/microtask scheduler every `tick`
+ * milliseconds to avoid blocking long loops.
+ * @param iters - number of loop iterations to run
+ * @param tick - maximum time slice in milliseconds
+ * @param cb - callback executed on each iteration
+ * @example
+ * Run a loop that periodically yields back to the event loop.
+ * ```ts
+ * await asyncLoop(2, 0, () => {});
+ * ```
+ */
+function asyncLoop(_x, _x2, _x3) {
+  return _asyncLoop.apply(this, arguments);
+}
+/**
+ * Converts string to bytes using UTF8 encoding.
+ * Built-in doesn't validate input to be string: we do the check.
+ * Non-ASCII details are delegated to the platform `TextEncoder`.
+ * @param str - string to encode
+ * @returns UTF-8 encoded bytes.
+ * @throws On wrong argument types. {@link TypeError}
+ * @example
+ * Encode a string as UTF-8 bytes.
+ * ```ts
+ * utf8ToBytes('abc'); // Uint8Array.from([97, 98, 99])
+ * ```
+ */
+function _asyncLoop() {
+  _asyncLoop = _asyncToGenerator(function* (iters, tick, cb) {
+    var ts = Date.now();
+    for (var i = 0; i < iters; i++) {
+      cb(i);
+      // Date.now() is not monotonic, so in case if clock goes backwards we return return control too
+      var diff = Date.now() - ts;
+      if (diff >= 0 && diff < tick) continue;
+      yield nextTick();
+      ts += diff;
+    }
+  });
+  return _asyncLoop.apply(this, arguments);
+}
+function utf8ToBytes(str) {
+  if (typeof str !== 'string') throw new TypeError('string expected');
+  return new Uint8Array(new TextEncoder().encode(str)); // https://bugzil.la/1681809
+}
+/**
+ * Helper for KDFs: consumes Uint8Array or string.
+ * String inputs are UTF-8 encoded; byte-array inputs stay aliased to the caller buffer.
+ * @param data - user-provided KDF input
+ * @param errorTitle - label included in thrown errors
+ * @returns Byte representation of the input.
+ * @throws On wrong argument types. {@link TypeError}
+ * @example
+ * Normalize KDF input to bytes.
+ * ```ts
+ * kdfInputToBytes('password');
+ * ```
+ */
+function kdfInputToBytes(data) {
+  var errorTitle = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : '';
+  if (typeof data === 'string') return utf8ToBytes(data);
+  return abytes(data, undefined, errorTitle);
+}
+/**
+ * Copies several Uint8Arrays into one.
+ * @param arrays - arrays to concatenate
+ * @returns Concatenated byte array.
+ * @throws On wrong argument types. {@link TypeError}
+ * @example
+ * Concatenate multiple byte arrays.
+ * ```ts
+ * concatBytes(new Uint8Array([1]), new Uint8Array([2]));
+ * ```
+ */
+function concatBytes() {
+  var sum = 0;
+  for (var i = 0; i < arguments.length; i++) {
+    var a = i < 0 || arguments.length <= i ? undefined : arguments[i];
+    abytes(a);
+    sum += a.length;
+  }
+  var res = new Uint8Array(sum);
+  for (var _i = 0, pad = 0; _i < arguments.length; _i++) {
+    var _a = _i < 0 || arguments.length <= _i ? undefined : arguments[_i];
+    res.set(_a, pad);
+    pad += _a.length;
+  }
+  return res;
+}
+/**
+ * Merges default options and passed options.
+ * @param defaults - base option object
+ * @param opts - user overrides
+ * @returns Merged option object. The merge mutates `defaults` in place.
+ * @throws On wrong argument types. {@link TypeError}
+ * @example
+ * Merge user overrides onto default options.
+ * ```ts
+ * checkOpts({ dkLen: 32 }, { asyncTick: 10 });
+ * ```
+ */
+function checkOpts(defaults, opts) {
+  if (opts !== undefined && {}.toString.call(opts) !== '[object Object]') throw new TypeError('options must be object or undefined');
+  var merged = Object.assign(defaults, opts);
+  return merged;
+}
+/**
+ * Creates a callable hash function from a stateful class constructor.
+ * @param hashCons - hash constructor or factory
+ * @param info - optional metadata such as DER OID
+ * @returns Frozen callable hash wrapper with `.create()`.
+ *   Wrapper construction eagerly calls `hashCons(undefined)` once to read
+ *   `outputLen` / `blockLen`, so constructor side effects happen at module
+ *   init time.
+ * @example
+ * Wrap a stateful hash constructor into a callable helper.
+ * ```ts
+ * import { createHasher } from '@noble/hashes/utils.js';
+ * import { sha256 } from '@noble/hashes/sha2.js';
+ * const wrapped = createHasher(sha256.create, { oid: sha256.oid });
+ * wrapped(new Uint8Array([1]));
+ * ```
+ */
+function createHasher(hashCons) {
+  var info = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : {};
+  var hashC = (msg, opts) => hashCons(opts).update(msg).digest();
+  var tmp = hashCons(undefined);
+  hashC.outputLen = tmp.outputLen;
+  hashC.blockLen = tmp.blockLen;
+  hashC.canXOF = tmp.canXOF;
+  hashC.create = opts => hashCons(opts);
+  Object.assign(hashC, info);
+  return Object.freeze(hashC);
+}
+/**
+ * Cryptographically secure PRNG backed by `crypto.getRandomValues`.
+ * @param bytesLength - number of random bytes to generate
+ * @returns Random bytes.
+ * The platform `getRandomValues()` implementation still defines any
+ * single-call length cap, and this helper rejects oversize requests
+ * with a stable library `RangeError` instead of host-specific errors.
+ * @throws On wrong argument types. {@link TypeError}
+ * @throws On wrong argument ranges or values. {@link RangeError}
+ * @throws If the current runtime does not provide `crypto.getRandomValues`. {@link Error}
+ * @example
+ * Generate a fresh random key or nonce.
+ * ```ts
+ * const key = randomBytes(16);
+ * ```
+ */
+function randomBytes() {
+  var bytesLength = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : 32;
+  // Match the repo's other length-taking helpers instead of relying on Uint8Array coercion.
+  anumber(bytesLength, 'bytesLength');
+  var cr = typeof globalThis === 'object' ? globalThis.crypto : null;
+  if (typeof (cr === null || cr === void 0 ? void 0 : cr.getRandomValues) !== 'function') throw new Error('crypto.getRandomValues must be defined');
+  // Web Cryptography API Level 2 §10.1.1:
+  // if `byteLength > 65536`, throw `QuotaExceededError`.
+  // Keep the guard explicit so callers can see the quota in code
+  // instead of discovering it by reading the spec or host errors.
+  // This wrapper surfaces the same quota as a stable library RangeError.
+  if (bytesLength > 65536) throw new RangeError("\"bytesLength\" expected <= 65536, got ".concat(bytesLength));
+  return cr.getRandomValues(new Uint8Array(bytesLength));
+}
+/**
+ * Creates OID metadata for NIST hashes with prefix `06 09 60 86 48 01 65 03 04 02`.
+ * @param suffix - final OID byte for the selected hash.
+ *   The helper accepts any byte even though only the documented NIST hash
+ *   suffixes are meaningful downstream.
+ * @returns Object containing the DER-encoded OID.
+ * @example
+ * Build OID metadata for a NIST hash.
+ * ```ts
+ * oidNist(0x01);
+ * ```
+ */
+var oidNist = suffix => ({
+  // Current NIST hashAlgs suffixes used here fit in one DER subidentifier octet.
+  // Larger suffix values would need base-128 OID encoding and a different length byte.
+  oid: Uint8Array.from([0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, suffix])
+});
+
+/***/ }),
+
+/***/ "./src/onlykey-fido2/onlykey/vendor/@noble/post-quantum/_crystals.js":
+/*!***************************************************************************!*\
+  !*** ./src/onlykey-fido2/onlykey/vendor/@noble/post-quantum/_crystals.js ***!
+  \***************************************************************************/
+/*! exports provided: genCrystals, XOF128, XOF256 */
+/***/ (function(module, __webpack_exports__, __webpack_require__) {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "genCrystals", function() { return genCrystals; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "XOF128", function() { return XOF128; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "XOF256", function() { return XOF256; });
+/* harmony import */ var _noble_curves_abstract_fft_js__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! @noble/curves/abstract/fft.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/abstract/fft.js");
+/* harmony import */ var _noble_hashes_sha3_js__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(/*! @noble/hashes/sha3.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/hashes/sha3.js");
+/* harmony import */ var _utils_js__WEBPACK_IMPORTED_MODULE_2__ = __webpack_require__(/*! ./utils.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/post-quantum/utils.js");
+function ownKeys(e, r) { var t = Object.keys(e); if (Object.getOwnPropertySymbols) { var o = Object.getOwnPropertySymbols(e); r && (o = o.filter(function (r) { return Object.getOwnPropertyDescriptor(e, r).enumerable; })), t.push.apply(t, o); } return t; }
+function _objectSpread(e) { for (var r = 1; r < arguments.length; r++) { var t = null != arguments[r] ? arguments[r] : {}; r % 2 ? ownKeys(Object(t), !0).forEach(function (r) { _defineProperty(e, r, t[r]); }) : Object.getOwnPropertyDescriptors ? Object.defineProperties(e, Object.getOwnPropertyDescriptors(t)) : ownKeys(Object(t)).forEach(function (r) { Object.defineProperty(e, r, Object.getOwnPropertyDescriptor(t, r)); }); } return e; }
+function _defineProperty(e, r, t) { return (r = _toPropertyKey(r)) in e ? Object.defineProperty(e, r, { value: t, enumerable: !0, configurable: !0, writable: !0 }) : e[r] = t, e; }
+function _toPropertyKey(t) { var i = _toPrimitive(t, "string"); return "symbol" == typeof i ? i : i + ""; }
+function _toPrimitive(t, r) { if ("object" != typeof t || !t) return t; var e = t[Symbol.toPrimitive]; if (void 0 !== e) { var i = e.call(t, r || "default"); if ("object" != typeof i) return i; throw new TypeError("@@toPrimitive must return a primitive value."); } return ("string" === r ? String : Number)(t); }
+/**
+ * Internal methods for lattice-based ML-KEM and ML-DSA.
+ * @module
+ */
+/*! noble-post-quantum - MIT License (c) 2024 Paul Miller (paulmillr.com) */
+
+
+
+/**
+ * Creates shared modular arithmetic, NTT, and packing helpers for CRYSTALS schemes.
+ * @param opts - Polynomial and transform parameters. See {@link CrystalOpts}.
+ * @returns CRYSTALS arithmetic and encoding helpers.
+ * @example
+ * Create shared modular arithmetic and NTT helpers for a CRYSTALS parameter set.
+ * ```ts
+ * const crystals = genCrystals({
+ *   newPoly: (n) => new Uint16Array(n),
+ *   N: 256,
+ *   Q: 3329,
+ *   F: 3303,
+ *   ROOT_OF_UNITY: 17,
+ *   brvBits: 7,
+ *   isKyber: true,
+ * });
+ * const reduced = crystals.mod(-1);
+ * ```
+ */
+var genCrystals = opts => {
+  // isKyber: true means Kyber, false means Dilithium
+  var newPoly = opts.newPoly,
+    N = opts.N,
+    Q = opts.Q,
+    F = opts.F,
+    ROOT_OF_UNITY = opts.ROOT_OF_UNITY,
+    brvBits = opts.brvBits,
+    isKyber = opts.isKyber;
+  // Normalize JS `%` into the canonical Z_m representative `[0, modulo-1]` expected by
+  // FIPS 203 §2.3 / FIPS 204 §2.3 before downstream mod-q arithmetic.
+  var mod = function mod(a) {
+    var modulo = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : Q;
+    var result = a % modulo | 0;
+    return (result >= 0 ? result | 0 : modulo + result | 0) | 0;
+  };
+  // FIPS 204 §7.4 uses the centered `mod ±` representative for low bits, keeping the
+  // positive midpoint when `modulo` is even.
+  // Center to `[-floor((modulo-1)/2), floor(modulo/2)]`.
+  var smod = function smod(a) {
+    var modulo = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : Q;
+    var r = mod(a, modulo) | 0;
+    return (r > modulo >> 1 ? r - modulo | 0 : r) | 0;
+  };
+  // Kyber uses the FIPS 203 Appendix A `BitRev_7` table here via the first 128 entries, while
+  // Dilithium uses the FIPS 204 §7.5 / Appendix B `BitRev_8` zetas table over all 256 entries.
+  function getZettas() {
+    var out = newPoly(N);
+    for (var i = 0; i < N; i++) {
+      var b = Object(_noble_curves_abstract_fft_js__WEBPACK_IMPORTED_MODULE_0__["reverseBits"])(i, brvBits);
+      var p = BigInt(ROOT_OF_UNITY) ** BigInt(b) % BigInt(Q);
+      out[i] = Number(p) | 0;
+    }
+    return out;
+  }
+  var nttZetas = getZettas();
+  // Number-Theoretic Transform
+  // Explained: https://electricdusk.com/ntt.html
+  // Kyber has slightly different params, since there is no 512th primitive root of unity mod q,
+  // only 256th primitive root of unity mod. Which also complicates MultiplyNTT.
+  var field = {
+    add: (a, b) => mod((a | 0) + (b | 0)) | 0,
+    sub: (a, b) => mod((a | 0) - (b | 0)) | 0,
+    mul: (a, b) => mod((a | 0) * (b | 0)) | 0,
+    inv: _a => {
+      throw new Error('not implemented');
+    }
+  };
+  var nttOpts = {
+    N,
+    roots: nttZetas,
+    invertButterflies: true,
+    skipStages: isKyber ? 1 : 0,
+    brp: false
+  };
+  var dif = Object(_noble_curves_abstract_fft_js__WEBPACK_IMPORTED_MODULE_0__["FFTCore"])(field, _objectSpread({
+    dit: false
+  }, nttOpts));
+  var dit = Object(_noble_curves_abstract_fft_js__WEBPACK_IMPORTED_MODULE_0__["FFTCore"])(field, _objectSpread({
+    dit: true
+  }, nttOpts));
+  var NTT = {
+    encode: r => {
+      return dif(r);
+    },
+    decode: r => {
+      dit(r);
+      // The inverse-NTT normalization factor is family-specific: FIPS 203 Algorithm 10 line 14
+      // uses `128^-1 mod q` for Kyber, while FIPS 204 Algorithm 42 lines 21-23 use `256^-1 mod q`.
+      // kyber uses 128 here, because brv && stuff
+      for (var i = 0; i < r.length; i++) r[i] = mod(F * r[i]);
+      return r;
+    }
+  };
+  // Pack one little-endian `d`-bit word per coefficient, matching FIPS 203 ByteEncode /
+  // ByteDecode and the FIPS 204 BitsToBytes-based polynomial packing helpers.
+  var bitsCoder = (d, c) => {
+    var mask = Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["getMask"])(d);
+    var bytesLen = d * (N / 8);
+    return {
+      bytesLen,
+      encode: poly_ => {
+        var poly = poly_;
+        var r = new Uint8Array(bytesLen);
+        for (var i = 0, buf = 0, bufLen = 0, pos = 0; i < poly.length; i++) {
+          buf |= (c.encode(poly[i]) & mask) << bufLen;
+          bufLen += d;
+          for (; bufLen >= 8; bufLen -= 8, buf >>= 8) r[pos++] = buf & Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["getMask"])(bufLen);
+        }
+        return r;
+      },
+      decode: bytes => {
+        var r = newPoly(N);
+        for (var i = 0, buf = 0, bufLen = 0, pos = 0; i < bytes.length; i++) {
+          buf |= bytes[i] << bufLen;
+          bufLen += 8;
+          for (; bufLen >= d; bufLen -= d, buf >>= d) r[pos++] = c.decode(buf & mask);
+        }
+        return r;
+      }
+    };
+  };
+  return {
+    mod,
+    smod,
+    nttZetas: nttZetas,
+    NTT: {
+      encode: r => NTT.encode(r),
+      decode: r => NTT.decode(r)
+    },
+    bitsCoder: bitsCoder
+  };
+};
+var createXofShake = shake => (seed, blockLen) => {
+  if (!blockLen) blockLen = shake.blockLen;
+  // Optimizations that won't mater:
+  // - cached seed update (two .update(), on start and on the end)
+  // - another cache which cloned into working copy
+  // Faster than multiple updates, since seed less than blockLen
+  var _seed = new Uint8Array(seed.length + 2);
+  _seed.set(seed);
+  var seedLen = seed.length;
+  var buf = new Uint8Array(blockLen); // == shake128.blockLen
+  var h = shake.create({});
+  var calls = 0;
+  var xofs = 0;
+  return {
+    stats: () => ({
+      calls,
+      xofs
+    }),
+    get: (x, y) => {
+      // Rebind to `seed || x || y` so callers can implement the spec's per-coordinate
+      // SHAKE inputs like `rho || j || i` and `rho || IntegerToBytes(counter, 2)`.
+      _seed[seedLen + 0] = x;
+      _seed[seedLen + 1] = y;
+      h.destroy();
+      h = shake.create({}).update(_seed);
+      calls++;
+      return () => {
+        xofs++;
+        return h.xofInto(buf);
+      };
+    },
+    clean: () => {
+      h.destroy();
+      Object(_utils_js__WEBPACK_IMPORTED_MODULE_2__["cleanBytes"])(buf, _seed);
+    }
+  };
+};
+/**
+ * SHAKE128-based extendable-output reader factory used by ML-KEM.
+ * `get(x, y)` selects one coordinate pair at a time; calling it again invalidates previously
+ * returned readers, and each squeeze reuses one mutable internal output buffer.
+ * @param seed - Seed bytes for the reader.
+ * @param blockLen - Optional output block length.
+ * @returns Stateful XOF reader.
+ * @example
+ * Build the ML-KEM SHAKE128 matrix expander and read one block.
+ * ```ts
+ * import { randomBytes } from '@noble/post-quantum/utils.js';
+ * import { XOF128 } from '@noble/post-quantum/_crystals.js';
+ * const reader = XOF128(randomBytes(32));
+ * const block = reader.get(0, 0)();
+ * ```
+ */
+var XOF128 = /* @__PURE__ */createXofShake(_noble_hashes_sha3_js__WEBPACK_IMPORTED_MODULE_1__["shake128"]);
+/**
+ * SHAKE256-based extendable-output reader factory used by ML-DSA.
+ * `get(x, y)` appends raw one-byte coordinates to the seed, invalidates previously returned
+ * readers, and reuses one mutable internal output buffer for each squeeze.
+ * @param seed - Seed bytes for the reader.
+ * @param blockLen - Optional output block length.
+ * @returns Stateful XOF reader.
+ * @example
+ * Build the ML-DSA SHAKE256 coefficient expander and read one block.
+ * ```ts
+ * import { randomBytes } from '@noble/post-quantum/utils.js';
+ * import { XOF256 } from '@noble/post-quantum/_crystals.js';
+ * const reader = XOF256(randomBytes(32));
+ * const block = reader.get(0, 0)();
+ * ```
+ */
+var XOF256 = /* @__PURE__ */createXofShake(_noble_hashes_sha3_js__WEBPACK_IMPORTED_MODULE_1__["shake256"]);
+
+/***/ }),
+
+/***/ "./src/onlykey-fido2/onlykey/vendor/@noble/post-quantum/ml-kem.js":
+/*!************************************************************************!*\
+  !*** ./src/onlykey-fido2/onlykey/vendor/@noble/post-quantum/ml-kem.js ***!
+  \************************************************************************/
+/*! exports provided: PARAMS, ml_kem512, ml_kem768, ml_kem1024, __tests */
+/***/ (function(module, __webpack_exports__, __webpack_require__) {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "PARAMS", function() { return PARAMS; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "ml_kem512", function() { return ml_kem512; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "ml_kem768", function() { return ml_kem768; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "ml_kem1024", function() { return ml_kem1024; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "__tests", function() { return __tests; });
+/* harmony import */ var _noble_hashes_sha3_js__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! @noble/hashes/sha3.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/hashes/sha3.js");
+/* harmony import */ var _noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_1__ = __webpack_require__(/*! @noble/hashes/utils.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/hashes/utils.js");
+/* harmony import */ var _crystals_js__WEBPACK_IMPORTED_MODULE_2__ = __webpack_require__(/*! ./_crystals.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/post-quantum/_crystals.js");
+/* harmony import */ var _utils_js__WEBPACK_IMPORTED_MODULE_3__ = __webpack_require__(/*! ./utils.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/post-quantum/utils.js");
+function ownKeys(e, r) { var t = Object.keys(e); if (Object.getOwnPropertySymbols) { var o = Object.getOwnPropertySymbols(e); r && (o = o.filter(function (r) { return Object.getOwnPropertyDescriptor(e, r).enumerable; })), t.push.apply(t, o); } return t; }
+function _objectSpread(e) { for (var r = 1; r < arguments.length; r++) { var t = null != arguments[r] ? arguments[r] : {}; r % 2 ? ownKeys(Object(t), !0).forEach(function (r) { _defineProperty(e, r, t[r]); }) : Object.getOwnPropertyDescriptors ? Object.defineProperties(e, Object.getOwnPropertyDescriptors(t)) : ownKeys(Object(t)).forEach(function (r) { Object.defineProperty(e, r, Object.getOwnPropertyDescriptor(t, r)); }); } return e; }
+function _defineProperty(e, r, t) { return (r = _toPropertyKey(r)) in e ? Object.defineProperty(e, r, { value: t, enumerable: !0, configurable: !0, writable: !0 }) : e[r] = t, e; }
+function _toPropertyKey(t) { var i = _toPrimitive(t, "string"); return "symbol" == typeof i ? i : i + ""; }
+function _toPrimitive(t, r) { if ("object" != typeof t || !t) return t; var e = t[Symbol.toPrimitive]; if (void 0 !== e) { var i = e.call(t, r || "default"); if ("object" != typeof i) return i; throw new TypeError("@@toPrimitive must return a primitive value."); } return ("string" === r ? String : Number)(t); }
+function _slicedToArray(r, e) { return _arrayWithHoles(r) || _iterableToArrayLimit(r, e) || _unsupportedIterableToArray(r, e) || _nonIterableRest(); }
+function _nonIterableRest() { throw new TypeError("Invalid attempt to destructure non-iterable instance.\nIn order to be iterable, non-array objects must have a [Symbol.iterator]() method."); }
+function _unsupportedIterableToArray(r, a) { if (r) { if ("string" == typeof r) return _arrayLikeToArray(r, a); var t = {}.toString.call(r).slice(8, -1); return "Object" === t && r.constructor && (t = r.constructor.name), "Map" === t || "Set" === t ? Array.from(r) : "Arguments" === t || /^(?:Ui|I)nt(?:8|16|32)(?:Clamped)?Array$/.test(t) ? _arrayLikeToArray(r, a) : void 0; } }
+function _arrayLikeToArray(r, a) { (null == a || a > r.length) && (a = r.length); for (var e = 0, n = Array(a); e < a; e++) n[e] = r[e]; return n; }
+function _iterableToArrayLimit(r, l) { var t = null == r ? null : "undefined" != typeof Symbol && r[Symbol.iterator] || r["@@iterator"]; if (null != t) { var e, n, i, u, a = [], f = !0, o = !1; try { if (i = (t = t.call(r)).next, 0 === l) { if (Object(t) !== t) return; f = !1; } else for (; !(f = (e = i.call(t)).done) && (a.push(e.value), a.length !== l); f = !0); } catch (r) { o = !0, n = r; } finally { try { if (!f && null != t.return && (u = t.return(), Object(u) !== u)) return; } finally { if (o) throw n; } } return a; } }
+function _arrayWithHoles(r) { if (Array.isArray(r)) return r; }
+/**
+ * ML-KEM: Module Lattice-based Key Encapsulation Mechanism from
+ * [FIPS-203](https://csrc.nist.gov/pubs/fips/203/ipd). A.k.a. CRYSTALS-Kyber.
+ *
+ * Key encapsulation is similar to DH / ECDH (think X25519), with important differences:
+ * * Unlike in ECDH, we can't verify if it was "Bob" who've sent the shared secret
+ * * Unlike ECDH, it is probabalistic and relies on quality of randomness (CSPRNG).
+ * * Decapsulation never throws an error, even when shared secret was
+ *   encrypted by a different public key. It will just return a different shared secret.
+ *
+ * There are some concerns with regards to security: see
+ * [djb blog](https://blog.cr.yp.to/20231003-countcorrectly.html) and
+ * [mailing list](https://groups.google.com/a/list.nist.gov/g/pqc-forum/c/W2VOzy0wz_E).
+ *
+ * Has similar internals to ML-DSA, but their keys and params are different.
+ *
+ * Check out [official site](https://www.pq-crystals.org/kyber/resources.shtml),
+ * [repo](https://github.com/pq-crystals/kyber),
+ * [spec](https://datatracker.ietf.org/doc/draft-cfrg-schwabe-kyber/).
+ * @module
+ */
+/*! noble-post-quantum - MIT License (c) 2024 Paul Miller (paulmillr.com) */
+
+
+
+
+/** Key encapsulation mechanism interface */
+var N = 256; // Kyber (not FIPS-203) supports different lengths, but all std modes were using 256
+var Q = 3329; // 13*(2**8)+1, modulo prime
+var F = 3303; // 3303 ≡ 128**(−1) mod q (FIPS-203)
+var ROOT_OF_UNITY = 17; // ζ = 17 ∈ Zq is a primitive 256-th root of unity modulo Q. ζ**128 ≡−1
+// treeshake: keep genCrystals behind the object so PARAMS-only bundles can drop it entirely.
+// Shared CRYSTALS helper in the ML-KEM branch: Kyber mode, 7-bit bit-reversal,
+// and Uint16Array polys because current coefficients stay reduced modulo q.
+var crystals = /* @__PURE__ */Object(_crystals_js__WEBPACK_IMPORTED_MODULE_2__["genCrystals"])({
+  N,
+  Q,
+  F,
+  ROOT_OF_UNITY,
+  newPoly: n => new Uint16Array(n),
+  brvBits: 7,
+  isKyber: true
+});
+/** Internal params of ML-KEM versions */
+// prettier-ignore
+/** Built-in ML-KEM parameter presets keyed by the public export names
+ * `ml_kem512` / `ml_kem768` / `ml_kem1024`.
+ * `RBGstrength` is Table 2's required randomness-source strength in bits,
+ * not a generic security label.
+ */
+var PARAMS = /* @__PURE__ */(() => Object.freeze({
+  512: Object.freeze({
+    N,
+    Q,
+    K: 2,
+    ETA1: 3,
+    ETA2: 2,
+    du: 10,
+    dv: 4,
+    RBGstrength: 128
+  }),
+  768: Object.freeze({
+    N,
+    Q,
+    K: 3,
+    ETA1: 2,
+    ETA2: 2,
+    du: 10,
+    dv: 4,
+    RBGstrength: 192
+  }),
+  1024: Object.freeze({
+    N,
+    Q,
+    K: 4,
+    ETA1: 2,
+    ETA2: 2,
+    du: 11,
+    dv: 5,
+    RBGstrength: 256
+  })
+}))();
+// FIPS-203: compress/decompress
+var compress = d => {
+  // d=12 is the ByteEncode12/ByteDecode12 path, not lossy compression.
+  // ByteDecode12 interprets each 12-bit word modulo q; without that reduction the public-key
+  // modulus check in encapsulate() becomes a no-op for malformed coefficients like 4095.
+  if (d >= 12) return {
+    encode: i => i,
+    decode: i => i >= Q ? i - Q : i
+  };
+  // Comments map to python implementation in RFC (draft-cfrg-schwabe-kyber)
+  // const round = (i: number) => Math.floor(i + 0.5) | 0;
+  var a = 2 ** (d - 1);
+  return {
+    // This only matches standalone Compress_d after bitsCoder masks the result into Z_(2^d).
+    encode: i => ((i << d) + Q / 2) / Q,
+    // const decompress = (i: number) => round((Q / 2 ** d) * i);
+    decode: i => i * Q + a >>> d
+  };
+};
+// Raw ByteEncode_d / ByteDecode_d from FIPS 203 operate on d-bit words directly.
+// That differs from `polyCoder(d)` for d<12, where noble folds packing together with the lossy
+// ciphertext compression step used by u/v. Tests that exercise the spec's raw packing surface need
+// this exact non-lossy variant instead.
+var byteCoder = d => crystals.bitsCoder(d, d === 12 ? {
+  encode: i => i,
+  decode: i => i >= Q ? i - Q : i
+} : {
+  encode: i => i,
+  decode: i => i
+});
+// NOTE: we merge encoding and compress because it is faster, also both require same d param
+// d=12 is the ByteEncode12/ByteDecode12 path rather than compression, and caller-side
+// public-key modulus checks route through this helper's decode/encode roundtrip.
+// Converts between bytes and d-bits compressed representation.
+// Kinda like convertRadix2 from @scure/base.
+// decode(encode(t)) == t, but there is loss of information on encode(decode(t))
+var polyCoder = d => d === 12 ? byteCoder(12) : crystals.bitsCoder(d, compress(d));
+function polyAdd(a_, b_) {
+  var a = a_;
+  var b = b_;
+  // Mutates `a` in place; callers must pass two N=256 polynomials.
+  for (var i = 0; i < N; i++) a[i] = crystals.mod(a[i] + b[i]); // a += b
+}
+function polySub(a_, b_) {
+  var a = a_;
+  var b = b_;
+  // Mutates `a` in place; callers must pass two N=256 polynomials.
+  for (var i = 0; i < N; i++) a[i] = crystals.mod(a[i] - b[i]); // a -= b
+}
+// FIPS-203: Computes the product of two degree-one polynomials with respect to a quadratic modulus
+function BaseCaseMultiply(a0, a1, b0, b1, zeta) {
+  // `zeta` here is Algorithm 11's γ = ζ^(2BitRev_7(i)+1).
+  var c0 = crystals.mod(a1 * b1 * zeta + a0 * b0);
+  var c1 = crystals.mod(a0 * b1 + a1 * b0);
+  return {
+    c0,
+    c1
+  };
+}
+// FIPS-203: Computes the product (in the ring Tq) of two NTT representations.
+// Works in place on `f`; `g` is read-only and both inputs must already be in NTT form.
+function _MultiplyNTTs(f_, g_) {
+  var f = f_;
+  var g = g_;
+  for (var i = 0; i < N / 2; i++) {
+    var z = crystals.nttZetas[64 + (i >> 1)];
+    if (i & 1) z = -z;
+    var _BaseCaseMultiply = BaseCaseMultiply(f[2 * i + 0], f[2 * i + 1], g[2 * i + 0], g[2 * i + 1], z),
+      c0 = _BaseCaseMultiply.c0,
+      c1 = _BaseCaseMultiply.c1;
+    f[2 * i + 0] = c0;
+    f[2 * i + 1] = c1;
+  }
+  return f;
+}
+// Return poly in NTT representation
+function _SampleNTT(xof_) {
+  var xof = xof_;
+  // The reader must already bind the Algorithm 7 seed||j||i bytes
+  // and return block lengths divisible by 3.
+  var r = new Uint16Array(N);
+  for (var j = 0; j < N;) {
+    var b = xof();
+    if (b.length % 3) throw new Error('SampleNTT: unaligned block');
+    for (var i = 0; j < N && i + 3 <= b.length; i += 3) {
+      var d1 = (b[i + 0] >> 0 | b[i + 1] << 8) & 0xfff;
+      var d2 = (b[i + 1] >> 4 | b[i + 2] << 4) & 0xfff;
+      if (d1 < Q) r[j++] = d1;
+      if (j < N && d2 < Q) r[j++] = d2;
+    }
+  }
+  return r;
+}
+// Sampling from the centered binomial distribution
+// Returns poly with small coefficients (noise/errors) stored modulo q in ordinary coefficient form.
+// Current callers only use Table 2 eta values {2,3} and PRF outputs of exactly 64*eta bytes.
+var sampleCBDBytes = (buf, eta) => {
+  var r = new Uint16Array(N);
+  // CBD consumes the PRF bitstream in little-endian byte order; normalize the word view on BE,
+  // then swap it back so callers still observe `buf` as read-only.
+  var b32 = Object(_noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_1__["u32"])(buf);
+  Object(_noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_1__["swap32IfBE"])(b32);
+  var len = 0;
+  for (var i = 0, p = 0, bb = 0, t0 = 0; i < b32.length; i++) {
+    var b = b32[i];
+    for (var j = 0; j < 32; j++) {
+      bb += b & 1;
+      b >>= 1;
+      len += 1;
+      if (len === eta) {
+        t0 = bb;
+        bb = 0;
+      } else if (len === 2 * eta) {
+        r[p++] = crystals.mod(t0 - bb);
+        bb = 0;
+        len = 0;
+      }
+    }
+  }
+  Object(_noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_1__["swap32IfBE"])(b32);
+  if (len) throw new Error("sampleCBD: leftover bits: ".concat(len));
+  return r;
+};
+function sampleCBD(PRF_, seed, nonce, eta) {
+  var PRF = PRF_;
+  return sampleCBDBytes(PRF(eta * N / 4, seed, nonce), eta);
+}
+// K-PKE
+// Internal ML-KEM subroutine only: exact 32-byte `seed` / `msg` inputs
+// come from Algorithms 13-15, and the helper mutates decoded temporary
+// polynomials in place while leaving caller byte arrays unchanged.
+var genKPKE = opts_ => {
+  var opts = opts_;
+  var K = opts.K,
+    PRF = opts.PRF,
+    XOF = opts.XOF,
+    HASH512 = opts.HASH512,
+    ETA1 = opts.ETA1,
+    ETA2 = opts.ETA2,
+    du = opts.du,
+    dv = opts.dv;
+  var poly1 = polyCoder(1);
+  var polyV = polyCoder(dv);
+  var polyU = polyCoder(du);
+  var publicCoder = Object(_utils_js__WEBPACK_IMPORTED_MODULE_3__["splitCoder"])('publicKey', Object(_utils_js__WEBPACK_IMPORTED_MODULE_3__["vecCoder"])(polyCoder(12), K), 32);
+  var secretCoder = Object(_utils_js__WEBPACK_IMPORTED_MODULE_3__["vecCoder"])(polyCoder(12), K);
+  var cipherCoder = Object(_utils_js__WEBPACK_IMPORTED_MODULE_3__["splitCoder"])('ciphertext', Object(_utils_js__WEBPACK_IMPORTED_MODULE_3__["vecCoder"])(polyU, K), polyV);
+  var seedCoder = Object(_utils_js__WEBPACK_IMPORTED_MODULE_3__["splitCoder"])('seed', 32, 32);
+  return {
+    secretCoder,
+    lengths: {
+      secretKey: secretCoder.bytesLen,
+      publicKey: publicCoder.bytesLen,
+      cipherText: cipherCoder.bytesLen
+    },
+    keygen: seed => {
+      Object(_utils_js__WEBPACK_IMPORTED_MODULE_3__["abytes"])(seed, 32, 'seed');
+      var seedDst = new Uint8Array(33);
+      seedDst.set(seed);
+      // FIPS 203 Algorithm 13 appends the parameter-set byte `k`
+      // before `G(d || k)`, so expanding the same 32-byte seed
+      // under a different ML-KEM parameter set yields unrelated keys.
+      seedDst[32] = K;
+      var seedHash = HASH512(seedDst);
+      var _seedCoder$decode = seedCoder.decode(seedHash),
+        _seedCoder$decode2 = _slicedToArray(_seedCoder$decode, 2),
+        rho = _seedCoder$decode2[0],
+        sigma = _seedCoder$decode2[1];
+      var sHat = [];
+      var tHat = [];
+      for (var i = 0; i < K; i++) sHat.push(crystals.NTT.encode(sampleCBD(PRF, sigma, i, ETA1)));
+      var x = XOF(rho);
+      for (var _i = 0; _i < K; _i++) {
+        var e = crystals.NTT.encode(sampleCBD(PRF, sigma, K + _i, ETA1));
+        for (var j = 0; j < K; j++) {
+          var aji = _SampleNTT(x.get(j, _i)); // A[i][j], inplace
+          polyAdd(e, _MultiplyNTTs(aji, sHat[j]));
+        }
+        tHat.push(e); // t ← A ◦ s + e
+      }
+      x.clean();
+      var res = {
+        publicKey: publicCoder.encode([tHat, rho]),
+        secretKey: secretCoder.encode(sHat)
+      };
+      Object(_utils_js__WEBPACK_IMPORTED_MODULE_3__["cleanBytes"])(rho, sigma, sHat, tHat, seedDst, seedHash);
+      return res;
+    },
+    encrypt: (publicKey, msg, seed) => {
+      var _publicCoder$decode = publicCoder.decode(publicKey),
+        _publicCoder$decode2 = _slicedToArray(_publicCoder$decode, 2),
+        tHat = _publicCoder$decode2[0],
+        rho = _publicCoder$decode2[1];
+      var rHat = [];
+      for (var i = 0; i < K; i++) rHat.push(crystals.NTT.encode(sampleCBD(PRF, seed, i, ETA1)));
+      var x = XOF(rho);
+      var tmp2 = new Uint16Array(N);
+      var u = [];
+      for (var _i2 = 0; _i2 < K; _i2++) {
+        var e1 = sampleCBD(PRF, seed, K + _i2, ETA2);
+        var tmp = new Uint16Array(N);
+        for (var j = 0; j < K; j++) {
+          var aij = _SampleNTT(x.get(_i2, j)); // A[j][i], inplace transpose access
+          polyAdd(tmp, _MultiplyNTTs(aij, rHat[j])); // t += aij * rHat[j]
+        }
+        polyAdd(e1, crystals.NTT.decode(tmp)); // e1 += tmp
+        u.push(e1);
+        polyAdd(tmp2, _MultiplyNTTs(tHat[_i2], rHat[_i2])); // t2 += tHat[i] * rHat[i]
+        Object(_utils_js__WEBPACK_IMPORTED_MODULE_3__["cleanBytes"])(tmp);
+      }
+      x.clean();
+      var e2 = sampleCBD(PRF, seed, 2 * K, ETA2);
+      polyAdd(e2, crystals.NTT.decode(tmp2)); // e2 += tmp2
+      var v = poly1.decode(msg); // encode plaintext m into polynomial v
+      polyAdd(v, e2); // v += e2
+      Object(_utils_js__WEBPACK_IMPORTED_MODULE_3__["cleanBytes"])(tHat, rHat, tmp2, e2);
+      return cipherCoder.encode([u, v]);
+    },
+    decrypt: (cipherText, privateKey) => {
+      var _cipherCoder$decode = cipherCoder.decode(cipherText),
+        _cipherCoder$decode2 = _slicedToArray(_cipherCoder$decode, 2),
+        u = _cipherCoder$decode2[0],
+        v = _cipherCoder$decode2[1];
+      var sk = secretCoder.decode(privateKey); // s  ← ByteDecode_12(dkPKE)
+      var tmp = new Uint16Array(N);
+      // tmp += sk[i] * u[i]
+      for (var i = 0; i < K; i++) polyAdd(tmp, _MultiplyNTTs(sk[i], crystals.NTT.encode(u[i])));
+      polySub(v, crystals.NTT.decode(tmp)); // w = v' - tmp
+      Object(_utils_js__WEBPACK_IMPORTED_MODULE_3__["cleanBytes"])(tmp, sk, u);
+      return poly1.encode(v);
+    }
+  };
+};
+/**
+ * Public ML-KEM wrapper over the internal K-PKE subroutine.
+ * `keygen(seed)` and `encapsulate(publicKey, msg)` are deterministic/test-oriented hooks that map
+ * more directly to Algorithms 16-17 than to the pure no-input / random-internal Algorithms 19-20.
+ * decapsulate() tries to follow the Algorithms 18/21 implicit-reject structure as closely as
+ * practical here by re-encrypting, comparing ciphertexts, returning `Khat` on match or `Kbar` on
+ * mismatch, and zeroizing the non-returned shared-secret candidate; JS/JIT still provides no
+ * constant-time guarantees for that path.
+ */
+function createKyber(opts) {
+  var rawOpts = opts;
+  var KPKE = genKPKE(rawOpts);
+  var HASH256 = rawOpts.HASH256,
+    HASH512 = rawOpts.HASH512,
+    KDF = rawOpts.KDF;
+  var KPKESecretCoder = KPKE.secretCoder,
+    lengths = KPKE.lengths;
+  var secretCoder = Object(_utils_js__WEBPACK_IMPORTED_MODULE_3__["splitCoder"])('secretKey', lengths.secretKey, lengths.publicKey, 32, 32);
+  var msgLen = 32;
+  var seedLen = 64;
+  var kemLengths = Object.freeze(_objectSpread(_objectSpread({}, lengths), {}, {
+    seed: 64,
+    msg: msgLen,
+    msgRand: msgLen,
+    secretKey: secretCoder.bytesLen
+  }));
+  return Object.freeze({
+    info: Object.freeze({
+      type: 'ml-kem'
+    }),
+    lengths: kemLengths,
+    keygen: function keygen() {
+      var seed = arguments.length > 0 && arguments[0] !== undefined ? arguments[0] : Object(_utils_js__WEBPACK_IMPORTED_MODULE_3__["randomBytes"])(seedLen);
+      Object(_utils_js__WEBPACK_IMPORTED_MODULE_3__["abytes"])(seed, seedLen, 'seed');
+      var _KPKE$keygen = KPKE.keygen(seed.subarray(0, 32)),
+        publicKey = _KPKE$keygen.publicKey,
+        sk = _KPKE$keygen.secretKey;
+      var publicKeyHash = HASH256(publicKey);
+      // (dkPKE||ek||H(ek)||z)
+      var secretKey = secretCoder.encode([sk, publicKey, publicKeyHash, seed.subarray(32)]);
+      Object(_utils_js__WEBPACK_IMPORTED_MODULE_3__["cleanBytes"])(sk, publicKeyHash);
+      return {
+        publicKey: publicKey,
+        secretKey: secretKey
+      };
+    },
+    getPublicKey: secretKey => {
+      var _secretCoder$decode = secretCoder.decode(secretKey),
+        _secretCoder$decode2 = _slicedToArray(_secretCoder$decode, 4),
+        _sk = _secretCoder$decode2[0],
+        publicKey = _secretCoder$decode2[1],
+        _publicKeyHash = _secretCoder$decode2[2],
+        _z = _secretCoder$decode2[3];
+      return Uint8Array.from(publicKey);
+    },
+    encapsulate: function encapsulate(publicKey) {
+      var msg = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : Object(_utils_js__WEBPACK_IMPORTED_MODULE_3__["randomBytes"])(msgLen);
+      Object(_utils_js__WEBPACK_IMPORTED_MODULE_3__["abytes"])(publicKey, lengths.publicKey, 'publicKey');
+      Object(_utils_js__WEBPACK_IMPORTED_MODULE_3__["abytes"])(msg, msgLen, 'message');
+      // FIPS-203 includes additional verification check for modulus
+      var eke = publicKey.subarray(0, 384 * opts.K);
+      // Copy because of inplace encoding
+      var ek = KPKESecretCoder.encode(KPKESecretCoder.decode(Object(_utils_js__WEBPACK_IMPORTED_MODULE_3__["copyBytes"])(eke)));
+      // (Modulus check.) Perform the computation ek ← ByteEncode12(ByteDecode12(eke)).
+      // If ek = ̸ eke, the input is invalid. (See Section 4.2.1.)
+      if (!Object(_utils_js__WEBPACK_IMPORTED_MODULE_3__["equalBytes"])(ek, eke)) {
+        Object(_utils_js__WEBPACK_IMPORTED_MODULE_3__["cleanBytes"])(ek);
+        throw new Error('ML-KEM.encapsulate: wrong publicKey modulus');
+      }
+      Object(_utils_js__WEBPACK_IMPORTED_MODULE_3__["cleanBytes"])(ek);
+      // derive randomness
+      var kr = HASH512.create().update(msg).update(HASH256(publicKey)).digest();
+      var cipherText = KPKE.encrypt(publicKey, msg, kr.subarray(32, 64));
+      Object(_utils_js__WEBPACK_IMPORTED_MODULE_3__["cleanBytes"])(kr.subarray(32));
+      return {
+        cipherText: cipherText,
+        sharedSecret: kr.subarray(0, 32)
+      };
+    },
+    decapsulate: (cipherText, secretKey) => {
+      Object(_utils_js__WEBPACK_IMPORTED_MODULE_3__["abytes"])(secretKey, secretCoder.bytesLen, 'secretKey'); // 768*k + 96
+      Object(_utils_js__WEBPACK_IMPORTED_MODULE_3__["abytes"])(cipherText, lengths.cipherText, 'cipherText'); // 32(du*k + dv)
+      // test ← H(dk[384𝑘 ∶ 768𝑘 + 32])) .
+      var k768 = secretCoder.bytesLen - 96;
+      var start = k768 + 32;
+      var test = HASH256(secretKey.subarray(k768 / 2, start));
+      // If test ≠ dk[768𝑘 + 32 ∶ 768𝑘 + 64], then input checking has failed.
+      if (!Object(_utils_js__WEBPACK_IMPORTED_MODULE_3__["equalBytes"])(test, secretKey.subarray(start, start + 32))) throw new Error('invalid secretKey: hash check failed');
+      var _secretCoder$decode3 = secretCoder.decode(secretKey),
+        _secretCoder$decode4 = _slicedToArray(_secretCoder$decode3, 4),
+        sk = _secretCoder$decode4[0],
+        publicKey = _secretCoder$decode4[1],
+        publicKeyHash = _secretCoder$decode4[2],
+        z = _secretCoder$decode4[3];
+      var msg = KPKE.decrypt(cipherText, sk);
+      // derive randomness, Khat, rHat = G(mHat || h)
+      var kr = HASH512.create().update(msg).update(publicKeyHash).digest();
+      var Khat = kr.subarray(0, 32);
+      // re-encrypt using the derived randomness
+      var cipherText2 = KPKE.encrypt(publicKey, msg, kr.subarray(32, 64));
+      // if ciphertexts do not match, “implicitly reject”
+      var isValid = Object(_utils_js__WEBPACK_IMPORTED_MODULE_3__["equalBytes"])(cipherText, cipherText2);
+      var Kbar = KDF.create({
+        dkLen: 32
+      }).update(z).update(cipherText).digest();
+      Object(_utils_js__WEBPACK_IMPORTED_MODULE_3__["cleanBytes"])(msg, cipherText2, !isValid ? Khat : Kbar);
+      return isValid ? Khat : Kbar;
+    }
+  });
+}
+// FIPS 203's PRF_eta binding: current callers use only 32-byte keys, one-byte nonces,
+// and dkLen values {128, 192}; out-of-range nonce numbers still wrap modulo 256 here.
+function shakePRF(dkLen, key, nonce) {
+  return _noble_hashes_sha3_js__WEBPACK_IMPORTED_MODULE_0__["shake256"].create({
+    dkLen
+  }).update(key).update(new Uint8Array([nonce])).digest();
+}
+// Fixed ML-KEM hash/XOF bindings. `KDF` here is the spec's fixed 32-byte `J` call,
+// and swapping any field changes the scheme rather than tuning an internal dependency.
+var opts = /* @__PURE__ */(() => ({
+  HASH256: _noble_hashes_sha3_js__WEBPACK_IMPORTED_MODULE_0__["sha3_256"],
+  HASH512: _noble_hashes_sha3_js__WEBPACK_IMPORTED_MODULE_0__["sha3_512"],
+  KDF: _noble_hashes_sha3_js__WEBPACK_IMPORTED_MODULE_0__["shake256"],
+  XOF: _crystals_js__WEBPACK_IMPORTED_MODULE_2__["XOF128"],
+  PRF: shakePRF
+}))();
+// Parameter-set instantiation step for the spec's "ML-KEM-x" names; current correctness relies
+// on the internal PARAMS rows rather than local validation of arbitrary KEMParam objects.
+var mk = params => createKyber(_objectSpread(_objectSpread({}, opts), params));
+/**
+ * ML-KEM-512: Table 2 row `k=2, η1=3, η2=2, du=10, dv=4`; Table 3 sizes `800/1632/768/32`.
+ * The ASD lifecycle note here is external policy guidance, not a FIPS 203 requirement.
+ */
+var ml_kem512 = /* @__PURE__ */(() => mk(PARAMS[512]))();
+/**
+ * ML-KEM-768: Table 2 row `k=3, η1=2, η2=2, du=10, dv=4`; Table 3 sizes `1184/2400/1088/32`.
+ * The ASD lifecycle note here is external policy guidance, not a FIPS 203 requirement.
+ */
+var ml_kem768 = /* @__PURE__ */(() => mk(PARAMS[768]))();
+/**
+ * ML-KEM-1024: Table 2 row `k=4, η1=2, η2=2, du=11, dv=5`; Table 3 sizes `1568/3168/1568/32`.
+ * The ASD lifecycle note here is external policy guidance, not a FIPS 203 requirement.
+ */
+var ml_kem1024 = /* @__PURE__ */(() => mk(PARAMS[1024]))();
+// NOTE: for tests only, don't use. This keeps the exact internal ML-KEM math surfaces available
+// without re-implementing them in separate test code.
+var __tests = /* @__PURE__ */(() => Object.freeze({
+  Compress_d: (x, d) => {
+    if (d < 1 || d > 11) throw new Error("Compress_d: expected d in [1..11], got ".concat(d));
+    return compress(d).encode(x) & Object(_utils_js__WEBPACK_IMPORTED_MODULE_3__["getMask"])(d);
+  },
+  Decompress_d: (y, d) => {
+    if (d < 1 || d > 11) throw new Error("Decompress_d: expected d in [1..11], got ".concat(d));
+    return compress(d).decode(y);
+  },
+  ByteEncode_d: (F, d) => {
+    if (d < 1 || d > 12) throw new Error("ByteEncode_d: expected d in [1..12], got ".concat(d));
+    return byteCoder(d).encode(F);
+  },
+  ByteDecode_d: (B, d) => {
+    if (d < 1 || d > 12) throw new Error("ByteDecode_d: expected d in [1..12], got ".concat(d));
+    return byteCoder(d).decode(B);
+  },
+  NTT: f => crystals.NTT.encode(Uint16Array.from(f)),
+  NTT_inv: fHat => crystals.NTT.decode(Uint16Array.from(fHat)),
+  MultiplyNTTs: (fHat, gHat) => _MultiplyNTTs(Uint16Array.from(fHat), Uint16Array.from(gHat)),
+  SamplePolyCBD: (B, eta) => {
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_3__["abytes"])(B, 64 * eta, 'B');
+    return sampleCBDBytes(B, eta);
+  },
+  SampleNTT: B => {
+    Object(_utils_js__WEBPACK_IMPORTED_MODULE_3__["abytes"])(B, 34, 'B');
+    var xof = Object(_crystals_js__WEBPACK_IMPORTED_MODULE_2__["XOF128"])(B.subarray(0, 32));
+    try {
+      return _SampleNTT(xof.get(B[32], B[33]));
+    } finally {
+      xof.clean();
+    }
+  }
+}))();
+
+/***/ }),
+
+/***/ "./src/onlykey-fido2/onlykey/vendor/@noble/post-quantum/utils.js":
+/*!***********************************************************************!*\
+  !*** ./src/onlykey-fido2/onlykey/vendor/@noble/post-quantum/utils.js ***!
+  \***********************************************************************/
+/*! exports provided: abytes, concatBytes, randomBytes, equalBytes, copyBytes, byteSwap64, baswap64If, validateOpts, validateVerOpts, validateSigOpts, splitCoder, vecCoder, cleanBytes, getMask, EMPTY, getMessage, checkHash, getMessagePrehash */
+/***/ (function(module, __webpack_exports__, __webpack_require__) {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "abytes", function() { return abytesDoc; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "concatBytes", function() { return concatBytesDoc; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "randomBytes", function() { return randomBytes; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "equalBytes", function() { return equalBytes; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "copyBytes", function() { return copyBytes; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "byteSwap64", function() { return byteSwap64; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "baswap64If", function() { return baswap64If; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "validateOpts", function() { return validateOpts; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "validateVerOpts", function() { return validateVerOpts; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "validateSigOpts", function() { return validateSigOpts; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "splitCoder", function() { return splitCoder; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "vecCoder", function() { return vecCoder; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "cleanBytes", function() { return cleanBytes; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "getMask", function() { return getMask; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "EMPTY", function() { return EMPTY; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "getMessage", function() { return getMessage; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "checkHash", function() { return checkHash; });
+/* harmony export (binding) */ __webpack_require__.d(__webpack_exports__, "getMessagePrehash", function() { return getMessagePrehash; });
+/* harmony import */ var _noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__ = __webpack_require__(/*! @noble/hashes/utils.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/hashes/utils.js");
+/**
+ * Utilities for hex, bytearray and number handling.
+ * @module
+ */
+/*! noble-post-quantum - MIT License (c) 2024 Paul Miller (paulmillr.com) */
+
+/**
+ * Asserts that a value is a byte array and optionally checks its length.
+ * Returns the original reference unchanged on success, and currently also accepts Node `Buffer`
+ * values through the upstream validator.
+ * This helper throws on malformed input, so APIs that must return `false` need to guard lengths
+ * before decoding or before calling it.
+ * @example
+ * Validate that a value is a byte array with the expected length.
+ * ```ts
+ * abytes(new Uint8Array([1]), 1);
+ * ```
+ */
+var abytesDoc = _noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"];
+
+/**
+ * Concatenates byte arrays into a new `Uint8Array`.
+ * Zero arguments return an empty `Uint8Array`.
+ * Invalid segments throw before allocation because each argument is validated first.
+ * @example
+ * Concatenate two byte arrays into one result.
+ * ```ts
+ * concatBytes(new Uint8Array([1]), new Uint8Array([2]));
+ * ```
+ */
+var concatBytesDoc = _noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__["concatBytes"];
+
+/**
+ * Returns cryptographically secure random bytes.
+ * Requires `globalThis.crypto.getRandomValues` and throws if that API is unavailable.
+ * `bytesLength` is validated by the upstream helper as a non-negative integer before allocation,
+ * so negative and fractional values both throw instead of truncating through JS `ToIndex`.
+ * @param bytesLength - Number of random bytes to generate.
+ * @returns Fresh random bytes.
+ * @example
+ * Generate a fresh random seed.
+ * ```ts
+ * const seed = randomBytes(4);
+ * ```
+ */
+var randomBytes = _noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__["randomBytes"];
+/**
+ * Compares two byte arrays in a length-constant way for equal lengths.
+ * Unequal lengths return `false` immediately, and there is no runtime type validation.
+ * @param a - First byte array.
+ * @param b - Second byte array.
+ * @returns Whether both arrays contain the same bytes.
+ * @example
+ * Compare two byte arrays for equality.
+ * ```ts
+ * equalBytes(new Uint8Array([1]), new Uint8Array([1]));
+ * ```
+ */
+function equalBytes(a, b) {
+  if (a.length !== b.length) return false;
+  var diff = 0;
+  for (var i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+  return diff === 0;
+}
+/**
+ * Copies bytes into a fresh `Uint8Array`.
+ * Returns a detached plain `Uint8Array` after validating that the input is real bytes.
+ * @param bytes - Source bytes.
+ * @returns Copy of the input bytes.
+ * @example
+ * Copy bytes into a fresh array.
+ * ```ts
+ * copyBytes(new Uint8Array([1, 2]));
+ * ```
+ */
+function copyBytes(bytes) {
+  // `Uint8Array.from(...)` would also accept arrays / other typed arrays. Keep this helper strict
+  // because callers use it at byte-validation boundaries before mutating the detached copy.
+  return Uint8Array.from(Object(_noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(bytes));
+}
+/**
+ * Byte-swaps each 64-bit lane in place.
+ * Falcon's exact binary64 tables are stored as little-endian byte payloads, so BE runtimes need
+ * this boundary helper before aliasing them as host `Float64Array` lanes.
+ * @param arr - Byte buffer whose length is a multiple of 8.
+ * @returns The same buffer after in-place 64-bit lane byte swaps.
+ * @example
+ * Byte-swap one 64-bit lane in place.
+ * ```ts
+ * byteSwap64(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]));
+ * ```
+ */
+function byteSwap64(arr) {
+  var bytes = new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength);
+  for (var i = 0; i < bytes.length; i += 8) {
+    var a0 = bytes[i + 0];
+    var a1 = bytes[i + 1];
+    var a2 = bytes[i + 2];
+    var a3 = bytes[i + 3];
+    bytes[i + 0] = bytes[i + 7];
+    bytes[i + 1] = bytes[i + 6];
+    bytes[i + 2] = bytes[i + 5];
+    bytes[i + 3] = bytes[i + 4];
+    bytes[i + 4] = a3;
+    bytes[i + 5] = a2;
+    bytes[i + 6] = a1;
+    bytes[i + 7] = a0;
+  }
+  return arr;
+}
+/**
+ * Byte-swaps 64-bit lanes on big-endian runtimes and returns the input unchanged on little-endian.
+ * This keeps Falcon's binary64 tables in canonical little-endian order before aliasing them as
+ * `Float64Array` lanes on the current host.
+ * @param arr - Buffer to pass through or swap in place.
+ * @returns The same buffer, normalized for Falcon's little-endian table layout.
+ * @example
+ * Normalize one host-endian buffer for Falcon's float tables.
+ * ```ts
+ * baswap64If(new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]));
+ * ```
+ */
+var baswap64If = _noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__["isLE"] ? arr => arr : byteSwap64;
+/**
+ * Validates that an options bag is a plain object.
+ * @param opts - Options object to validate.
+ * @throws On wrong argument types. {@link TypeError}
+ * @example
+ * Validate that an options bag is a plain object.
+ * ```ts
+ * validateOpts({});
+ * ```
+ */
+function validateOpts(opts) {
+  // Arrays silently passed here before, but these call sites expect named option-bag fields.
+  if (Object.prototype.toString.call(opts) !== '[object Object]') throw new TypeError('expected valid options object');
+}
+/**
+ * Validates common verification options.
+ * `context` itself is validated with `abytes(...)`, and individual algorithms may narrow support
+ * further after this shared plain-object gate.
+ * @param opts - Verification options. See {@link VerOpts}.
+ * @throws On wrong argument types. {@link TypeError}
+ * @example
+ * Validate common verification options.
+ * ```ts
+ * validateVerOpts({ context: new Uint8Array([1]) });
+ * ```
+ */
+function validateVerOpts(opts) {
+  validateOpts(opts);
+  if (opts.context !== undefined) Object(_noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(opts.context, undefined, 'opts.context');
+}
+/**
+ * Validates common signing options.
+ * `extraEntropy` is validated with `abytes(...)`; exact lengths and extra algorithm-specific
+ * restrictions are enforced later by callers.
+ * @param opts - Signing options. See {@link SigOpts}.
+ * @throws On wrong argument types. {@link TypeError}
+ * @example
+ * Validate common signing options.
+ * ```ts
+ * validateSigOpts({ extraEntropy: new Uint8Array([1]) });
+ * ```
+ */
+function validateSigOpts(opts) {
+  validateVerOpts(opts);
+  if (opts.extraEntropy !== false && opts.extraEntropy !== undefined) Object(_noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(opts.extraEntropy, undefined, 'opts.extraEntropy');
+}
+/**
+ * Builds a fixed-layout coder from byte lengths and nested coders.
+ * Raw-length fields decode as zero-copy `subarray(...)` views, and nested coders may preserve that
+ * aliasing too. Nested coder `encode(...)` results are treated as owned scratch: `splitCoder`
+ * copies them into the output and then zeroizes them with `fill(0)`. If a nested encoder forwards
+ * caller-owned bytes, it must do so only after detaching them into a disposable copy.
+ * @param label - Label used in validation errors.
+ * @param lengths - Field lengths or nested coders.
+ * @returns Composite fixed-length coder.
+ * @example
+ * Build a fixed-layout coder from byte lengths and nested coders.
+ * ```ts
+ * splitCoder('demo', 1, 2).encode([new Uint8Array([1]), new Uint8Array([2, 3])]);
+ * ```
+ */
+function splitCoder(label) {
+  for (var _len = arguments.length, lengths = new Array(_len > 1 ? _len - 1 : 0), _key = 1; _key < _len; _key++) {
+    lengths[_key - 1] = arguments[_key];
+  }
+  var getLength = c => typeof c === 'number' ? c : c.bytesLen;
+  var bytesLen = lengths.reduce((sum, a) => sum + getLength(a), 0);
+  return {
+    bytesLen,
+    encode: bufs => {
+      var res = new Uint8Array(bytesLen);
+      for (var i = 0, pos = 0; i < lengths.length; i++) {
+        var c = lengths[i];
+        var l = getLength(c);
+        var b = typeof c === 'number' ? bufs[i] : c.encode(bufs[i]);
+        Object(_noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(b, l, label);
+        res.set(b, pos);
+        if (typeof c !== 'number') b.fill(0); // clean
+        pos += l;
+      }
+      return res;
+    },
+    decode: buf => {
+      Object(_noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(buf, bytesLen, label);
+      var res = [];
+      for (var c of lengths) {
+        var l = getLength(c);
+        var b = buf.subarray(0, l);
+        res.push(typeof c === 'number' ? b : c.decode(b));
+        buf = buf.subarray(l);
+      }
+      return res;
+    }
+  };
+}
+// nano-packed.array (fixed size)
+/**
+ * Builds a fixed-length vector coder from another fixed-length coder.
+ * Element decoding receives `subarray(...)` views, so aliasing depends on the element coder.
+ * Element coder `encode(...)` results are treated as owned scratch: `vecCoder` copies them into
+ * the output and then zeroizes them with `fill(0)`. If an element encoder forwards caller-owned
+ * bytes, it must do so only after detaching them into a disposable copy. `vecCoder` also trusts
+ * the `BytesCoderLen` contract: each encoded element must already be exactly `c.bytesLen` bytes.
+ * @param c - Element coder.
+ * @param vecLen - Number of elements in the vector.
+ * @returns Fixed-length vector coder.
+ * @example
+ * Build a fixed-length vector coder from another fixed-length coder.
+ * ```ts
+ * vecCoder(
+ *   { bytesLen: 1, encode: (n: number) => Uint8Array.of(n), decode: (b: Uint8Array) => b[0] || 0 },
+ *   2
+ * ).encode([1, 2]);
+ * ```
+ */
+function vecCoder(c, vecLen) {
+  var coder = c;
+  var bytesLen = vecLen * coder.bytesLen;
+  return {
+    bytesLen,
+    encode: u => {
+      if (u.length !== vecLen) throw new RangeError("vecCoder.encode: wrong length=".concat(u.length, ". Expected: ").concat(vecLen));
+      var res = new Uint8Array(bytesLen);
+      for (var i = 0, pos = 0; i < u.length; i++) {
+        var b = coder.encode(u[i]);
+        res.set(b, pos);
+        b.fill(0); // clean
+        pos += b.length;
+      }
+      return res;
+    },
+    decode: a => {
+      Object(_noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(a, bytesLen);
+      var r = [];
+      for (var i = 0; i < a.length; i += coder.bytesLen) r.push(coder.decode(a.subarray(i, i + coder.bytesLen)));
+      return r;
+    }
+  };
+}
+/**
+ * Overwrites supported typed-array inputs with zeroes in place.
+ * Accepts direct typed arrays and one-level arrays of them.
+ * @param list - Typed arrays or one-level lists of typed arrays to clear.
+ * @example
+ * Overwrite typed arrays with zeroes.
+ * ```ts
+ * const buf = Uint8Array.of(1, 2, 3);
+ * cleanBytes(buf);
+ * ```
+ */
+function cleanBytes() {
+  for (var _len2 = arguments.length, list = new Array(_len2), _key2 = 0; _key2 < _len2; _key2++) {
+    list[_key2] = arguments[_key2];
+  }
+  for (var t of list) {
+    if (Array.isArray(t)) for (var b of t) b.fill(0);else t.fill(0);
+  }
+}
+/**
+ * Creates a 32-bit mask with the lowest `bits` bits set.
+ * @param bits - Number of low bits to keep.
+ * @returns Bit mask with `bits` ones.
+ * @throws On wrong argument ranges or values. {@link RangeError}
+ * @example
+ * Create a low-bit mask for packed-field operations.
+ * ```ts
+ * const mask = getMask(4);
+ * ```
+ */
+function getMask(bits) {
+  if (!Number.isSafeInteger(bits) || bits < 0 || bits > 32) throw new RangeError("expected bits in [0..32], got ".concat(bits));
+  // JS shifts are modulo 32, so bit 32 needs an explicit full-width mask.
+  return bits === 32 ? 0xffffffff : ~(-1 << bits) >>> 0;
+}
+/** Shared empty byte array used as the default context. */
+var EMPTY = /* @__PURE__ */Uint8Array.of();
+/**
+ * Builds the domain-separated message payload for the pure sign/verify paths.
+ * Context length `255` is valid; only `ctx.length > 255` is rejected.
+ * @param msg - Message bytes.
+ * @param ctx - Optional context bytes.
+ * @returns Domain-separated message payload.
+ * @throws On wrong argument ranges or values. {@link RangeError}
+ * @example
+ * Build the domain-separated payload before direct signing.
+ * ```ts
+ * const payload = getMessage(new Uint8Array([1, 2]));
+ * ```
+ */
+function getMessage(msg) {
+  var ctx = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : EMPTY;
+  Object(_noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(msg);
+  Object(_noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(ctx);
+  if (ctx.length > 255) throw new RangeError('context should be 255 bytes or less');
+  return Object(_noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__["concatBytes"])(new Uint8Array([0, ctx.length]), ctx, msg);
+}
+// DER tag+length plus the shared NIST hash OID arc 2.16.840.1.101.3.4.2.* used by the
+// FIPS 204 / FIPS 205 pre-hash wrappers; the final byte selects SHA-256, SHA-512, SHAKE128,
+// SHAKE256, or another approved hash/XOF under that subtree.
+// 06 09 60 86 48 01 65 03 04 02
+var oidNistP = /* @__PURE__ */Uint8Array.from([6, 9, 0x60, 0x86, 0x48, 1, 0x65, 3, 4, 2]);
+/**
+ * Validates that a hash exposes a NIST hash OID and enough collision resistance.
+ * Current accepted surface is broader than the FIPS algorithm tables: any hash/XOF under the NIST
+ * `2.16.840.1.101.3.4.2.*` subtree is accepted if its effective `outputLen` is strong enough.
+ * XOF callers must pass a callable whose `outputLen` matches the digest length they actually intend
+ * to sign; bare `shake128` / `shake256` defaults are too short for the stronger prehash modes.
+ * @param hash - Hash function to validate.
+ * @param requiredStrength - Minimum required collision-resistance strength in bits.
+ * @throws If the hash metadata or collision resistance is insufficient. {@link Error}
+ * @example
+ * Validate that a hash exposes a NIST hash OID and enough collision resistance.
+ * ```ts
+ * import { sha256 } from '@noble/hashes/sha2.js';
+ * import { checkHash } from '@noble/post-quantum/utils.js';
+ * checkHash(sha256, 128);
+ * ```
+ */
+function checkHash(hash) {
+  var requiredStrength = arguments.length > 1 && arguments[1] !== undefined ? arguments[1] : 0;
+  if (!hash.oid || !equalBytes(hash.oid.subarray(0, 10), oidNistP)) throw new Error('hash.oid is invalid: expected NIST hash');
+  // FIPS 204 / FIPS 205 require both collision and second-preimage strength; for approved NIST
+  // hashes/XOFs under this OID subtree, the collision bound from the configured digest length is
+  // the tighter runtime check, so enforce that lower bound here.
+  var collisionResistance = hash.outputLen * 8 / 2;
+  if (requiredStrength > collisionResistance) {
+    throw new Error('Pre-hash security strength too low: ' + collisionResistance + ', required: ' + requiredStrength);
+  }
+}
+/**
+ * Builds the domain-separated prehash payload for the prehash sign/verify paths.
+ * Callers are expected to vet `hash.oid` first, e.g. via `checkHash(...)`; calling this helper
+ * directly with a hash object that lacks `oid` currently throws later inside `concatBytes(...)`.
+ * Context length `255` is valid; only `ctx.length > 255` is rejected.
+ * @param hash - Prehash function.
+ * @param msg - Message bytes.
+ * @param ctx - Optional context bytes.
+ * @returns Domain-separated prehash payload.
+ * @throws On wrong argument ranges or values. {@link RangeError}
+ * @example
+ * Build the domain-separated prehash payload for external hashing.
+ * ```ts
+ * import { sha256 } from '@noble/hashes/sha2.js';
+ * import { getMessagePrehash } from '@noble/post-quantum/utils.js';
+ * getMessagePrehash(sha256, new Uint8Array([1, 2]));
+ * ```
+ */
+function getMessagePrehash(hash, msg) {
+  var ctx = arguments.length > 2 && arguments[2] !== undefined ? arguments[2] : EMPTY;
+  Object(_noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(msg);
+  Object(_noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__["abytes"])(ctx);
+  if (ctx.length > 255) throw new RangeError('context should be 255 bytes or less');
+  var hashed = hash(msg);
+  return Object(_noble_hashes_utils_js__WEBPACK_IMPORTED_MODULE_0__["concatBytes"])(new Uint8Array([1, ctx.length]), ctx, hash.oid, hashed);
+}
+
+/***/ }),
+
 /***/ "./src/plugins-devel.js":
 /*!******************************!*\
   !*** ./src/plugins-devel.js ***!
@@ -150373,6 +162723,8 @@ module.exports.push(__webpack_require__(/*! ./lib/history.js */ "./src/lib/histo
 
 
 module.exports.push(__webpack_require__(/*! ./plugins/password-generator/password-generator.js */ "./src/plugins/password-generator/password-generator.js"));
+
+module.exports.push(__webpack_require__(/*! ./plugins/age-derive/age-derive.js */ "./src/plugins/age-derive/age-derive.js"));
   
 
 /***/ }),
@@ -150430,6 +162782,169 @@ if (false) {}else{//is development
   //put your DEV plugins in `plugins-devel.js` so webpack wont include it in production
 }
 
+
+/***/ }),
+
+/***/ "./src/plugins/age-derive/age-derive.js":
+/*!**********************************************!*\
+  !*** ./src/plugins/age-derive/age-derive.js ***!
+  \**********************************************/
+/*! no static exports found */
+/***/ (function(module, exports, __webpack_require__) {
+
+//change   _template_  to your plugin name
+
+var pagesList = {
+    "age-derive": {
+        sort: 34,
+        icon: "fa-lock",
+        //   title: "Chat"
+    }
+};
+
+function b64ToBytes(b64) {
+    var bin = atob(b64.trim());
+    var bytes = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+}
+
+function bytesToB64(bytes) {
+    var bin = '';
+    for (var i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+    return btoa(bin);
+}
+
+module.exports = {
+    pagesList: pagesList,
+    consumes: ["app"],
+    provides: ["plugin_age-derive"],
+    setup: function(options, imports, register) {
+
+        // Deferred to setup-call time, not module-require time - matching
+        // the ./age-derive.page.html require just below. webpack.config.js's
+        // getPagesList() requires this whole plugin module directly under
+        // plain Node (to read pagesList before any bundling happens), which
+        // has no knowledge of the @noble/* resolve.alias entries webpack
+        // itself uses - a top-level require() of age_pqc.js/age_file.js
+        // there would throw MODULE_NOT_FOUND before webpack ever runs.
+        var init = false;
+        var agePqc = __webpack_require__(/*! ../../onlykey-fido2/onlykey/age_pqc.js */ "./src/onlykey-fido2/onlykey/age_pqc.js");
+        var ageFile = __webpack_require__(/*! ../../onlykey-fido2/onlykey/age_file.js */ "./src/onlykey-fido2/onlykey/age_file.js");
+        var page = {
+            view: __webpack_require__(/*! ./age-derive.page.html */ "./src/plugins/age-derive/age-derive.page.html").default,
+            init: function(app, $page, pathname) {
+                init = true;
+
+
+                page.setup(app, $page, pathname);
+            },
+            setup: function(app, $page, pathname) {
+                if (!init)
+                    return page.init(app, $page, pathname);
+
+                // See password-generator.js's comment on this same call -
+                // onlykey3rd() takes no arguments in the currently-bundled
+                // library version, kept only to match history.js's call.
+                var onlykey3rd = app.onlykey3rd;
+                var ok = onlykey3rd(1, 0);
+                var $ = app.$;
+
+                // press_required=false requests the non-REQ_PRESS "derived
+                // keys per site without touch" path (same device setting
+                // password-generator.js relies on), matching this
+                // feature's non-interactive encrypt/decrypt flow.
+                var press_required = false;
+
+                function currentLabel() {
+                    return $("#label").val();
+                }
+
+                $("#label").on("input", function() {
+                    var label = currentLabel();
+                    $("#identity_out").val(label ? agePqc.encodeIdentity(label) : "");
+                });
+
+                $("#encrypt_start").click(function() {
+                    var label = currentLabel();
+                    var plaintext = $("#plaintext").val();
+                    $("#age_file_out").val("");
+                    ok.derive_xwing_recipient(label, press_required, function(error, pkX, mlkemSeed) {
+                        if (error) {
+                            $("#age_file_out").val("ERROR: " + error);
+                            return;
+                        }
+                        var recipientPk = agePqc.buildRecipient(pkX, mlkemSeed);
+                        var encaps = agePqc.xwingEncapsHost(recipientPk);
+                        var fileBytes = ageFile.encryptAgeFile(
+                            new TextEncoder().encode(plaintext),
+                            { ciphertext: encaps.ciphertext, sharedSecret: encaps.sharedSecret }
+                        );
+                        $("#age_file_out").val(bytesToB64(fileBytes));
+                        $("#identity_out").val(agePqc.encodeIdentity(label));
+                    });
+                });
+
+                $("#decrypt_start").click(function() {
+                    var label = currentLabel();
+                    $("#decrypted_out").val("");
+                    var fileBytes;
+                    try {
+                        fileBytes = b64ToBytes($("#decrypt_file_in").val());
+                    } catch (e) {
+                        $("#decrypted_out").val("ERROR: invalid base64: " + e.message);
+                        return;
+                    }
+
+                    ageFile.decryptAgeFile(fileBytes, function(ciphertext) {
+                        return new Promise(function(resolve, reject) {
+                            ok.derive_xwing_recipient(label, press_required, function(error, pkX, mlkemSeed) {
+                                if (error) { reject(new Error(error)); return; }
+                                var ctX = agePqc.ctXOf(ciphertext);
+                                ok.derive_xwing_decap(label, ctX, press_required, function(error2, ssX) {
+                                    if (error2) { reject(new Error(error2)); return; }
+                                    try {
+                                        resolve(agePqc.splitDecapsulate(ssX, ciphertext, pkX, mlkemSeed));
+                                    } catch (e) {
+                                        reject(e);
+                                    }
+                                });
+                            });
+                        });
+                    }).then(function(plaintextBytes) {
+                        $("#decrypted_out").val(new TextDecoder().decode(plaintextBytes));
+                    }).catch(function(err) {
+                        $("#decrypted_out").val("ERROR: " + (err && err.message ? err.message : err));
+                    });
+                });
+            }
+        };
+
+        pagesList["age-derive"] = page;
+
+        register(null, {
+            "plugin_age-derive": {
+                pagesList: pagesList
+            }
+        });
+
+
+    }
+};
+
+
+/***/ }),
+
+/***/ "./src/plugins/age-derive/age-derive.page.html":
+/*!*****************************************************!*\
+  !*** ./src/plugins/age-derive/age-derive.page.html ***!
+  \*****************************************************/
+/*! exports provided: default */
+/***/ (function(module, __webpack_exports__, __webpack_require__) {
+
+"use strict";
+__webpack_require__.r(__webpack_exports__);
+/* harmony default export */ __webpack_exports__["default"] = ("<h4>\n    <font size=\"+2\">Derived X-Wing age encryption with\n        <a href=\"https://onlykey.io\" target=\"_blank\">OnlyKey</a></font>\n</h4>\n<fieldset>\n    <label for=\"label\">Label (identifies the derived recipient - same label on the CLI and here derives the same key)</label>\n    <input type=\"text\" placeholder=\"e.g. me@example.com\" id=\"label\" />\n\n    <label for=\"identity_out\">Identity (age -d -i ...)</label>\n    <input readonly=\"readonly\" type=\"text\" id=\"identity_out\" />\n\n    <label for=\"plaintext\">Plaintext to encrypt</label>\n    <textarea placeholder=\"Plaintext\" rows=\"3\" id=\"plaintext\"></textarea>\n    <button type=\"button\" id=\"encrypt_start\" value=\"Encrypt\">Encrypt</button>\n\n    <label for=\"age_file_out\">Encrypted age file (base64)</label>\n    <textarea readonly=\"readonly\" rows=\"4\" id=\"age_file_out\"></textarea>\n\n    <label for=\"decrypt_file_in\">age file to decrypt (base64)</label>\n    <textarea placeholder=\"Paste base64 age file\" rows=\"4\" id=\"decrypt_file_in\"></textarea>\n    <button type=\"button\" id=\"decrypt_start\" value=\"Decrypt\">Decrypt</button>\n\n    <label for=\"decrypted_out\">Decrypted plaintext</label>\n    <textarea readonly=\"readonly\" rows=\"3\" id=\"decrypted_out\"></textarea>\n</fieldset>\n<div>\n    <h3>Console Messages from OnlyKey Appear Below</h3>\n    <pre>\n            <code data-language=\"javascript\">\n                <font color=\"008700\">\n                    <div id=\"messages\"></div>\n                </font>\n            </code>\n        </pre>\n</div>\n");
 
 /***/ }),
 
@@ -153800,4 +166315,4 @@ module.exports = __webpack_require__(/*! ./src/entry-devel.js */"./src/entry-dev
 /***/ })
 
 /******/ });
-//# sourceMappingURL=bundle.85a8a87cbe8f6b51b4ea.js.map
+//# sourceMappingURL=bundle.051e3a9d470a7e52284a.js.map
