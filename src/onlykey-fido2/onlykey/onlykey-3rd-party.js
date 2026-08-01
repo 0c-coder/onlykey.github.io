@@ -21,7 +21,10 @@ module.exports = function(imports, onlykeyApi) {
         // ctap_error_codes,
         // getAllUrlParams,
         aesgcm_decrypt,
-        // aesgcm_encrypt
+        // Needed by the composite_sign/composite_decrypt payload encryption
+        // below; was commented out while nothing in this file sent encrypted
+        // data to the device.
+        aesgcm_encrypt,
         digestBuff,
         digestArray,
         arrayBufToBase64UrlDecode,
@@ -603,6 +606,156 @@ module.exports = function(imports, onlykeyApi) {
                 api.emit("status", "OnlyKey: Problem Requesting Derived X-Wing Decapsulation");
                 if (typeof cb === 'function') cb(e.message || e);
             }
+        };
+
+        // ---- Composite PGP-PQC (ML-DSA-65 + Ed25519 / ML-KEM-768 + X25519) --
+        //
+        // The device half of the pgp-pqc page. composite_pgp.js wires these to
+        // the vendored openpgp.js fork's hardware hooks, so ordinary
+        // openpgp.sign()/decrypt() calls route private-key operations to the
+        // key. Ported from onlykey-testing's lib/fido2/composite.js, which is
+        // the same protocol proven against hardware in TC-11.
+        //
+        // Unlike the derive calls these return promises rather than taking a
+        // callback, because that is what composite_pgp.js's hooks await.
+        //
+        // The one thing that differs from the Node original: there is no
+        // SEREMU channel here to inject the three challenge digits. In the
+        // browser the user reads them off the device and presses the buttons,
+        // so this simply polls until the device produces the answer.
+        var OKSIGN = 237;
+        var OKDECRYPT = 240;
+        var OKPING = 243;
+        var HALF_ECC = 0;
+        var HALF_PQC = 1;
+        var ED25519_SIG_LEN = 64;
+        var MLDSA_SIG_LEN = 3309;
+
+        // The firmware reports status and failures as plain ASCII through the
+        // SAME response path as real data ("Error incorrect challenge was
+        // entered", ...), so a response has to be classified rather than just
+        // measured. Returns the text when the payload is entirely printable,
+        // otherwise null. Safe because a genuine signature being all-printable
+        // is not a practical possibility - (95/256)^64 for the Ed25519 half.
+        function as_device_message(data) {
+            if (!data || !data.length) return null;
+            var text = '';
+            for (var i = 0; i < data.length; i++) text += String.fromCharCode(data[i]);
+            text = text.replace(/\0+$/, '');
+            return /^[\x20-\x7e]+$/.test(text) ? text : null;
+        }
+
+        // Polls OKPING, accumulating chunks until `expected` bytes have
+        // arrived. Reassembly is required because a response larger than one
+        // WebAuthn assertion (512 bytes - ctap.cpp's sigder[514] less a status
+        // byte and the size test) is served in pieces by
+        // send_stored_response(). An ML-DSA-65 signature is 3309 bytes, so it
+        // takes seven polls. Callers that expect a small response pass no
+        // `expected` and take the first non-status payload.
+        //
+        // A status string arriving AFTER chunks have started means the buffer
+        // is gone (wiped or exhausted) and the response will never complete -
+        // reported rather than silently returning a truncated signature.
+        async function poll_for_response(expected, maxMs) {
+            var deadline = Date.now() + (maxMs || 120000);
+            var parts = [];
+            var total = 0;
+            var lastMessage = null;
+
+            while (Date.now() < deadline) {
+                var resp = await onlykeyApi.ctaphid_via_webauthn(OKPING, 0, 0, 0, new Uint8Array(), 10000);
+                if (resp && resp.data && resp.data.length) {
+                    var msg = as_device_message(resp.data);
+                    if (msg) {
+                        if (total > 0) break;
+                        lastMessage = msg;
+                    }
+                    else {
+                        parts.push(Array.from(resp.data));
+                        total += resp.data.length;
+                        if (!expected || total >= expected) {
+                            var out = [].concat.apply([], parts);
+                            return Uint8Array.from(expected ? out.slice(0, expected) : out);
+                        }
+                        continue; // more to collect - poll again immediately
+                    }
+                }
+                await new Promise(function(r) { setTimeout(r, 150); });
+            }
+            if (total > 0) {
+                throw new Error('Incomplete composite response: got ' + total + ' of ' + expected +
+                    ' bytes in ' + parts.length + ' chunk(s)' +
+                    (lastMessage ? ' - last device message: "' + lastMessage + '"' : ''));
+            }
+            throw new Error('No composite response' +
+                (lastMessage ? ' - last device message: "' + lastMessage + '"' : ''));
+        }
+
+        // Sends the payload to the device, chunked.
+        //
+        // A WebAuthn keyhandle carries at most 255 bytes including a 10-byte
+        // header, so anything larger has to go in pieces - an ML-KEM-768
+        // ciphertext is 1088 bytes and an ML-DSA digest payload is well over
+        // the limit too. Sending it in one call throws "Max size exceeded"
+        // out of encode_ctaphid_request_as_keyhandle(), which surfaces on the
+        // page as "Error decrypting message: Max size exceeded" (confirmed
+        // live, TC-11).
+        //
+        // The framing is onlykey-pgp.js's u2fSignBuffer(), reused rather than
+        // reinvented because it is what the classic RSA path has always used
+        // and what the firmware's OKSIGN/OKDECRYPT dispatch already expects:
+        // 228-byte chunks, opt2 set only on the FINAL chunk, opt3 carrying an
+        // incrementing packet number. Each chunk is encrypted on its own -
+        // the firmware decrypts per packet and reassembles in packet_buffer,
+        // so encrypting the whole payload once would not survive the split.
+        //
+        // opt2 is what tells the device the input is complete; without it the
+        // device keeps waiting for more and never primes the challenge.
+        var COMPOSITE_MAX_PACKET = 228; // 57 (OK packet size) * 4, under 255 - header
+
+        async function prime_composite(cmd, slot, payload) {
+            var bytes = Array.from(payload);
+            var packetnum = 0;
+            var last = null;
+            while (bytes.length > 0) {
+                var chunk = bytes.slice(0, COMPOSITE_MAX_PACKET);
+                bytes = bytes.slice(COMPOSITE_MAX_PACKET);
+                var finalPacket = bytes.length === 0 ? 1 : 0;
+                packetnum++;
+                var encrypted = await aesgcm_encrypt(chunk, onlykeyApi.sharedsec);
+                last = await onlykeyApi.ctaphid_via_webauthn(
+                    cmd, slot, finalPacket, packetnum, encrypted, 10000
+                );
+            }
+            return last;
+        }
+
+        // One half of a composite signature. `half` selects Ed25519 (0) or
+        // ML-DSA-65 (1); `digest` goes to the device UNCHANGED - the ML-DSA
+        // half's FIPS 204 empty-context framing is applied firmware-side by
+        // okpqc.cpp, not here.
+        api.composite_sign = async function(slot, half, digest) {
+            api.emit("status", "OnlyKey: Signing (" + (half === HALF_PQC ? "ML-DSA-65" : "Ed25519") + ") - confirm on the device");
+            var payload = new Uint8Array(1 + digest.length);
+            payload[0] = half;
+            payload.set(Uint8Array.from(digest), 1);
+            await prime_composite(OKSIGN, slot, payload);
+            var expected = half === HALF_ECC ? ED25519_SIG_LEN : MLDSA_SIG_LEN;
+            var sig = await poll_for_response(expected);
+            api.emit("status", "OnlyKey: Signature complete");
+            return sig;
+        };
+
+        // The device half of composite decryption. okpqc_decrypt() infers
+        // which half is being asked for purely from the input size - 32 bytes
+        // is the X25519 ephemeral point, 1088 the ML-KEM-768 ciphertext - so
+        // unlike signing there is no selector byte.
+        api.composite_decrypt = async function(slot, data) {
+            api.emit("status", "OnlyKey: Decrypting - confirm on the device");
+            await prime_composite(OKDECRYPT, slot, Uint8Array.from(data));
+            var out = await poll_for_response(null);
+            api.emit("status", "OnlyKey: Decryption complete");
+            return out;
         };
 
         api.encode_key = encode_key;
