@@ -24,4 +24,6 @@ module.exports.push(require("./lib/history.js"));
 module.exports.push(require("./plugins/password-generator/password-generator.js"));
 
 module.exports.push(require("./plugins/age-derive/age-derive.js"));
+
+module.exports.push(require("./plugins/pgp-pqc/pgp-pqc.js"));
   

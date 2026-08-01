@@ -134,14 +134,18 @@ module.exports = {
     },
     module: {
         rules: [{
-            // Scoped only to the vendored @noble packages - webpack 4's
-            // built-in parser can't handle the modern syntax they publish
-            // with (optional chaining, ES2022 class fields). Deliberately
-            // not applied project-wide: this transpiles at build time only,
-            // the committed files in vendor/ stay byte-for-byte unmodified/
-            // diffable against the real npm packages (see VENDORED.md).
+            // Scoped only to the vendored @noble packages and the vendored
+            // openpgp.js fork - webpack 4's built-in parser can't handle the
+            // modern syntax they ship with (optional chaining, ES2022 class
+            // fields). Deliberately not applied project-wide: this
+            // transpiles at build time only, the committed files in vendor/
+            // stay byte-for-byte unmodified/diffable against their source
+            // (see each vendor dir's VENDORED.md).
             test: /\.js$/,
-            include: path.resolve(__dirname, 'src/onlykey-fido2/onlykey/vendor/@noble'),
+            include: [
+                path.resolve(__dirname, 'src/onlykey-fido2/onlykey/vendor/@noble'),
+                path.resolve(__dirname, 'src/onlykey-fido2/onlykey/vendor/openpgp'),
+            ],
             use: {
                 loader: 'babel-loader',
                 options: {
