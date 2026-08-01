@@ -144103,28 +144103,109 @@ module.exports = function(imports, onlykeyApi) {
         // byte and the size test) is served in pieces by
         // send_stored_response(). An ML-DSA-65 signature is 3309 bytes, so it
         // takes seven polls. Callers that expect a small response pass no
-        // `expected` and take the first non-status payload.
+        // `expected` and take the first payload.
+        //
+        // THE STATUS BYTE DECIDES WHETHER THERE IS A PAYLOAD AT ALL. Every
+        // assertion the extension path returns carries a full CBOR byte
+        // string, but only a CTAP1_SUCCESS one holds real bytes:
+        // send_stored_response() answers a poll made while the device is still
+        // waiting on the button challenge with CTAP2_ERR_USER_ACTION_PENDING
+        // and calls no extension_writeback(), so ctap.cpp falls to its default
+        // `sigder_sz = 72` and ships 71 bytes of UNINITIALISED STACK after the
+        // status byte. Measured live on an idle device: a composite_decrypt
+        // that nobody confirmed came back "successfully" in 1.4s with 71 bytes
+        // whose tail was the ASCII "OCKEDv3.0.4-test" left over from an
+        // earlier UNLOCKED response.
+        //
+        // That garbage is not printable ASCII, so classifying the payload with
+        // as_device_message() alone - the previous approach - accepted it as
+        // the answer and handed it to openpgp.js as the plaintext/signature.
+        // Keying off resp.status is what onlykey-pgp.js's msg_polling() has
+        // always done for the classic RSA path, for exactly this reason.
         //
         // A status string arriving AFTER chunks have started means the buffer
         // is gone (wiped or exhausted) and the response will never complete -
         // reported rather than silently returning a truncated signature.
+        var POLL_INTERVAL_MS = 1000; // msg_polling()'s pacing: one poll a second
+        var PING_TIMEOUT_MS = 10000;
+        // Status text the device emits while an operation is still in flight -
+        // never a reason to stop polling. Everything else it says is.
+        var TRANSIENT_DEVICE_ERROR = /incorrect challenge was entered/;
+
+        // Budget: the device abandons an unconfirmed operation after ~20s
+        // (fadeoffafter20), so 45s covers a confirmed operation still working
+        // plus that abandonment message, and nothing useful happens after it.
+        //
+        // It must also stay comfortably BELOW whatever the caller is waiting
+        // on. At 120s against a 90s page-side wait, this loop still held the
+        // real diagnosis when the outer wait gave up, and the failure surfaced
+        // as a bare "did not appear within 90000ms" instead of the device's
+        // own words. The innermost budget has to expire first or its error
+        // never gets told.
+        var POLL_BUDGET_MS = 30000;
+
+        // The budget is NO-RESPONSE, not total: it is re-armed every time a
+        // chunk arrives, so a device that keeps delivering may take as long as
+        // the response needs, while a silent one still dies in POLL_BUDGET_MS.
+        //
+        // A total cap cannot work here. The device serves this response 64
+        // bytes per poll and each poll is a full WebAuthn ceremony, so a
+        // 3309-byte ML-DSA-65 signature needs ~52 polls - ~36s of steady,
+        // healthy progress. Measured live 2026-08-01 on the Node copy of this
+        // loop against a 30s total cap: two runs stopped at 2944 and 3008
+        // bytes. A moving number is the signature of a clock expiring, not of
+        // a limit being hit. Sizing a total cap for the largest possible
+        // response would also destroy its only real job - spotting a wedged
+        // device.
         async function poll_for_response(expected, maxMs) {
-            var deadline = Date.now() + (maxMs || 120000);
+            var deadline = Date.now() + (maxMs || POLL_BUDGET_MS);
             var parts = [];
             var total = 0;
             var lastMessage = null;
+            var lastStatus = null;
 
             while (Date.now() < deadline) {
-                var resp = await onlykeyApi.ctaphid_via_webauthn(OKPING, 0, 0, 0, new Uint8Array(), 10000);
-                if (resp && resp.data && resp.data.length) {
+                var resp = await onlykeyApi.ctaphid_via_webauthn(OKPING, 0, 0, 0, new Uint8Array(), PING_TIMEOUT_MS);
+                lastStatus = resp && resp.status;
+                // Fail fast on anything that cannot improve by polling again.
+                // The deadline is a backstop for "still working", not a
+                // penalty box to sit out once the answer is already known.
+                //
+                // But device status text is NOT such a thing.
+                // decode_ctaphid_response_from_signature() promotes any
+                // payload beginning "Error " into resp.error, and OKPING
+                // answers "Error incorrect challenge was entered" during the
+                // legitimate window between the last challenge digit being
+                // consumed and the result being computed and stored. Treating
+                // that as terminal aborts a decrypt that was about to succeed.
+                // If the digits really were wrong, the device says so itself a
+                // few seconds later by abandoning the operation ("Timeout
+                // occured while waiting for confirmation"), which IS terminal
+                // and is handled below - so the failure still comes from the
+                // device rather than from a guess made here.
+                if (resp && resp.error && !TRANSIENT_DEVICE_ERROR.test(resp.error)) {
+                    throw new Error('Composite poll failed: ' + resp.error);
+                }
+                if (lastStatus === 'CTAP1_SUCCESS' && resp.data && resp.data.length) {
                     var msg = as_device_message(resp.data);
                     if (msg) {
                         if (total > 0) break;
                         lastMessage = msg;
+                        // The device has stopped waiting - no later poll can
+                        // produce the answer, so report it now instead of
+                        // spending the rest of the budget. "Error incorrect
+                        // challenge was entered" is deliberately NOT in here:
+                        // OKPING answers that during the window between the
+                        // last digit being consumed and the result being
+                        // stored, when the operation is still on its way.
+                        if (/Timeout occured while waiting for confirmation/.test(msg)) {
+                            throw new Error('Composite operation abandoned by the device: "' + msg + '"');
+                        }
                     }
                     else {
                         parts.push(Array.from(resp.data));
                         total += resp.data.length;
+                        deadline = Date.now() + (maxMs || POLL_BUDGET_MS); // progress: re-arm
                         if (!expected || total >= expected) {
                             var out = [].concat.apply([], parts);
                             return Uint8Array.from(expected ? out.slice(0, expected) : out);
@@ -144132,15 +144213,22 @@ module.exports = function(imports, onlykeyApi) {
                         continue; // more to collect - poll again immediately
                     }
                 }
-                await new Promise(function(r) { setTimeout(r, 150); });
+                // Not a payload: the device is still waiting on the challenge
+                // (CTAP2_ERR_USER_ACTION_PENDING), still computing
+                // (CTAP2_ERR_OPERATION_PENDING), or has nothing staged. Pace
+                // the next poll rather than spinning - each one is a full
+                // WebAuthn ceremony.
+                await new Promise(function(r) { setTimeout(r, POLL_INTERVAL_MS); });
             }
             if (total > 0) {
                 throw new Error('Incomplete composite response: got ' + total + ' of ' + expected +
                     ' bytes in ' + parts.length + ' chunk(s)' +
-                    (lastMessage ? ' - last device message: "' + lastMessage + '"' : ''));
+                    (lastMessage ? ' - last device message: "' + lastMessage + '"' : '') +
+                    ' - last status: ' + lastStatus);
             }
             throw new Error('No composite response' +
-                (lastMessage ? ' - last device message: "' + lastMessage + '"' : ''));
+                (lastMessage ? ' - last device message: "' + lastMessage + '"' : '') +
+                ' - last status: ' + lastStatus);
         }
 
         // Sends the payload to the device, chunked.
@@ -144165,15 +144253,45 @@ module.exports = function(imports, onlykeyApi) {
         // device keeps waiting for more and never primes the challenge.
         var COMPOSITE_MAX_PACKET = 228; // 57 (OK packet size) * 4, under 255 - header
 
+        // opt3 must INCREASE ACROSS OPERATIONS, not restart per operation.
+        //
+        // ok_extension.cpp's duplicate-packet guard is
+        //
+        //     if (!packet_buffer_details[3]) packet_buffer_details[3] = opt3;
+        //     else if (opt3 <= packet_buffer_details[3]) return 0;
+        //
+        // and packet_buffer_details[3] is only cleared by wipetasks(), which
+        // runs off a 5-second timer. wipedata() - what actually runs after a
+        // response is stored - clears [0] and [1] and leaves [3] alone. So a
+        // second operation starting within that window arrives with the
+        // previous operation's high-water mark still in place, and restarting
+        // at 1 makes its FIRST chunk fail `opt3 <= last` and get silently
+        // dropped. Nothing reports it: the device simply accumulates a short
+        // payload, hashes that, and asks for challenge digits computed over
+        // bytes the host never sent - which is exactly "Error incorrect
+        // challenge was entered" for a composite decrypt whose ML-KEM half
+        // (1088 B, 5 chunks) follows its X25519 half (32 B, 1 chunk).
+        //
+        // Counting up from 1 and never resetting keeps every chunk strictly
+        // greater than the last one the device saw. Wrapping back to 1 at 255
+        // is the one case this cannot cover; a session sends far fewer chunks
+        // than that, and by then the 5s wipetasks() has long since cleared the
+        // high-water mark anyway.
+        var composite_packetnum = 0;
+
+        function next_packetnum() {
+            composite_packetnum = composite_packetnum >= 255 ? 1 : composite_packetnum + 1;
+            return composite_packetnum;
+        }
+
         async function prime_composite(cmd, slot, payload) {
             var bytes = Array.from(payload);
-            var packetnum = 0;
             var last = null;
             while (bytes.length > 0) {
                 var chunk = bytes.slice(0, COMPOSITE_MAX_PACKET);
                 bytes = bytes.slice(COMPOSITE_MAX_PACKET);
                 var finalPacket = bytes.length === 0 ? 1 : 0;
-                packetnum++;
+                var packetnum = next_packetnum();
                 var encrypted = await aesgcm_encrypt(chunk, onlykeyApi.sharedsec);
                 last = await onlykeyApi.ctaphid_via_webauthn(
                     cmd, slot, finalPacket, packetnum, encrypted, 10000
@@ -144215,6 +144333,12 @@ module.exports = function(imports, onlykeyApi) {
         api.build_AESGCM = build_AESGCM;
         api.nacl = nacl;
         api.forge = forge;
+        // The transport this module was built against. onlykey-pgp.js already
+        // receives the same object as an argument; exposing it here gives the
+        // pages (and the test harness driving them) one wire-level entry point
+        // for probing the device directly - otherwise onlykeyApi is reachable
+        // only through the architect registry, which no page holds a handle to.
+        api.onlykeyApi = onlykeyApi;
 
         return api;
     }
@@ -144529,6 +144653,15 @@ module.exports = function(imports, onlykeyApi) {
 
     switch (ctap_error_codes[error_code]) {
       case "CTAP1_SUCCESS":
+        // `data` is null whenever the assertion carried nothing but the status
+        // byte - send_stored_response() can answer a poll with no
+        // extension_writeback() at all, and ctap.cpp then reports
+        // output_buffer_offset+1 == 1. Dereferencing it here threw a TypeError
+        // from inside ctaphid_via_webauthn()'s .then(), which skipped the
+        // resolve() below it, so the returned promise NEVER SETTLED - the
+        // caller waited forever with the browser's WebAuthn prompt on screen.
+        // A decode branch must never be able to strand the transport.
+        if (!data) break;
         if (bytes2string(data.slice(0, 9)) == 'UNLOCKEDv') {
           // Reset shared secret and start over
           onlykey_api.unlocked = true;
@@ -144627,18 +144760,29 @@ module.exports = function(imports, onlykeyApi) {
 
       }).then(assertion => {
         var response;
-        if (!assertion && results) {
-          response = results;
+        try {
+          if (!assertion && results) {
+            response = results;
+          }
+          else {
+            // console.log("GOT ASSERTION", assertion);
+            // console.log("RESPONSE", assertion.response);
+            response = decode_ctaphid_response_from_signature(assertion.response);
+            response.request = request;
+            // console.log("RESPONSE:", response);
+          }
         }
-        else {
-          // console.log("GOT ASSERTION", assertion);
-          // console.log("RESPONSE", assertion.response);
-          response = decode_ctaphid_response_from_signature(assertion.response);
-          response.request = request;
-          // console.log("RESPONSE:", response);
+        catch (decode_error) {
+          // Anything thrown here would otherwise skip the resolve() below and
+          // strand this promise forever - the caller keeps awaiting, the
+          // browser keeps its WebAuthn prompt up, and a polling loop can never
+          // take its next turn. Surface it as a failed response instead, so
+          // the failure is reported in milliseconds rather than never.
+          console.warn("FAILED TO DECODE RESPONSE:", decode_error);
+          response = { error: "Error decoding device response: " + decode_error.message };
         }
         console.log({ctaphid_response:response});
-        
+
         if (cb) cb(response.error, response);
         resolve(response);
       });
@@ -162994,4 +163138,4 @@ module.exports = __webpack_require__(/*! ./src/entry-devel.js */"./src/entry-dev
 /***/ })
 
 /******/ });
-//# sourceMappingURL=bundle.79af9e4ca5b02b8e32c6.js.map
+//# sourceMappingURL=bundle.f15c4081179954e6401a.js.map

@@ -293,6 +293,15 @@ module.exports = function(imports) {
 
     switch (ctap_error_codes[error_code]) {
       case "CTAP1_SUCCESS":
+        // `data` is null whenever the assertion carried nothing but the status
+        // byte - send_stored_response() can answer a poll with no
+        // extension_writeback() at all, and ctap.cpp then reports
+        // output_buffer_offset+1 == 1. Dereferencing it here threw a TypeError
+        // from inside ctaphid_via_webauthn()'s .then(), which skipped the
+        // resolve() below it, so the returned promise NEVER SETTLED - the
+        // caller waited forever with the browser's WebAuthn prompt on screen.
+        // A decode branch must never be able to strand the transport.
+        if (!data) break;
         if (bytes2string(data.slice(0, 9)) == 'UNLOCKEDv') {
           // Reset shared secret and start over
           onlykey_api.unlocked = true;
@@ -391,18 +400,29 @@ module.exports = function(imports) {
 
       }).then(assertion => {
         var response;
-        if (!assertion && results) {
-          response = results;
+        try {
+          if (!assertion && results) {
+            response = results;
+          }
+          else {
+            // console.log("GOT ASSERTION", assertion);
+            // console.log("RESPONSE", assertion.response);
+            response = decode_ctaphid_response_from_signature(assertion.response);
+            response.request = request;
+            // console.log("RESPONSE:", response);
+          }
         }
-        else {
-          // console.log("GOT ASSERTION", assertion);
-          // console.log("RESPONSE", assertion.response);
-          response = decode_ctaphid_response_from_signature(assertion.response);
-          response.request = request;
-          // console.log("RESPONSE:", response);
+        catch (decode_error) {
+          // Anything thrown here would otherwise skip the resolve() below and
+          // strand this promise forever - the caller keeps awaiting, the
+          // browser keeps its WebAuthn prompt up, and a polling loop can never
+          // take its next turn. Surface it as a failed response instead, so
+          // the failure is reported in milliseconds rather than never.
+          console.warn("FAILED TO DECODE RESPONSE:", decode_error);
+          response = { error: "Error decoding device response: " + decode_error.message };
         }
         console.log({ctaphid_response:response});
-        
+
         if (cb) cb(response.error, response);
         resolve(response);
       });
