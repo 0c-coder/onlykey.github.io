@@ -65,6 +65,25 @@ async function digestArray(buff) {
     return hashArray;
 }
 
+// Bytes for the key-derivation input.
+//
+// This exists because `Uint8Array.from(str)` is NOT a string encoder: it
+// treats the string as an iterable of characters and coerces each one with
+// Number(), which is NaN for any letter and stores as 0. So every passphrase
+// collapsed to a run of zero bytes whose only distinguishing feature was its
+// LENGTH - "spike-label" and "other-label" hashed identically, and the
+// password generator produced the same password for both. Confirmed
+// end-to-end against hardware through the real page.
+//
+// Callers that already pass real bytes (Uint8Array/Array, e.g. the age-derive
+// label path) are unaffected: they take the same branch as before.
+function derivationInputBytes(additional_d) {
+    if (typeof additional_d === 'string') {
+        return new TextEncoder().encode(additional_d);
+    }
+    return Uint8Array.from(additional_d);
+}
+
 function buf2hex(buffer) {
     // buffer is an ArrayBuffer
     return Array.prototype.map.call(new Uint8Array(buffer), x => ('00' + x.toString(16)).slice(-2)).join('');
@@ -441,7 +460,7 @@ function onlykey(keytype, enc_resp) {
                 }
                 else {
                     // SHA256 hash of input data
-                    dataHash = await digestArray(Uint8Array.from(additional_d));
+                    dataHash = await digestArray(derivationInputBytes(additional_d));
                 }
 
                 Array.prototype.push.apply(message, dataHash);
@@ -532,7 +551,7 @@ function onlykey(keytype, enc_resp) {
                     }
                     else {
                         // SHA256 hash of input data
-                        dataHash = await digestArray(Uint8Array.from(additional_d));
+                        dataHash = await digestArray(derivationInputBytes(additional_d));
                     }
 
                     Array.prototype.push.apply(message, dataHash);
