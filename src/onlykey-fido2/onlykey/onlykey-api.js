@@ -8,7 +8,7 @@ module.exports = function(imports) {
   var onlykey_api = new EventEmitter();
 
 
-  var nacl = require("./nacl.min.js");
+  var nacl = imports.nacl;//require("./nacl.js");
 
   onlykey_api._status;
   onlykey_api.poll_delay;
@@ -359,7 +359,11 @@ module.exports = function(imports) {
     
     return new Promise(async function(resolve) {
       // return 
+      if(onlykey_api.step){
+        onlykey_api.step(proceed);
+      }else proceed();
       
+      function proceed(){
       console.log({ctaphid_request:request});
       var results = false;
       // console.log("REQUEST:", request_options);
@@ -402,7 +406,7 @@ module.exports = function(imports) {
         if (cb) cb(response.error, response);
         resolve(response);
       });
-
+      }
     });
 
   }
