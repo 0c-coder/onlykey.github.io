@@ -49,6 +49,30 @@ module.exports = {
                 var ok = onlykey3rd(1, 0);
                 var $ = app.$;
 
+                // Mirror the device's own progress into whichever status line
+                // belongs to the operation in flight.
+                //
+                // Without this a composite operation shows one unchanging
+                // string for its whole duration, and these are not quick: an
+                // ML-KEM-768 ciphertext is 1088 bytes = 5 WebAuthn ceremonies
+                // just to send, and ML-DSA-65 signing costs the device around
+                // ten seconds before the first response byte exists. A frozen
+                // line for that long reads as a hang, and anything watching the
+                // page for progress cannot tell a working device from a wedged
+                // one. The `ok` api emits "status" throughout - surface it.
+                var activeStatusEl = null;
+                function runWithStatus(elId, initial, fn) {
+                    activeStatusEl = elId;
+                    $("#" + elId).text(initial);
+                    return Promise.resolve()
+                        .then(fn)
+                        .then(function(r) { activeStatusEl = null; return r; },
+                              function(e) { activeStatusEl = null; throw e; });
+                }
+                ok.on("status", function(text) {
+                    if (activeStatusEl) $("#" + activeStatusEl).text(text);
+                });
+
                 function currentSlot() {
                     var slot = parseInt($("#pgp_slot").val(), 10);
                     if (!(slot >= 1 && slot <= 4)) {
@@ -184,14 +208,17 @@ module.exports = {
                 // does the KMAC combine + unwrap itself. Requires the
                 // challenge PIN confirmed once on-device.
                 $("#pgp_decrypt").off('click').click(function() {
-                    $("#pgp_decrypt_status").text("Decrypting (confirm the challenge PIN on your OnlyKey)...");
                     $("#pgp_plaintext_out").val("");
                     var armoredCiphertext = $("#pgp_ciphertext_in").val().trim();
-                    Promise.all([hardwareKeyForCurrentSlot(), openpgp.readMessage({ armoredMessage: armoredCiphertext })])
-                        .then(function(results) {
-                            var hwKey = results[0].hwKey;
-                            var message = results[1];
-                            return openpgp.decrypt({ message: message, decryptionKeys: hwKey, format: 'utf8' });
+                    runWithStatus("pgp_decrypt_status",
+                        "Decrypting (confirm the challenge PIN on your OnlyKey)...",
+                        function() {
+                            return Promise.all([hardwareKeyForCurrentSlot(), openpgp.readMessage({ armoredMessage: armoredCiphertext })])
+                                .then(function(results) {
+                                    var hwKey = results[0].hwKey;
+                                    var message = results[1];
+                                    return openpgp.decrypt({ message: message, decryptionKeys: hwKey, format: 'utf8' });
+                                });
                         })
                         .then(function(result) {
                             $("#pgp_plaintext_out").val(result.data);
@@ -210,14 +237,17 @@ module.exports = {
                 // registerCompositeHooks() comment for why this needs two
                 // separate device confirmations rather than one.
                 $("#pgp_sign").off('click').click(function() {
-                    $("#pgp_sign_status").text("Signing (confirm the challenge PIN on your OnlyKey - TWICE, once per key half)...");
                     $("#pgp_signature_out").val("");
                     var plaintext = $("#pgp_sign_plaintext").val();
-                    Promise.all([hardwareKeyForCurrentSlot(), openpgp.createCleartextMessage({ text: plaintext })])
-                        .then(function(results) {
-                            var hwKey = results[0].hwKey;
-                            var message = results[1];
-                            return openpgp.sign({ message: message, signingKeys: hwKey, format: 'armored' });
+                    runWithStatus("pgp_sign_status",
+                        "Signing (confirm the challenge PIN on your OnlyKey - TWICE, once per key half)...",
+                        function() {
+                            return Promise.all([hardwareKeyForCurrentSlot(), openpgp.createCleartextMessage({ text: plaintext })])
+                                .then(function(results) {
+                                    var hwKey = results[0].hwKey;
+                                    var message = results[1];
+                                    return openpgp.sign({ message: message, signingKeys: hwKey, format: 'armored' });
+                                });
                         })
                         .then(function(armoredSignedMessage) {
                             $("#pgp_signature_out").val(armoredSignedMessage);

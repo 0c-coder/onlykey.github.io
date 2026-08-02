@@ -630,6 +630,12 @@ module.exports = function(imports, onlykeyApi) {
         var HALF_PQC = 1;
         var ED25519_SIG_LEN = 64;
         var MLDSA_SIG_LEN = 3309;
+        // Both composite-decrypt halves answer with a 32-byte shared secret:
+        // X25519_SS_SIZE and MLKEM_SS_SIZE are both 32 (okpqc.cpp).
+        var COMPOSITE_SS_LEN = 32;
+        // ok_extension.cpp's MAX_LARGE_RESP_CHUNK - how much of a staged
+        // response one WebAuthn assertion carries.
+        var MAX_LARGE_RESP_CHUNK = 512;
 
         // The firmware reports status and failures as plain ASCII through the
         // SAME response path as real data ("Error incorrect challenge was
@@ -711,6 +717,7 @@ module.exports = function(imports, onlykeyApi) {
             var total = 0;
             var lastMessage = null;
             var lastStatus = null;
+            var waited = 0;
 
             while (Date.now() < deadline) {
                 var resp = await onlykeyApi.ctaphid_via_webauthn(OKPING, 0, 0, 0, new Uint8Array(), PING_TIMEOUT_MS);
@@ -751,9 +758,33 @@ module.exports = function(imports, onlykeyApi) {
                         }
                     }
                     else {
+                        // A chunk has a KNOWN shape: send_stored_response()
+                        // hands back MAX_LARGE_RESP_CHUNK bytes per poll until
+                        // the tail, so every chunk but the last is exactly 512
+                        // and the last lands exactly on `expected`. Anything
+                        // else did not come off the cursor.
+                        //
+                        // Without this a TRUNCATED chunk is indistinguishable
+                        // from a whole one, because its bytes are genuine.
+                        // Measured live 2026-08-01 on the Node copy of this
+                        // loop: the device staged a correct 3309-byte ML-DSA
+                        // signature and advanced its cursor a full 512 per
+                        // poll while each assertion carried only 71 bytes, so
+                        // the reassembled signature was real bytes in the wrong
+                        // places and verified under no framing. Fixed in
+                        // firmware (ctap.cpp no longer sizes assertions from
+                        // pending_operation); this is the host-side guarantee,
+                        // and what an older build still needs.
+                        if (expected && resp.data.length !== MAX_LARGE_RESP_CHUNK
+                            && total + resp.data.length !== expected) {
+                            await new Promise(function(r) { setTimeout(r, POLL_INTERVAL_MS); });
+                            continue;
+                        }
                         parts.push(Array.from(resp.data));
                         total += resp.data.length;
                         deadline = Date.now() + (maxMs || POLL_BUDGET_MS); // progress: re-arm
+                        api.emit("status", "OnlyKey: Receiving response (" + total +
+                            (expected ? " of " + expected : "") + " bytes)");
                         if (!expected || total >= expected) {
                             var out = [].concat.apply([], parts);
                             return Uint8Array.from(expected ? out.slice(0, expected) : out);
@@ -766,6 +797,15 @@ module.exports = function(imports, onlykeyApi) {
                 // (CTAP2_ERR_OPERATION_PENDING), or has nothing staged. Pace
                 // the next poll rather than spinning - each one is a full
                 // WebAuthn ceremony.
+                //
+                // Report the wait with a counter. ML-DSA-65 signing takes the
+                // device around ten seconds on a 72MHz Cortex-M4, during which
+                // a caller sees no payload and no state change at all - a
+                // healthy device and a wedged one look identical. A count that
+                // advances each poll tells them apart, and lets a watcher with
+                // a no-progress budget wait as long as the device is answering.
+                waited++;
+                api.emit("status", "OnlyKey: Waiting for device (" + waited + ")");
                 await new Promise(function(r) { setTimeout(r, POLL_INTERVAL_MS); });
             }
             if (total > 0) {
@@ -835,6 +875,18 @@ module.exports = function(imports, onlykeyApi) {
         async function prime_composite(cmd, slot, payload) {
             var bytes = Array.from(payload);
             var last = null;
+            // An ML-KEM-768 ciphertext is 1088 bytes = 5 keyhandles, each a
+            // full WebAuthn ceremony, so priming alone runs several seconds
+            // before the device has anything to confirm. Report each one.
+            //
+            // This is not decoration. A caller watching a single unchanging
+            // "Decrypting..." string cannot tell a send in progress from a
+            // wedged device, and anything with a no-progress budget shorter
+            // than the whole send will abandon a healthy operation partway -
+            // measured 2026-08-01, a GUI decrypt gave up after 5s with the
+            // device still receiving chunks and no final packet yet sent.
+            var total = Math.ceil(bytes.length / COMPOSITE_MAX_PACKET) || 1;
+            var sent = 0;
             while (bytes.length > 0) {
                 var chunk = bytes.slice(0, COMPOSITE_MAX_PACKET);
                 bytes = bytes.slice(COMPOSITE_MAX_PACKET);
@@ -844,6 +896,8 @@ module.exports = function(imports, onlykeyApi) {
                 last = await onlykeyApi.ctaphid_via_webauthn(
                     cmd, slot, finalPacket, packetnum, encrypted, 10000
                 );
+                sent++;
+                api.emit("status", "OnlyKey: Sending data to device (packet " + sent + " of " + total + ")");
             }
             return last;
         }
@@ -871,7 +925,11 @@ module.exports = function(imports, onlykeyApi) {
         api.composite_decrypt = async function(slot, data) {
             api.emit("status", "OnlyKey: Decrypting - confirm on the device");
             await prime_composite(OKDECRYPT, slot, Uint8Array.from(data));
-            var out = await poll_for_response(null);
+            // State the expected length. Passing null returned the FIRST binary
+            // reply of any size and skipped the chunk-shape check entirely -
+            // which is exactly how a short or off-cursor reply gets accepted as
+            // a shared secret. Both halves answer 32 bytes.
+            var out = await poll_for_response(COMPOSITE_SS_LEN);
             api.emit("status", "OnlyKey: Decryption complete");
             return out;
         };
