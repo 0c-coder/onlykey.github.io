@@ -4,9 +4,10 @@
 </h4>
 <fieldset>
     <p>
-        Generate a composite key here, then load the blob onto your device
-        via the CLI: <code>onlykey-cli setpqc &lt;slot&gt; &lt;blob hex&gt;</code>
-        (this app cannot load the key itself). Decrypt and sign then run
+        Generate a composite key here, then load it onto your device with the
+        command line. <strong>This app cannot load the key itself</strong> -
+        writing a private key needs the device's config mode over the vendor
+        interface, which a browser has no access to. Decrypt and sign then run
         against the device in the slot you loaded it into.
     </p>
 
@@ -18,11 +19,26 @@
     <label for="pgp_public_key">Composite public key (armored) - from Generate, or paste an existing one</label>
     <textarea rows="6" id="pgp_public_key"></textarea>
 
-    <label for="pgp_blob_hex">160-byte private blob (hex) - load via `onlykey-cli setpqc`</label>
-    <textarea readonly="readonly" rows="3" id="pgp_blob_hex"></textarea>
-
-    <label for="pgp_slot">RSA slot (1-4) the key was loaded into on the device</label>
+    <label for="pgp_slot">RSA slot (1-4) to load the key into, and to use for decrypt/sign</label>
     <input type="number" min="1" max="4" value="1" id="pgp_slot" />
+
+    <label for="pgp_setpqc_cmd">Run this to load the key onto your OnlyKey</label>
+    <textarea readonly="readonly" rows="3" id="pgp_setpqc_cmd"></textarea>
+    <button type="button" id="pgp_copy_cmd" value="Copy">Copy command</button>
+    <button type="button" id="pgp_download_blob" value="Download">Download blob file</button>
+    <div id="pgp_handoff_status"></div>
+    <p>
+        Put the device in config mode first (hold button 6 for 5+ seconds, then
+        enter your PIN); <code>setpqc</code> is refused outside it and now says
+        so instead of reporting success. If you would rather keep the key in a
+        file, use the download above and run
+        <code>onlykey-cli setpqc RSA&lt;slot&gt; &lt;file&gt;</code>, or load an
+        armored composite private key directly with
+        <code>onlykey-cli loadpqc &lt;key.asc&gt; RSA&lt;slot&gt;</code>.
+    </p>
+
+    <label for="pgp_blob_hex">160-byte private blob (hex) - this is PRIVATE key material</label>
+    <textarea readonly="readonly" rows="3" id="pgp_blob_hex"></textarea>
 </fieldset>
 
 <fieldset>

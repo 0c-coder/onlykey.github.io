@@ -158,6 +158,83 @@ module.exports = {
                 // is exactly what made TC-11's GUI test intermittently
                 // decrypt/encrypt against a key that didn't match the one
                 // actually shown in #pgp_public_key.
+                // The handoff to the command line, which is the only thing
+                // that can finish this job. Keeping it to "here is the blob,
+                // now go and type a command around it" was where every real
+                // mistake happened: the wrong slot, a truncated paste, or a
+                // `setpqc` that printed success for a load the device had
+                // refused (fixed in python-onlykey, but the paste errors are
+                // this page's to prevent). So the exact command is assembled
+                // here, from the same two values the page already holds.
+                function currentSlot() {
+                    var n = parseInt($("#pgp_slot").val(), 10);
+                    return (n >= 1 && n <= 4) ? n : 1;
+                }
+
+                function refreshSetpqcCommand() {
+                    var hex = $("#pgp_blob_hex").val().trim();
+                    if (!hex) {
+                        $("#pgp_setpqc_cmd").val("");
+                        return;
+                    }
+                    $("#pgp_setpqc_cmd").val(
+                        "onlykey-cli setpqc RSA" + currentSlot() + " " + hex);
+                }
+
+                // The slot is an input the user changes AFTER generating, and
+                // a command line still naming the old slot is exactly the kind
+                // of stale-value trap the .off('click') comment below is about.
+                $("#pgp_slot").off('input.pqc').on('input.pqc', refreshSetpqcCommand);
+
+                $("#pgp_copy_cmd").off('click').click(function() {
+                    var cmd = $("#pgp_setpqc_cmd").val();
+                    if (!cmd) {
+                        $("#pgp_handoff_status").text("Generate a key first.");
+                        return;
+                    }
+                    // navigator.clipboard is unavailable on insecure origins
+                    // and in some embedded webviews; falling back to selecting
+                    // the field means the button always does something useful
+                    // rather than failing silently.
+                    var done = function() { $("#pgp_handoff_status").text("Command copied."); };
+                    if (navigator.clipboard && navigator.clipboard.writeText) {
+                        navigator.clipboard.writeText(cmd).then(done, function() {
+                            $("#pgp_setpqc_cmd").select();
+                            $("#pgp_handoff_status").text("Could not copy - the command is selected, press Ctrl+C.");
+                        });
+                    } else {
+                        $("#pgp_setpqc_cmd").select();
+                        $("#pgp_handoff_status").text("Select-and-copy: the command is selected, press Ctrl+C.");
+                    }
+                });
+
+                $("#pgp_download_blob").off('click').click(function() {
+                    var hex = $("#pgp_blob_hex").val().trim();
+                    if (!hex) {
+                        $("#pgp_handoff_status").text("Generate a key first.");
+                        return;
+                    }
+                    // Written as HEX TEXT rather than raw bytes on purpose:
+                    // `setpqc` tries a file as hex first and falls back to raw,
+                    // so hex works either way and stays greppable/diffable. The
+                    // trailing newline is deliberate too - cli.py strips it.
+                    var blob = new Blob([hex + "\n"], { type: "text/plain" });
+                    var url = URL.createObjectURL(blob);
+                    var a = document.createElement("a");
+                    a.href = url;
+                    a.download = "onlykey-composite-pqc.hex";
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    // Revoking immediately can cancel the download in some
+                    // browsers; one turn of the event loop is enough.
+                    setTimeout(function() { URL.revokeObjectURL(url); }, 0);
+                    $("#pgp_handoff_status").text(
+                        "Saved onlykey-composite-pqc.hex - this file is PRIVATE key material. "
+                        + "Load it with: onlykey-cli setpqc RSA" + currentSlot()
+                        + " onlykey-composite-pqc.hex, then delete it.");
+                });
+
                 $("#pgp_generate").off('click').click(function() {
                     $("#pgp_generate_status").text("Generating...");
                     // Clear stale output before starting - a caller polling
@@ -168,12 +245,17 @@ module.exports = {
                     // ultimately produces.
                     $("#pgp_public_key").val("");
                     $("#pgp_blob_hex").val("");
+                    $("#pgp_setpqc_cmd").val("");
+                    $("#pgp_handoff_status").text("");
                     var userId = $("#pgp_user_email").val().trim();
                     compositePgp.generateCompositeKey(openpgp, userId ? { userId: { email: userId } } : {})
                         .then(function(result) {
                             $("#pgp_public_key").val(result.armoredPublicKey);
                             $("#pgp_blob_hex").val(bytesToHex(result.blob));
-                            $("#pgp_generate_status").text("Generated. Load the blob below onto the device via: onlykey-cli setpqc <slot> <blob hex>");
+                            refreshSetpqcCommand();
+                            $("#pgp_generate_status").text(
+                                "Generated. Put the OnlyKey in config mode, then run the command below "
+                                + "(or download the blob and pass the filename instead).");
                         })
                         .catch(function(err) {
                             $("#pgp_generate_status").text("ERROR: " + (err && err.message ? err.message : err));
