@@ -139,33 +139,14 @@ module.exports = {
                     ok: ok
                 };
 
-                // Generate a fresh composite key locally (host-side,
-                // ephemeral) and show its public key + 160-byte blob. The
-                // blob is for the user to load via `onlykey-cli setpqc`
-                // (TC-11 step 2) - this app never loads it itself, since
-                // OKSETPRIV isn't reachable over the browser's WebAuthn
-                // transport (confirmed by direct firmware read - see the
-                // implementation plan). Local private material is
-                // discarded once this function returns; nothing here keeps
-                // it around.
-                // .off('click') first: setup() re-runs (and re-registers
-                // every handler below) each time the SPA router revisits
-                // this page after `init` has already run once - without
-                // this, jQuery's .click() shorthand is additive, so a
-                // second visit fires generate/encrypt/etc TWICE
-                // concurrently, and whichever async call resolves last
-                // silently wins the DOM write race. Confirmed live: this
-                // is exactly what made TC-11's GUI test intermittently
-                // decrypt/encrypt against a key that didn't match the one
-                // actually shown in #pgp_public_key.
-                // The handoff to the command line, which is the only thing
-                // that can finish this job. Keeping it to "here is the blob,
-                // now go and type a command around it" was where every real
-                // mistake happened: the wrong slot, a truncated paste, or a
-                // `setpqc` that printed success for a load the device had
-                // refused (fixed in python-onlykey, but the paste errors are
-                // this page's to prevent). So the exact command is assembled
-                // here, from the same two values the page already holds.
+                // ---- handoff to the command line -------------------------
+                //
+                // This page cannot load the key itself, so the last step is a
+                // command the user runs. Assembling that command here, from
+                // the blob and slot the page already holds, removes the two
+                // ways a hand-built one goes wrong: a truncated paste of 320
+                // hex characters, and a slot that does not match the one the
+                // decrypt and sign sections below will use.
                 function currentSlot() {
                     var n = parseInt($("#pgp_slot").val(), 10);
                     return (n >= 1 && n <= 4) ? n : 1;
@@ -181,9 +162,11 @@ module.exports = {
                         "onlykey-cli setpqc RSA" + currentSlot() + " " + hex);
                 }
 
-                // The slot is an input the user changes AFTER generating, and
-                // a command line still naming the old slot is exactly the kind
-                // of stale-value trap the .off('click') comment below is about.
+                // The slot is an input the user can change AFTER generating, so
+                // the command has to follow it; a displayed command still
+                // naming the old slot would load the key where nothing looks
+                // for it. Namespaced (`input.pqc`) so the .off() cannot detach
+                // a handler some other part of the page put on this field.
                 $("#pgp_slot").off('input.pqc').on('input.pqc', refreshSetpqcCommand);
 
                 $("#pgp_copy_cmd").off('click').click(function() {
@@ -235,6 +218,25 @@ module.exports = {
                         + " onlykey-composite-pqc.hex, then delete it.");
                 });
 
+                // Generate a fresh composite key locally (host-side,
+                // ephemeral) and show its public key + 160-byte blob. The
+                // blob is for the user to load via `onlykey-cli setpqc`
+                // (TC-11 step 2) - this app never loads it itself, since
+                // OKSETPRIV isn't reachable over the browser's WebAuthn
+                // transport (confirmed by direct firmware read - see the
+                // implementation plan). Local private material is
+                // discarded once this function returns; nothing here keeps
+                // it around.
+                // .off('click') first: setup() re-runs (and re-registers
+                // every handler below) each time the SPA router revisits
+                // this page after `init` has already run once - without
+                // this, jQuery's .click() shorthand is additive, so a
+                // second visit fires generate/encrypt/etc TWICE
+                // concurrently, and whichever async call resolves last
+                // silently wins the DOM write race. Confirmed live: this
+                // is exactly what made TC-11's GUI test intermittently
+                // decrypt/encrypt against a key that didn't match the one
+                // actually shown in #pgp_public_key.
                 $("#pgp_generate").off('click').click(function() {
                     $("#pgp_generate_status").text("Generating...");
                     // Clear stale output before starting - a caller polling

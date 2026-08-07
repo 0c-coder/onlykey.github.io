@@ -63,25 +63,28 @@ users had generated.
 raw ML-KEM and X25519 shared secrets; it never sees an OpenPGP algorithm
 ID, and every hash and combine happens host-side. `hooks.ecdh` fires
 inside `recomputeSharedSecret()`, one level below the key-share layer, so
-the device contract is untouched. Measured: the composite kit suites pass
-unchanged against this tree.
+the device contract is untouched by construction. The on-device composite
+operations were re-run against this tree and are unaffected.
 
 Also unchanged: the composite **signature** path, which was already
 conformant — only the codepoint was wrong there.
 
 ### Verified against an independent implementation
 
-rpgp 0.20 (`draft-pqc`), Rust/RustCrypto, which has never seen this code.
-All four directions pass — it parses the key, decrypts what we encrypt,
-we decrypt what it encrypts, and it verifies our composite signatures.
-Before these changes it could not parse our keys at all. Harness:
-`onlykey/pqc-rust/interop/`. Background:
-`onlykey-testing/FINDING-pqc-private-algorithm-ids.md`.
+rpgp 0.20 (`draft-pqc`), Rust/RustCrypto, which shares no code with
+OpenPGP.js. All four directions pass — it parses the key, decrypts what
+we encrypt, we decrypt what it encrypts, and it verifies our composite
+signatures. Before these changes it could not parse our keys at all.
+
+Anyone revisiting this when the draft moves again should repeat that
+check against a second implementation rather than against another copy of
+this fork: generating with one copy and parsing with the other agrees
+perfectly and proves nothing about the wire format, which is exactly how
+the wrong codepoints survived.
 
 Keep this file and `python-onlykey/onlykey/openpgp_bridge/openpgp.js` in
-step — they are required to stay **byte-identical** (verified by `md5sum`
-at edit time), and `onlykey-testing/03-gui/05-composite-blob` is what
-notices when the three codebases drift apart on the blob layout.
+step — they are required to stay **byte-identical**, so re-check with
+`md5sum` after editing either one.
 
 ## Provenance
 
