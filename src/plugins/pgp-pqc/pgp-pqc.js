@@ -124,8 +124,8 @@ module.exports = {
                 // same guard as above). v6 signatures embed a mandatory
                 // random salt in the hashed data (OpenPGP crypto-refresh),
                 // so the digest openpgp.js hashes is DIFFERENT on every
-                // sign() call even with a pinned `date` - confirmed live,
-                // this session: a separate dry-run-then-precompute-digits
+                // sign() call even with a pinned `date` - measured, not
+                // assumed: a separate dry-run-then-precompute-digits
                 // pass (the pattern this test hook was originally built
                 // for) can never predict the real digest for a v6 key, no
                 // matter how carefully the date is pinned. The test needs
@@ -289,8 +289,10 @@ module.exports = {
                 // Device-backed: decrypt an armored composite-PGP message.
                 // hooks.ecdh/hooks.mlkemDecaps (registered above) route the
                 // X25519 and ML-KEM-768 shares through the device; openpgp
-                // does the KMAC combine + unwrap itself. Requires the
-                // challenge PIN confirmed once on-device.
+                // does the SHA3-256 key combine and RFC 3394 unwrap itself.
+                // The two shares are fetched in separate device operations, so
+                // this raises the three-button challenge TWICE - once per half
+                // - not once.
                 $("#pgp_decrypt").off('click').click(function() {
                     $("#pgp_plaintext_out").val("");
                     var armoredCiphertext = $("#pgp_ciphertext_in").val().trim();

@@ -3,8 +3,8 @@
 //
 // Mirrors python-onlykey's onlykey/pqc.py (wire layout/constants) and
 // python-onlykey/onlykey/openpgp_bridge/bridge.js's parseKey() (blob field
-// order, confirmed byte-identical to okpqc.h's layout by direct read this
-// session). Key GENERATION here uses the vendored PQC-aware openpgp.js
+// order, byte-identical to okpqc.h's PQC_OFF_* layout). Key GENERATION here
+// uses the vendored PQC-aware openpgp.js
 // fork's own generateKey({type:'pqc'}) - it already produces the exact
 // eccSecretKey/mldsaSeed/mlkemSeed fields bridge.js already knows how to
 // extract, so there's no need to hand-roll composite key generation.
@@ -15,7 +15,7 @@
 // same split as age_pqc.js (math here) vs onlykey-3rd-party.js
 // (derive_xwing_recipient/derive_xwing_decap there).
 
-// okpqc.h layout (confirmed via direct read this session):
+// Blob layout, matching okpqc.h's PQC_OFF_* defines:
 //   [0:32]   Ed25519 secret       (sign, ecc half)
 //   [32:64]  ML-DSA-65 seed       (sign, pqc half)
 //   [64:96]  X25519 secret        (decrypt, ecc half)
@@ -143,7 +143,8 @@ function registerCompositeHooks(openpgp, ok, slot) {
         // Post-quantum (ML-KEM-768) half of composite decryption.
         // `mlkemCipherText` is 1088 bytes - okpqc_decrypt infers the
         // ML-KEM half from this exact size too. openpgp.js does the
-        // composite KMAC-combine + AES-keywrap-unwrap itself once both
+        // composite key combine (SHA3-256, draft-ietf-openpgp-pqc-10
+        // section 4.2.1) and the RFC 3394 AES key-unwrap itself once both
         // shares are available - no need to port onlykey_pqc.py's
         // composite_decrypt KDF math to JS at all.
         mlkemDecaps: async function(algo, mlkemCipherText) {

@@ -28,21 +28,34 @@ being wrong and confident, is why nobody re-checked for months.
 | `pqc_mldsa_ed25519` | 107 | **30** |
 | `pqc_mlkem_x25519`  | 105 | **35** |
 
-IANA's OpenPGP Public Key Algorithms registry assigns 30 and 35. 105 and
-107 sit in the **private/experimental range** (100–110), which means "no
-other implementation is expected to understand this".
+IANA's OpenPGP Public Key Algorithms registry assigns 30 and 35, as does
+the draft's own IANA section (§11). 105 and 107 sit in the range IANA
+marks **"Private or Experimental Use"** (100–110), which means no other
+implementation is expected to understand them.
+
+*(One inconsistency in the draft itself, noted so the next reader does not
+trip on it: §11's table gives the ML-DSA-65 signature as 3293 octets,
+while Table 7 in §5.1.2 — the normative parameter table — gives 3309.
+3309 is correct; it matches FIPS 204 and the signatures the device
+actually produces.)*
 
 ### 2. ECC key share (`encaps$1` / `decaps$1`)
 
-The X25519 key share **is the raw shared secret**. The fork hashed it as
+Draft §4.1.1.1, `x25519Kem.Encaps()`/`Decaps()`: "Set the output
+ecdhKeyShare to X", the raw shared coordinate. The fork hashed it as
 `SHA3-256(ss ‖ ct ‖ recipientPub)` first.
 
 ### 3. Key combiner (`multiKeyCombine`)
+
+Draft §4.2.1, verbatim:
 
 ```
 KEK = SHA3-256( mlkemKeyShare ‖ ecdhKeyShare ‖ ecdhCipherText ‖
                 ecdhPublicKey ‖ algId ‖ domSep ‖ len(domSep) )
 ```
+
+`domSep` is the UTF-8 encoding of `OpenPGPCompositeKDFv1`; `len(domSep)`
+is a single octet, decimal 21.
 
 The fork used `KMAC256` keyed on the two shares, over data that also
 carried `mlkemCipherText` and `mlkemPublicKey`, with the domain separator
