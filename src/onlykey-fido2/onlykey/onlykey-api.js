@@ -146,8 +146,7 @@ module.exports = function(imports) {
       
       var enc_resp = 1;//<----- not used in setting time/initial connection
       ctaphid_via_webauthn(cmd, null, null, null, encryptedkeyHandle, 6000, function(maybe_a_err, data) {
-         console.info("ctaphid_response resp", maybe_a_err, data);
-         
+
       }).then(async function(ctaphid_response){
         imports.app.emit("ok-waiting");
         
@@ -172,12 +171,12 @@ module.exports = function(imports) {
                 okPub = response.slice(0, 32);
                 
                 // Decrypt with transit_key
-                var transit_key = nacl.box.before(Uint8Array.from(okPub), appKey.secretKey);   
-                console.info("Onlykey transit public", okPub);
-                console.info("App transit public", appKey.publicKey);
-                console.info("Transit shared secret", transit_key);
+                var transit_key = nacl.box.before(Uint8Array.from(okPub), appKey.secretKey);
+                // NOTHING derived from transit_key is logged. It is the session
+                // key every composite operation encrypts its chunks under, so a
+                // console line carrying it hands that session to anyone who can
+                // read the console. See 05-security/01-secret-material-not-logged.
                 transit_key = await digestBuff(Uint8Array.from(transit_key)); //AES256 key sha256 hash of shared secret
-                console.info("App AES Key", transit_key);
                 var encrypted  = response.slice(32, response.length);
                 onlykey_api.FWversion = bytes2string(response.slice(32+8, 32+20));
                 response = await aesgcm_decrypt(encrypted, transit_key);
@@ -189,8 +188,8 @@ module.exports = function(imports) {
               }else{
                 okPub = response.slice(21, 53);
                 console.info("OnlyKey Public Key: ", okPub);
+                /* sharedsec is the session key - never logged, see above. */
                 onlykey_api.sharedsec = nacl.box.before(Uint8Array.from(okPub), appKey.secretKey);
-                console.info("NACL shared secret: ", onlykey_api.sharedsec);
                 onlykey_api.OKversion = response[19] == 99 ? 'Color' : 'Original';
                 onlykey_api.FWversion = bytes2string(response.slice(8, 20));
                 console.info("Version:",[onlykey_api.OKversion, onlykey_api.FWversion]);
@@ -373,7 +372,10 @@ module.exports = function(imports) {
       }else proceed();
       
       function proceed(){
-      console.log({ctaphid_request:request});
+      /* The raw request is NOT logged. Composite operations put AES-GCM chunks
+       * through here, and a page that handles private keys should not dump
+       * every buffer it sends to a channel devtools, extensions and pasted bug
+       * reports can read. Errors below still report. */
       var results = false;
       // console.log("REQUEST:", request_options);
       window.navigator.credentials.get({
@@ -421,7 +423,8 @@ module.exports = function(imports) {
           console.warn("FAILED TO DECODE RESPONSE:", decode_error);
           response = { error: "Error decoding device response: " + decode_error.message };
         }
-        console.log({ctaphid_response:response});
+        /* Nor the raw response: device replies carry signatures and decrypted
+         * shared secrets on the composite paths. */
 
         if (cb) cb(response.error, response);
         resolve(response);
