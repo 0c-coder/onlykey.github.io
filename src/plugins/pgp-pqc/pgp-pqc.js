@@ -109,35 +109,27 @@ module.exports = {
                 // needs to construct a sign() call with an EXPLICIT,
                 // pre-agreed `date` so its Node-side dry-run challenge-
                 // digit capture (composite_pgp_challenge.js) computes the
-                // exact same digest the real on-device signing operation
-                // will - openpgp.js embeds a wall-clock creation timestamp
-                // in what gets hashed by default, and using two different
-                // implicit `new Date()` calls (one for the capture, one for
-                // the real click) risks a digest mismatch, which would
-                // send WRONG challenge-PIN digits to a device with a
-                // self-destruct PIN configured. Exposing the already-
-                // loaded openpgp/compositePgp instances (not re-requiring a
-                // second copy) and this page's own hardwareKeyForCurrentSlot
-                // lets the test build an identical, date-pinned sign call
-                // instead of guessing.
-                // Also exposes the real `ok` transport object (test-only,
-                // same guard as above). v6 signatures embed a mandatory
-                // random salt in the hashed data (OpenPGP crypto-refresh),
-                // so the digest openpgp.js hashes is DIFFERENT on every
-                // sign() call even with a pinned `date` - measured, not
-                // assumed: a separate dry-run-then-precompute-digits
-                // pass (the pattern this test hook was originally built
-                // for) can never predict the real digest for a v6 key, no
-                // matter how carefully the date is pinned. The test needs
-                // `ok` directly so it can wrap composite_sign itself and
-                // capture each real digest the instant it's computed,
-                // inside the one real sign() call that needs it.
-                window.__pgpPqcTestHooks = {
-                    openpgp: openpgp,
-                    compositePgp: compositePgp,
-                    hardwareKeyForCurrentSlot: hardwareKeyForCurrentSlot,
-                    ok: ok
-                };
+                // NO TEST HOOK IS ATTACHED TO `window` HERE, deliberately.
+                //
+                // This page used to export { openpgp, compositePgp,
+                // hardwareKeyForCurrentSlot, ok } as a global test-hook object
+                // for a harness that wanted to pin a signing date. That handed
+                // the live `ok` transport - composite_sign and
+                // composite_decrypt against whatever slot is loaded - to every
+                // script running in this origin. The three-button confirmation
+                // is the only thing that stood between a hostile script and a
+                // device signature, and a user approving a prompt they did not
+                // knowingly cause is exactly the case it cannot defend.
+                //
+                // Gating it on `process.env.NODE_ENV === "production"` would not
+                // have helped: BUILD.sh with no argument runs `build-site`
+                // (NODE_ENV=development), and that is the build committed to
+                // docs/ and served. The hook would have shipped anyway.
+                //
+                // A harness that needs these objects should reach them the way
+                // the rest of the kit does - load the modules directly - rather
+                // than have the page publish them. See
+                // onlykey-testing/test/05-security/02-shipped-bundle-clean.
 
                 // ---- handoff to the command line -------------------------
                 //
