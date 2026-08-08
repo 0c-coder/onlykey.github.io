@@ -8,7 +8,7 @@ module.exports = function(imports) {
   var onlykey_api = new EventEmitter();
 
 
-  var nacl = require("./nacl.min.js");
+  var nacl = imports.nacl;//require("./nacl.js");
 
   onlykey_api._status;
   onlykey_api.poll_delay;
@@ -146,8 +146,7 @@ module.exports = function(imports) {
       
       var enc_resp = 1;//<----- not used in setting time/initial connection
       ctaphid_via_webauthn(cmd, null, null, null, encryptedkeyHandle, 6000, function(maybe_a_err, data) {
-         console.info("ctaphid_response resp", maybe_a_err, data);
-         
+
       }).then(async function(ctaphid_response){
         imports.app.emit("ok-waiting");
         
@@ -172,12 +171,12 @@ module.exports = function(imports) {
                 okPub = response.slice(0, 32);
                 
                 // Decrypt with transit_key
-                var transit_key = nacl.box.before(Uint8Array.from(okPub), appKey.secretKey);   
-                console.info("Onlykey transit public", okPub);
-                console.info("App transit public", appKey.publicKey);
-                console.info("Transit shared secret", transit_key);
+                var transit_key = nacl.box.before(Uint8Array.from(okPub), appKey.secretKey);
+                // NOTHING derived from transit_key is logged. It is the session
+                // key every composite operation encrypts its chunks under, so a
+                // console line carrying it hands that session to anyone who can
+                // read the console. See 05-security/01-secret-material-not-logged.
                 transit_key = await digestBuff(Uint8Array.from(transit_key)); //AES256 key sha256 hash of shared secret
-                console.info("App AES Key", transit_key);
                 var encrypted  = response.slice(32, response.length);
                 onlykey_api.FWversion = bytes2string(response.slice(32+8, 32+20));
                 response = await aesgcm_decrypt(encrypted, transit_key);
@@ -189,8 +188,8 @@ module.exports = function(imports) {
               }else{
                 okPub = response.slice(21, 53);
                 console.info("OnlyKey Public Key: ", okPub);
+                /* sharedsec is the session key - never logged, see above. */
                 onlykey_api.sharedsec = nacl.box.before(Uint8Array.from(okPub), appKey.secretKey);
-                console.info("NACL shared secret: ", onlykey_api.sharedsec);
                 onlykey_api.OKversion = response[19] == 99 ? 'Color' : 'Original';
                 onlykey_api.FWversion = bytes2string(response.slice(8, 20));
                 console.info("Version:",[onlykey_api.OKversion, onlykey_api.FWversion]);
@@ -293,6 +292,15 @@ module.exports = function(imports) {
 
     switch (ctap_error_codes[error_code]) {
       case "CTAP1_SUCCESS":
+        // `data` is null whenever the assertion carried nothing but the status
+        // byte - send_stored_response() can answer a poll with no
+        // extension_writeback() at all, and ctap.cpp then reports
+        // output_buffer_offset+1 == 1. Dereferencing it here threw a TypeError
+        // from inside ctaphid_via_webauthn()'s .then(), which skipped the
+        // resolve() below it, so the returned promise NEVER SETTLED - the
+        // caller waited forever with the browser's WebAuthn prompt on screen.
+        // A decode branch must never be able to strand the transport.
+        if (!data) break;
         if (bytes2string(data.slice(0, 9)) == 'UNLOCKEDv') {
           // Reset shared secret and start over
           onlykey_api.unlocked = true;
@@ -359,8 +367,15 @@ module.exports = function(imports) {
     
     return new Promise(async function(resolve) {
       // return 
+      if(onlykey_api.step){
+        onlykey_api.step(proceed);
+      }else proceed();
       
-      console.log({ctaphid_request:request});
+      function proceed(){
+      /* The raw request is NOT logged. Composite operations put AES-GCM chunks
+       * through here, and a page that handles private keys should not dump
+       * every buffer it sends to a channel devtools, extensions and pasted bug
+       * reports can read. Errors below still report. */
       var results = false;
       // console.log("REQUEST:", request_options);
       window.navigator.credentials.get({
@@ -387,22 +402,34 @@ module.exports = function(imports) {
 
       }).then(assertion => {
         var response;
-        if (!assertion && results) {
-          response = results;
+        try {
+          if (!assertion && results) {
+            response = results;
+          }
+          else {
+            // console.log("GOT ASSERTION", assertion);
+            // console.log("RESPONSE", assertion.response);
+            response = decode_ctaphid_response_from_signature(assertion.response);
+            response.request = request;
+            // console.log("RESPONSE:", response);
+          }
         }
-        else {
-          // console.log("GOT ASSERTION", assertion);
-          // console.log("RESPONSE", assertion.response);
-          response = decode_ctaphid_response_from_signature(assertion.response);
-          response.request = request;
-          // console.log("RESPONSE:", response);
+        catch (decode_error) {
+          // Anything thrown here would otherwise skip the resolve() below and
+          // strand this promise forever - the caller keeps awaiting, the
+          // browser keeps its WebAuthn prompt up, and a polling loop can never
+          // take its next turn. Surface it as a failed response instead, so
+          // the failure is reported in milliseconds rather than never.
+          console.warn("FAILED TO DECODE RESPONSE:", decode_error);
+          response = { error: "Error decoding device response: " + decode_error.message };
         }
-        console.log({ctaphid_response:response});
-        
+        /* Nor the raw response: device replies carry signatures and decrypted
+         * shared secrets on the composite paths. */
+
         if (cb) cb(response.error, response);
         resolve(response);
       });
-
+      }
     });
 
   }

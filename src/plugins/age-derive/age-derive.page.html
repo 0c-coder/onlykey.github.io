@@ -1,0 +1,35 @@
+<h4>
+    <font size="+2">Derived X-Wing age encryption with
+        <a href="https://onlykey.io" target="_blank">OnlyKey</a></font>
+</h4>
+<fieldset>
+    <label for="label">Label (identifies the derived recipient - same label on the CLI and here derives the same key)</label>
+    <input type="text" placeholder="e.g. me@example.com" id="label" />
+
+    <label for="identity_out">Identity (age -d -i ...)</label>
+    <input readonly="readonly" type="text" id="identity_out" />
+
+    <label for="plaintext">Plaintext to encrypt</label>
+    <textarea placeholder="Plaintext" rows="3" id="plaintext"></textarea>
+    <button type="button" id="encrypt_start" value="Encrypt">Encrypt</button>
+
+    <label for="age_file_out">Encrypted age file (base64)</label>
+    <textarea readonly="readonly" rows="4" id="age_file_out"></textarea>
+
+    <label for="decrypt_file_in">age file to decrypt (base64)</label>
+    <textarea placeholder="Paste base64 age file" rows="4" id="decrypt_file_in"></textarea>
+    <button type="button" id="decrypt_start" value="Decrypt">Decrypt</button>
+
+    <label for="decrypted_out">Decrypted plaintext</label>
+    <textarea readonly="readonly" rows="3" id="decrypted_out"></textarea>
+</fieldset>
+<div>
+    <h3>Console Messages from OnlyKey Appear Below</h3>
+    <pre>
+            <code data-language="javascript">
+                <font color="008700">
+                    <div id="messages"></div>
+                </font>
+            </code>
+        </pre>
+</div>
