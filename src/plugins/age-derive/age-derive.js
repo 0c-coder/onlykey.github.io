@@ -62,6 +62,22 @@ module.exports = {
                 // feature's non-interactive encrypt/decrypt flow.
                 var press_required = false;
 
+                // Show the 3-digit challenge code the device will ask for when
+                // web derived keys are set to Challenge Code mode. onlykey-3rd-
+                // party.js emits it right before the WebAuthn prompt goes up and
+                // emits null to clear it once the derive returns.
+                ok.on("challenge", function(code) {
+                    var box = document.getElementById("challenge_code_box");
+                    var out = document.getElementById("challenge_code");
+                    if (!box || !out) return;
+                    if (code && code.length) {
+                        out.textContent = code.join("  ");
+                        box.style.display = "block";
+                    } else {
+                        box.style.display = "none";
+                    }
+                });
+
                 function currentLabel() {
                     return $("#label").val();
                 }

@@ -524,6 +524,32 @@ module.exports = function(imports, onlykeyApi) {
                 ? (press_required ? KEYACTION.DERIVE_SHARED_SECRET_REQ_PRESS : KEYACTION.DERIVE_SHARED_SECRET)
                 : (press_required ? KEYACTION.DERIVE_PUBLIC_KEY_REQ_PRESS : KEYACTION.DERIVE_PUBLIC_KEY);
 
+            // If the OnlyKey is set to "Challenge Code" for web derived keys
+            // (webderivemode 0), a shared-secret derive makes the device wait
+            // for a 3-digit code before it will answer. The device computes the
+            // code as SHA-256 over the exact request payload it received - the
+            // 32-byte label hash followed by the 32-byte ct_X (okcore.cpp's
+            // done_process_packets over packet_buffer, and the web_derive_gate
+            // in ok_extension.cpp) - taking bytes 0, 15 and 31 mod 6 (mod 3 on a
+            // DUO), each plus one. The device only shows a spinning light, not
+            // the digits, so we compute the same code here and surface it; the
+            // page displays it while the WebAuthn prompt is up. A key in Button
+            // Press or No Press mode simply ignores it. Public-key derives are
+            // never gated, so only ct_X (shared-secret) requests get a code.
+            if (ctX) {
+                try {
+                    var mod = (onlykeyApi.hw === 'DUO') ? 3 : 6;
+                    var codeInput = Uint8Array.from(labelHash.concat(Array.from(ctX)));
+                    var codeHash = await digestArray(codeInput);
+                    var challengeCode = [codeHash[0] % mod + 1, codeHash[15] % mod + 1, codeHash[31] % mod + 1];
+                    api.emit("challenge", challengeCode);
+                    api.emit("status", "OnlyKey: if it asks for a challenge code, enter " + challengeCode.join(" ") + " (or just press the button)");
+                } catch (codeErr) {
+                    // Never let a display convenience block the actual operation.
+                    api.emit("status", "OnlyKey: could not precompute the challenge code (" + (codeErr && codeErr.message ? codeErr.message : codeErr) + ")");
+                }
+            }
+
             var enc_resp = 1;
             var response = await onlykeyApi.ctaphid_via_webauthn(
                 OKCMD.OKCONNECT, keyAction, XWING_WIRE_KEYTYPE, enc_resp, message, 60000
@@ -545,6 +571,8 @@ module.exports = function(imports, onlykeyApi) {
             if (payload.length !== 64) {
                 throw new Error('X-Wing derive: expected 64 bytes after the status string, got ' + payload.length);
             }
+
+            if (ctX) api.emit("challenge", null); // clear the displayed code
 
             return {
                 pkOrSsX: Uint8Array.from(payload.slice(0, 32)),
