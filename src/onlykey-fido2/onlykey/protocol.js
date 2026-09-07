@@ -170,6 +170,8 @@
     SECPROFILE_FIRST_INIT_ONLY: 'Error Second Profile Mode may only be changed on first use',
     WIPE_MODE_LOCKED: 'Error Wipe Mode may not be changed',
     BACKUP_KEY_MODE_LOCKED: 'Error Backup Key Mode may not be changed',
+    DERIVED_REQUEST_WRONG_SIZE: 'Error derived key request wrong size',
+    DERIVED_KEY_TYPE_UNSUPPORTED: 'Error unsupported derived key type',
   };
   function startsWithAscii(bytes, s) {
     if (bytes.length < s.length) return false;
@@ -194,6 +196,10 @@
     return { kind: 'data', data: bytes };
   };
   P.isError = function (bytes) { return P.classifyResponse(bytes).kind === 'error'; };
+
+  // Derived keys over raw HID (slot 128): [cmd][slot][len|0xFF][keytype][label32][ct_X32?]
+  P.DERIVED_RECIPIENT_LEN = 33;
+  P.DERIVED_DECAPS_LEN = 65;
 
   P.CAPABILITIES_MAGIC = 202;
   P.CAPABILITIES_SELECTOR = 'c'.charCodeAt(0); // OKGETLABELS buffer[5]
