@@ -541,7 +541,9 @@ module.exports = function(imports, onlykeyApi) {
             // never gated, so only ct_X (shared-secret) requests get a code.
             if (ctX) {
                 try {
-                    var codeInput = Uint8Array.from(labelHash.concat(Array.from(ctX)));
+                    // [keytype | label32 | ct_X32]: the exact bytes both the FIDO2 gate
+                    // and the raw-HID derived decaps hash (protocol derived_key_hid)
+                    var codeInput = Uint8Array.from([protocol.KEYTYPE.XWING].concat(labelHash, Array.from(ctX)));
                     var codeHash = await digestArray(codeInput);
                     var challengeCode = protocol.challengeCodeFromHash(codeHash, onlykeyApi.hw === 'DUO');
                     api.emit("challenge", challengeCode);
