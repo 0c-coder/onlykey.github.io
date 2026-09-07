@@ -143959,7 +143959,9 @@ module.exports = function(imports, onlykeyApi) {
             // never gated, so only ct_X (shared-secret) requests get a code.
             if (ctX) {
                 try {
-                    var codeInput = Uint8Array.from(labelHash.concat(Array.from(ctX)));
+                    // [keytype | label32 | ct_X32]: the exact bytes both the FIDO2 gate
+                    // and the raw-HID derived decaps hash (protocol derived_key_hid)
+                    var codeInput = Uint8Array.from([protocol.KEYTYPE.XWING].concat(labelHash, Array.from(ctX)));
                     var codeHash = await digestArray(codeInput);
                     var challengeCode = protocol.challengeCodeFromHash(codeHash, onlykeyApi.hw === 'DUO');
                     api.emit("challenge", challengeCode);
@@ -147690,6 +147692,8 @@ module.exports = (function() {
     SECPROFILE_FIRST_INIT_ONLY: 'Error Second Profile Mode may only be changed on first use',
     WIPE_MODE_LOCKED: 'Error Wipe Mode may not be changed',
     BACKUP_KEY_MODE_LOCKED: 'Error Backup Key Mode may not be changed',
+    DERIVED_REQUEST_WRONG_SIZE: 'Error derived key request wrong size',
+    DERIVED_KEY_TYPE_UNSUPPORTED: 'Error unsupported derived key type',
   };
   function startsWithAscii(bytes, s) {
     if (bytes.length < s.length) return false;
@@ -147714,6 +147718,10 @@ module.exports = (function() {
     return { kind: 'data', data: bytes };
   };
   P.isError = function (bytes) { return P.classifyResponse(bytes).kind === 'error'; };
+
+  // Derived keys over raw HID (slot 128): [cmd][slot][len|0xFF][keytype][label32][ct_X32?]
+  P.DERIVED_RECIPIENT_LEN = 33;
+  P.DERIVED_DECAPS_LEN = 65;
 
   P.CAPABILITIES_MAGIC = 202;
   P.CAPABILITIES_SELECTOR = 'c'.charCodeAt(0); // OKGETLABELS buffer[5]
@@ -163530,4 +163538,4 @@ module.exports = __webpack_require__(/*! ./src/entry-devel.js */"./src/entry-dev
 /***/ })
 
 /******/ });
-//# sourceMappingURL=bundle.a4e5d788c7576bd29772.js.map
+//# sourceMappingURL=bundle.ec54b1a2108ecf924f09.js.map
