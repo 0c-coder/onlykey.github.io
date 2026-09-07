@@ -8,6 +8,9 @@ module.exports = function(imports, onlykeyApi) {
     var console = imports.console;
 
     var extras = require("./onlykey.extra.js")(imports);
+    // Generated protocol table (libraries/onlykey/protocol): challenge-code
+    // rule, response classifier, key type / field ids.
+    var protocol = require("./protocol.js");
     var {
         // wait,
         async_sha256,
@@ -538,10 +541,9 @@ module.exports = function(imports, onlykeyApi) {
             // never gated, so only ct_X (shared-secret) requests get a code.
             if (ctX) {
                 try {
-                    var mod = (onlykeyApi.hw === 'DUO') ? 3 : 6;
                     var codeInput = Uint8Array.from(labelHash.concat(Array.from(ctX)));
                     var codeHash = await digestArray(codeInput);
-                    var challengeCode = [codeHash[0] % mod + 1, codeHash[15] % mod + 1, codeHash[31] % mod + 1];
+                    var challengeCode = protocol.challengeCodeFromHash(codeHash, onlykeyApi.hw === 'DUO');
                     api.emit("challenge", challengeCode);
                     api.emit("status", "OnlyKey: if it asks for a challenge code, enter " + challengeCode.join(" ") + " (or just press the button)");
                 } catch (codeErr) {
@@ -649,6 +651,11 @@ module.exports = function(imports, onlykeyApi) {
         // is not a practical possibility - (95/256)^64 for the Ed25519 half.
         function as_device_message(data) {
             if (!data || !data.length) return null;
+            // The shared classifier (generated protocol.js) knows every prefix
+            // the firmware uses for status and error strings; the printable
+            // heuristic below only remains as a belt-and-braces fallback.
+            var classified = protocol.classifyResponse(data);
+            if (classified.kind !== 'data') return classified.text;
             var text = '';
             for (var i = 0; i < data.length; i++) text += String.fromCharCode(data[i]);
             text = text.replace(/\0+$/, '');
