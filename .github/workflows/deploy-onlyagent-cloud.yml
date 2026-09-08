@@ -22,6 +22,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Use Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install Worker dependencies
+        working-directory: onlyagent-cloud
+        run: npm install
+
+      - name: Validate Worker bundle
+        working-directory: onlyagent-cloud
+        run: npx wrangler deploy --dry-run --outdir .wrangler-dry-run
+
       - name: Check Cloudflare credentials
         id: credentials
         shell: bash
@@ -30,19 +43,8 @@ jobs:
             echo "configured=true" >> "$GITHUB_OUTPUT"
           else
             echo "configured=false" >> "$GITHUB_OUTPUT"
-            echo "Cloudflare deployment is prepared but GitHub secrets CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID are not configured yet."
+            echo "Cloudflare Worker bundle validated. Actual deployment is waiting for GitHub secrets CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID."
           fi
-
-      - name: Use Node 22
-        if: steps.credentials.outputs.configured == 'true'
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-
-      - name: Install Worker dependencies
-        if: steps.credentials.outputs.configured == 'true'
-        working-directory: onlyagent-cloud
-        run: npm install
 
       - name: Deploy Worker and custom domains
         if: steps.credentials.outputs.configured == 'true'
