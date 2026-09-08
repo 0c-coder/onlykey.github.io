@@ -23,13 +23,10 @@ module.exports = {
           hid: null,
           screen: null,
           ws: null,
-          deviceId: sessionStorage.getItem("onlyagent_device_id") || null,
-          ownerToken: sessionStorage.getItem("onlyagent_owner_token") || "",
+          deviceId: localStorage.getItem("onlyagent_device_id") || null,
+          deviceSecret: localStorage.getItem("onlyagent_device_secret") || null,
           stopped: false
         };
-
-        var ownerInput = $page.find("#oa-owner-token");
-        ownerInput.val(state.ownerToken);
 
         setStatus("#oa-secure-status", window.isSecureContext, "Secure context", "A secure context is required");
         setStatus("#oa-webhid-status", !!navigator.hid, "WebHID available", "WebHID is unavailable in this browser");
@@ -66,7 +63,7 @@ module.exports = {
             video.srcObject = state.screen;
             state.screen.getVideoTracks()[0].addEventListener("ended", function() {
               state.screen = null;
-              $page.find("#oa-screen-status").text("Not sharing");
+              $page.find("#oa-screen-status").removeClass("text-success").addClass("text-muted").text("Not sharing");
               sendDeviceStatus();
             });
             state.stopped = false;
@@ -87,16 +84,15 @@ module.exports = {
 
         async function connectCloud() {
           try {
-            state.ownerToken = ownerInput.val().trim();
-            if (state.ownerToken) sessionStorage.setItem("onlyagent_owner_token", state.ownerToken);
-
-            if (!state.deviceId) {
-              var created = await api("/api/devices", {
+            if (!state.deviceId || !state.deviceSecret) {
+              var created = await apiPublic("/api/devices", {
                 method: "POST",
                 body: JSON.stringify({ name: "OnlyAgent Browser Device" })
               });
               state.deviceId = created.device.id;
-              sessionStorage.setItem("onlyagent_device_id", state.deviceId);
+              state.deviceSecret = created.device.secret;
+              localStorage.setItem("onlyagent_device_id", state.deviceId);
+              localStorage.setItem("onlyagent_device_secret", state.deviceSecret);
             }
 
             var wsToken = await api("/api/devices/" + encodeURIComponent(state.deviceId) + "/ws-token", {
@@ -118,14 +114,24 @@ module.exports = {
             state.ws.onclose = function() {
               $page.find("#oa-cloud-status").removeClass("text-success").addClass("text-muted").text("Disconnected");
             };
+            state.ws.onerror = function() {
+              $page.find("#oa-cloud-status").removeClass("text-success").addClass("text-danger")
+                .text("Cloud connection failed");
+            };
             state.ws.onmessage = onCloudMessage;
           } catch (e) {
+            if (String(e.message || "").indexOf("401") !== -1) {
+              localStorage.removeItem("onlyagent_device_id");
+              localStorage.removeItem("onlyagent_device_secret");
+              state.deviceId = null;
+              state.deviceSecret = null;
+            }
             $page.find("#oa-cloud-status").removeClass("text-success").addClass("text-danger").text(e.message);
           }
         }
 
         async function createAgentGrant() {
-          if (!state.deviceId) return alert("Connect OnlyAgent Cloud first.");
+          if (!state.deviceId || !state.deviceSecret) return alert("Connect OnlyAgent Cloud first.");
           try {
             var scopes = [];
             $page.find(".oa-scope:checked").each(function() { scopes.push($(this).val()); });
@@ -192,8 +198,13 @@ module.exports = {
               sendResult(id, true, { stopped: true });
               return;
             }
+            if (command === "wait") {
+              await new Promise(function(resolve) { setTimeout(resolve, Math.min(Number(params.milliseconds || 0), 30000)); });
+              sendResult(id, true, { waited: Number(params.milliseconds || 0) });
+              return;
+            }
             if (state.stopped) throw new Error("Remote control is stopped");
-            if (!state.hid) throw new Error("OnlyAgent hardware is not connected");
+            if (!state.hid) throw new Error("OnlyAgent hardware is not connected yet");
             await sendHardwareCommand(command, params);
             sendResult(id, true, { ok: true });
           } catch (e) {
@@ -207,7 +218,7 @@ module.exports = {
             requestHardwareCapture(id, params);
             return;
           }
-          throw new Error("No capture source available");
+          throw new Error("No capture source available. Click Share Screen for browser-mode testing.");
         }
 
         async function sendBrowserScreenshot(id, params) {
@@ -225,6 +236,7 @@ module.exports = {
           ctx.drawImage(video, 0, 0, width, height);
           var quality = Math.max(.2, Math.min(Number(params.quality || 75) / 100, .95));
           var blob = await new Promise(function(resolve) { canvas.toBlob(resolve, "image/jpeg", quality); });
+          if (!blob) throw new Error("Could not encode screenshot");
           var jpeg = new Uint8Array(await blob.arrayBuffer());
           sendBinaryScreenshot(id, jpeg, width, height, "image/jpeg");
         }
@@ -295,11 +307,22 @@ module.exports = {
           }));
         }
 
-        async function api(path, options) {
+        async function apiPublic(path, options) {
           options = options || {};
           options.headers = options.headers || {};
           options.headers["content-type"] = "application/json";
-          if (state.ownerToken) options.headers["authorization"] = "Bearer " + state.ownerToken;
+          var response = await fetch(API_BASE + path, options);
+          if (!response.ok) throw new Error(response.status + ": " + await response.text());
+          if (response.status === 204) return null;
+          return response.json();
+        }
+
+        async function api(path, options) {
+          if (!state.deviceSecret) throw new Error("OnlyAgent device credential is missing");
+          options = options || {};
+          options.headers = options.headers || {};
+          options.headers["content-type"] = "application/json";
+          options.headers["authorization"] = "Bearer " + state.deviceSecret;
           var response = await fetch(API_BASE + path, options);
           if (!response.ok) throw new Error(response.status + ": " + await response.text());
           if (response.status === 204) return null;
