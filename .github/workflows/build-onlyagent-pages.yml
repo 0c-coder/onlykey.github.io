@@ -35,7 +35,7 @@ jobs:
 
       - name: Build site into docs
         env:
-          NODE_OPTIONS: --openssl-legacy-provider --max-old-space-size=4096
+          NODE_OPTIONS: --max-old-space-size=4096
         run: npm run build
 
       - name: Commit generated site
