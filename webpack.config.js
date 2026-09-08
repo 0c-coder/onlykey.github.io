@@ -34,6 +34,9 @@ var cspOptions = {
             "https://keybase.io",
             "https://onlykey.herokuapp.com", //for api
             "wss://onlykey.herokuapp.com", //for gun
+            "https://api.onlyagent.app",
+            "wss://api.onlyagent.app",
+            "https://mcp.onlyagent.app",
         ]
     },
     hashEnabled: {
