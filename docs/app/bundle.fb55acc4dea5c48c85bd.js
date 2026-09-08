@@ -152027,13 +152027,10 @@ module.exports = {
           hid: null,
           screen: null,
           ws: null,
-          deviceId: sessionStorage.getItem("onlyagent_device_id") || null,
-          ownerToken: sessionStorage.getItem("onlyagent_owner_token") || "",
+          deviceId: localStorage.getItem("onlyagent_device_id") || null,
+          deviceSecret: localStorage.getItem("onlyagent_device_secret") || null,
           stopped: false
         };
-
-        var ownerInput = $page.find("#oa-owner-token");
-        ownerInput.val(state.ownerToken);
 
         setStatus("#oa-secure-status", window.isSecureContext, "Secure context", "A secure context is required");
         setStatus("#oa-webhid-status", !!navigator.hid, "WebHID available", "WebHID is unavailable in this browser");
@@ -152070,7 +152067,7 @@ module.exports = {
             video.srcObject = state.screen;
             state.screen.getVideoTracks()[0].addEventListener("ended", function() {
               state.screen = null;
-              $page.find("#oa-screen-status").text("Not sharing");
+              $page.find("#oa-screen-status").removeClass("text-success").addClass("text-muted").text("Not sharing");
               sendDeviceStatus();
             });
             state.stopped = false;
@@ -152091,16 +152088,15 @@ module.exports = {
 
         async function connectCloud() {
           try {
-            state.ownerToken = ownerInput.val().trim();
-            if (state.ownerToken) sessionStorage.setItem("onlyagent_owner_token", state.ownerToken);
-
-            if (!state.deviceId) {
-              var created = await api("/api/devices", {
+            if (!state.deviceId || !state.deviceSecret) {
+              var created = await apiPublic("/api/devices", {
                 method: "POST",
                 body: JSON.stringify({ name: "OnlyAgent Browser Device" })
               });
               state.deviceId = created.device.id;
-              sessionStorage.setItem("onlyagent_device_id", state.deviceId);
+              state.deviceSecret = created.device.secret;
+              localStorage.setItem("onlyagent_device_id", state.deviceId);
+              localStorage.setItem("onlyagent_device_secret", state.deviceSecret);
             }
 
             var wsToken = await api("/api/devices/" + encodeURIComponent(state.deviceId) + "/ws-token", {
@@ -152122,14 +152118,24 @@ module.exports = {
             state.ws.onclose = function() {
               $page.find("#oa-cloud-status").removeClass("text-success").addClass("text-muted").text("Disconnected");
             };
+            state.ws.onerror = function() {
+              $page.find("#oa-cloud-status").removeClass("text-success").addClass("text-danger")
+                .text("Cloud connection failed");
+            };
             state.ws.onmessage = onCloudMessage;
           } catch (e) {
+            if (String(e.message || "").indexOf("401") !== -1) {
+              localStorage.removeItem("onlyagent_device_id");
+              localStorage.removeItem("onlyagent_device_secret");
+              state.deviceId = null;
+              state.deviceSecret = null;
+            }
             $page.find("#oa-cloud-status").removeClass("text-success").addClass("text-danger").text(e.message);
           }
         }
 
         async function createAgentGrant() {
-          if (!state.deviceId) return alert("Connect OnlyAgent Cloud first.");
+          if (!state.deviceId || !state.deviceSecret) return alert("Connect OnlyAgent Cloud first.");
           try {
             var scopes = [];
             $page.find(".oa-scope:checked").each(function() { scopes.push($(this).val()); });
@@ -152196,8 +152202,13 @@ module.exports = {
               sendResult(id, true, { stopped: true });
               return;
             }
+            if (command === "wait") {
+              await new Promise(function(resolve) { setTimeout(resolve, Math.min(Number(params.milliseconds || 0), 30000)); });
+              sendResult(id, true, { waited: Number(params.milliseconds || 0) });
+              return;
+            }
             if (state.stopped) throw new Error("Remote control is stopped");
-            if (!state.hid) throw new Error("OnlyAgent hardware is not connected");
+            if (!state.hid) throw new Error("OnlyAgent hardware is not connected yet");
             await sendHardwareCommand(command, params);
             sendResult(id, true, { ok: true });
           } catch (e) {
@@ -152211,7 +152222,7 @@ module.exports = {
             requestHardwareCapture(id, params);
             return;
           }
-          throw new Error("No capture source available");
+          throw new Error("No capture source available. Click Share Screen for browser-mode testing.");
         }
 
         async function sendBrowserScreenshot(id, params) {
@@ -152229,6 +152240,7 @@ module.exports = {
           ctx.drawImage(video, 0, 0, width, height);
           var quality = Math.max(.2, Math.min(Number(params.quality || 75) / 100, .95));
           var blob = await new Promise(function(resolve) { canvas.toBlob(resolve, "image/jpeg", quality); });
+          if (!blob) throw new Error("Could not encode screenshot");
           var jpeg = new Uint8Array(await blob.arrayBuffer());
           sendBinaryScreenshot(id, jpeg, width, height, "image/jpeg");
         }
@@ -152299,11 +152311,22 @@ module.exports = {
           }));
         }
 
-        async function api(path, options) {
+        async function apiPublic(path, options) {
           options = options || {};
           options.headers = options.headers || {};
           options.headers["content-type"] = "application/json";
-          if (state.ownerToken) options.headers["authorization"] = "Bearer " + state.ownerToken;
+          var response = await fetch(API_BASE + path, options);
+          if (!response.ok) throw new Error(response.status + ": " + await response.text());
+          if (response.status === 204) return null;
+          return response.json();
+        }
+
+        async function api(path, options) {
+          if (!state.deviceSecret) throw new Error("OnlyAgent device credential is missing");
+          options = options || {};
+          options.headers = options.headers || {};
+          options.headers["content-type"] = "application/json";
+          options.headers["authorization"] = "Bearer " + state.deviceSecret;
           var response = await fetch(API_BASE + path, options);
           if (!response.ok) throw new Error(response.status + ": " + await response.text());
           if (response.status === 204) return null;
@@ -152336,7 +152359,7 @@ module.exports = {
 
 "use strict";
 __webpack_require__.r(__webpack_exports__);
-/* harmony default export */ __webpack_exports__["default"] = ("<div class=\"oa-card\">\n  <div class=\"oa-card-head\">\n    <h2><i class=\"fa fa-plug\" aria-hidden=\"true\"></i> Connect OnlyAgent</h2>\n    <p>Connect this browser to OnlyAgent hardware and securely relay a remote MCP agent through OnlyAgent Cloud.</p>\n  </div>\n\n  <div class=\"oa-connect-grid\">\n    <section>\n      <h3>Browser</h3>\n      <div id=\"oa-secure-status\">Checking secure context…</div>\n      <div id=\"oa-webhid-status\">Checking WebHID…</div>\n      <div id=\"oa-capture-status\">Checking screen capture…</div>\n    </section>\n\n    <section>\n      <h3>Hardware</h3>\n      <div id=\"oa-device-status\" class=\"text-muted\">Not connected</div>\n      <button id=\"oa-connect-device\" class=\"btn oa-btn-primary\">Connect OnlyAgent</button>\n    </section>\n\n    <section>\n      <h3>Screen</h3>\n      <div id=\"oa-screen-status\" class=\"text-muted\">Not sharing</div>\n      <button id=\"oa-share-screen\" class=\"btn btn-secondary\">Share Screen</button>\n      <button id=\"oa-stop-screen\" class=\"btn btn-secondary\">Stop Sharing</button>\n    </section>\n\n    <section>\n      <h3>OnlyAgent Cloud</h3>\n      <div id=\"oa-cloud-status\" class=\"text-muted\">Not connected</div>\n      <label for=\"oa-owner-token\">Development owner token</label>\n      <input id=\"oa-owner-token\" type=\"password\" class=\"form-control\" autocomplete=\"off\" placeholder=\"Temporary MVP token\">\n      <div style=\"margin-top:10px\">\n        <button id=\"oa-cloud-login\" class=\"btn btn-secondary\">Connect Cloud</button>\n      </div>\n      <p class=\"text-muted\" style=\"margin-top:10px\">Production will replace this development token with device-scoped OAuth authorization.</p>\n    </section>\n  </div>\n\n  <hr>\n\n  <h3>Remote Agent</h3>\n  <p>Create a device-scoped MCP credential for Hermes, OpenClaw, or another Streamable-HTTP MCP client.</p>\n\n  <div class=\"form-group\">\n    <label for=\"oa-agent-name\">Agent name</label>\n    <input id=\"oa-agent-name\" class=\"form-control\" value=\"Remote Agent\">\n  </div>\n\n  <div class=\"oa-scope-row\">\n    <label><input type=\"checkbox\" class=\"oa-scope\" value=\"screen.read\" checked> Screen</label>\n    <label><input type=\"checkbox\" class=\"oa-scope\" value=\"input.control\" checked> Keyboard / mouse</label>\n    <label><input type=\"checkbox\" class=\"oa-scope\" value=\"state.read\" checked> Device status</label>\n    <label><input type=\"checkbox\" class=\"oa-scope\" value=\"session.stop\" checked> Emergency stop</label>\n  </div>\n\n  <button id=\"oa-create-agent\" class=\"btn oa-btn-primary\">Create Remote Agent Connection</button>\n  <div id=\"oa-agent-output\" style=\"margin-top:18px\"></div>\n\n  <hr>\n\n  <h3>Emergency Control</h3>\n  <button id=\"oa-emergency-stop\" class=\"btn btn-danger\">STOP REMOTE CONTROL</button>\n\n  <video id=\"oa-capture-video\" autoplay muted playsinline style=\"display:none\"></video>\n  <canvas id=\"oa-capture-canvas\" style=\"display:none\"></canvas>\n</div>\n");
+/* harmony default export */ __webpack_exports__["default"] = ("<div class=\"oa-card\">\n  <div class=\"oa-card-head\">\n    <h2><i class=\"fa fa-plug\" aria-hidden=\"true\"></i> Connect OnlyAgent</h2>\n    <p>Connect this browser to OnlyAgent hardware and securely relay a remote MCP agent through OnlyAgent Cloud.</p>\n  </div>\n\n  <div class=\"oa-connect-grid\">\n    <section>\n      <h3>Browser</h3>\n      <div id=\"oa-secure-status\">Checking secure context…</div>\n      <div id=\"oa-webhid-status\">Checking WebHID…</div>\n      <div id=\"oa-capture-status\">Checking screen capture…</div>\n    </section>\n\n    <section>\n      <h3>Hardware</h3>\n      <div id=\"oa-device-status\" class=\"text-muted\">Not connected</div>\n      <button id=\"oa-connect-device\" class=\"btn oa-btn-primary\">Connect OnlyAgent</button>\n    </section>\n\n    <section>\n      <h3>Screen</h3>\n      <div id=\"oa-screen-status\" class=\"text-muted\">Not sharing</div>\n      <button id=\"oa-share-screen\" class=\"btn btn-secondary\">Share Screen</button>\n      <button id=\"oa-stop-screen\" class=\"btn btn-secondary\">Stop Sharing</button>\n    </section>\n\n    <section>\n      <h3>OnlyAgent Cloud</h3>\n      <div id=\"oa-cloud-status\" class=\"text-muted\">Not connected</div>\n      <div style=\"margin-top:10px\">\n        <button id=\"oa-cloud-login\" class=\"btn btn-secondary\">Connect Cloud</button>\n      </div>\n      <p class=\"text-muted\" style=\"margin-top:10px\">For this MVP, this browser receives a random device credential stored locally. Production will bind device ownership to OnlyKey and OAuth.</p>\n    </section>\n  </div>\n\n  <hr>\n\n  <h3>Remote Agent</h3>\n  <p>Create a device-scoped MCP credential for Hermes, OpenClaw, or another Streamable-HTTP MCP client.</p>\n\n  <div class=\"form-group\">\n    <label for=\"oa-agent-name\">Agent name</label>\n    <input id=\"oa-agent-name\" class=\"form-control\" value=\"Remote Agent\">\n  </div>\n\n  <div class=\"oa-scope-row\">\n    <label><input type=\"checkbox\" class=\"oa-scope\" value=\"screen.read\" checked> Screen</label>\n    <label><input type=\"checkbox\" class=\"oa-scope\" value=\"input.control\" checked> Keyboard / mouse</label>\n    <label><input type=\"checkbox\" class=\"oa-scope\" value=\"state.read\" checked> Device status</label>\n    <label><input type=\"checkbox\" class=\"oa-scope\" value=\"session.stop\" checked> Emergency stop</label>\n  </div>\n\n  <button id=\"oa-create-agent\" class=\"btn oa-btn-primary\">Create Remote Agent Connection</button>\n  <div id=\"oa-agent-output\" style=\"margin-top:18px\"></div>\n\n  <hr>\n\n  <h3>Emergency Control</h3>\n  <button id=\"oa-emergency-stop\" class=\"btn btn-danger\">STOP REMOTE CONTROL</button>\n\n  <video id=\"oa-capture-video\" autoplay muted playsinline style=\"display:none\"></video>\n  <canvas id=\"oa-capture-canvas\" style=\"display:none\"></canvas>\n</div>\n");
 
 /***/ }),
 
@@ -153558,4 +153581,4 @@ module.exports = __webpack_require__(/*! ./src/entry-devel.js */"./src/entry-dev
 /***/ })
 
 /******/ });
-//# sourceMappingURL=bundle.44052b8eafa546459fe9.js.map
+//# sourceMappingURL=bundle.fb55acc4dea5c48c85bd.js.map
