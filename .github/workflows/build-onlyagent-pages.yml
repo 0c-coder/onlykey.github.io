@@ -25,17 +25,17 @@ jobs:
           ref: onlyagent-reskin
           fetch-depth: 0
 
-      - name: Use Node 16
+      - name: Use Node 20
         uses: actions/setup-node@v4
         with:
-          node-version: '16'
+          node-version: '20.19.5'
 
       - name: Install dependencies
         run: npm install
 
       - name: Build site into docs
         env:
-          NODE_OPTIONS: --max-old-space-size=4096
+          NODE_OPTIONS: --openssl-legacy-provider --max-old-space-size=4096
         run: npm run build
 
       - name: Commit generated site
