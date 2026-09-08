@@ -27,6 +27,9 @@ module.exports.push(require("./plugins/fancy-icons/fi.js"));
 
 module.exports.push(require("./plugins/index/index.js"));
 
+// OnlyAgent remote computer / MCP connection page.
+module.exports.push(require("./plugins/onlyagent_connect/onlyagent_connect.js"));
+
 module.exports.push(require("./plugins/xterm_console/index.js"));
 
 module.exports.push(require("./plugins/encrypt/encrypt.js"));

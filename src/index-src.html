@@ -14,6 +14,7 @@
   <header class="oa-nav"><div class="inner">
     <a class="oa-brand" href="/"><img src="<%= htmlWebpackPlugin.options.dir_name %>/onlyagent-logo.svg" alt="OnlyAgent"></a>
     <nav class="oa-navlinks">
+      <a href="<%= htmlWebpackPlugin.options.dir_name %>/connect"><i class="fa fa-plug"></i><span>Connect</span></a>
       <a href="<%= htmlWebpackPlugin.options.dir_name %>/encrypt"><i class="fa fa-lock"></i><span>Encrypt</span></a>
       <a href="<%= htmlWebpackPlugin.options.dir_name %>/decrypt"><i class="fa fa-unlock"></i><span>Decrypt</span></a>
       <a href="<%= htmlWebpackPlugin.options.dir_name %>/search"><i class="fa fa-search"></i><span>Search</span></a>
@@ -25,15 +26,16 @@
 
   <main class="oa-main">
     <section class="oa-hero">
-      <h1>Encrypt anything with <span class="g">your hardware key</span>.</h1>
-      <p>Securely encrypt, sign, decrypt and verify messages and files right in your browser. Your private keys never leave your OnlyKey.</p>
+      <h1>Connect AI agents to <span class="g">your hardware-controlled computer</span>.</h1>
+      <p>Use OnlyAgent to share the screen, authorize a remote MCP agent, and route keyboard and mouse control through dedicated hardware — while keeping existing OnlyKey security features available.</p>
       <div class="oa-cta-row" style="margin-top:26px">
-        <a class="btn oa-btn-primary" style="max-width:260px" href="<%= htmlWebpackPlugin.options.dir_name %>/encrypt">Encrypt a message</a>
+        <a class="btn oa-btn-primary" style="max-width:260px" href="<%= htmlWebpackPlugin.options.dir_name %>/connect">Connect an Agent</a>
         <a id="setTime" class="btn btn-secondary">Set Time for OTP 2FA</a>
       </div>
     </section>
 
     <section class="oa-tools">
+      <a class="oa-tool" href="<%= htmlWebpackPlugin.options.dir_name %>/connect"><div class="ic"><i class="fa fa-plug"></i></div><h3>Connect a Remote Agent</h3><p>Connect OnlyAgent hardware, share the screen when available, and securely authorize Hermes, OpenClaw, or another MCP agent.</p></a>
       <a class="oa-tool" href="<%= htmlWebpackPlugin.options.dir_name %>/encrypt"><div class="ic"><i class="fa fa-lock"></i></div><h3>Encrypt &amp; Sign Messages</h3><p>Compose an end-to-end encrypted, signed message for any Keybase or Protonmail user.</p></a>
       <a class="oa-tool" href="<%= htmlWebpackPlugin.options.dir_name %>/encrypt-file"><div class="ic"><i class="fa fa-file-archive-o"></i></div><h3>Encrypt &amp; Sign Files</h3><p>Encrypt files for a recipient — or for yourself — with your OnlyKey.</p></a>
       <a class="oa-tool" href="<%= htmlWebpackPlugin.options.dir_name %>/decrypt"><div class="ic"><i class="fa fa-unlock"></i></div><h3>Decrypt &amp; Verify Messages</h3><p>Decrypt incoming PGP messages and verify the sender's signature.</p></a>
