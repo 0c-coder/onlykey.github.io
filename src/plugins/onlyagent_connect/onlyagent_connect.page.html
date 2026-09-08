@@ -1,0 +1,67 @@
+<div class="oa-card">
+  <div class="oa-card-head">
+    <h2><i class="fa fa-plug" aria-hidden="true"></i> Connect OnlyAgent</h2>
+    <p>Connect this browser to OnlyAgent hardware and securely relay a remote MCP agent through OnlyAgent Cloud.</p>
+  </div>
+
+  <div class="oa-connect-grid">
+    <section>
+      <h3>Browser</h3>
+      <div id="oa-secure-status">Checking secure context…</div>
+      <div id="oa-webhid-status">Checking WebHID…</div>
+      <div id="oa-capture-status">Checking screen capture…</div>
+    </section>
+
+    <section>
+      <h3>Hardware</h3>
+      <div id="oa-device-status" class="text-muted">Not connected</div>
+      <button id="oa-connect-device" class="btn oa-btn-primary">Connect OnlyAgent</button>
+    </section>
+
+    <section>
+      <h3>Screen</h3>
+      <div id="oa-screen-status" class="text-muted">Not sharing</div>
+      <button id="oa-share-screen" class="btn btn-secondary">Share Screen</button>
+      <button id="oa-stop-screen" class="btn btn-secondary">Stop Sharing</button>
+    </section>
+
+    <section>
+      <h3>OnlyAgent Cloud</h3>
+      <div id="oa-cloud-status" class="text-muted">Not connected</div>
+      <label for="oa-owner-token">Development owner token</label>
+      <input id="oa-owner-token" type="password" class="form-control" autocomplete="off" placeholder="Temporary MVP token">
+      <div style="margin-top:10px">
+        <button id="oa-cloud-login" class="btn btn-secondary">Connect Cloud</button>
+      </div>
+      <p class="text-muted" style="margin-top:10px">Production will replace this development token with device-scoped OAuth authorization.</p>
+    </section>
+  </div>
+
+  <hr>
+
+  <h3>Remote Agent</h3>
+  <p>Create a device-scoped MCP credential for Hermes, OpenClaw, or another Streamable-HTTP MCP client.</p>
+
+  <div class="form-group">
+    <label for="oa-agent-name">Agent name</label>
+    <input id="oa-agent-name" class="form-control" value="Remote Agent">
+  </div>
+
+  <div class="oa-scope-row">
+    <label><input type="checkbox" class="oa-scope" value="screen.read" checked> Screen</label>
+    <label><input type="checkbox" class="oa-scope" value="input.control" checked> Keyboard / mouse</label>
+    <label><input type="checkbox" class="oa-scope" value="state.read" checked> Device status</label>
+    <label><input type="checkbox" class="oa-scope" value="session.stop" checked> Emergency stop</label>
+  </div>
+
+  <button id="oa-create-agent" class="btn oa-btn-primary">Create Remote Agent Connection</button>
+  <div id="oa-agent-output" style="margin-top:18px"></div>
+
+  <hr>
+
+  <h3>Emergency Control</h3>
+  <button id="oa-emergency-stop" class="btn btn-danger">STOP REMOTE CONTROL</button>
+
+  <video id="oa-capture-video" autoplay muted playsinline style="display:none"></video>
+  <canvas id="oa-capture-canvas" style="display:none"></canvas>
+</div>
