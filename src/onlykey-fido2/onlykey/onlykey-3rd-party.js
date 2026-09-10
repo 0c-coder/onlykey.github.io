@@ -47,11 +47,21 @@ module.exports = function(imports, onlykeyApi) {
         CURVE25519: 3
     };
 
+    // 3 and 4 (DERIVE_*_REQ_PRESS) were removed from the firmware and the
+    // numbers are burned, not reused - sending either now gets
+    // CTAP2_ERR_EXTENSION_NOT_SUPPORTED rather than being reinterpreted.
+    //
+    // The `press_required` argument these mapped to is now IGNORED, and kept
+    // only so existing callers still parse. Presence is decided by the device
+    // from what is being asked for: deriving a public key never prompts,
+    // deriving a shared secret always does, with no setting to turn it off.
+    // The suffix had also quietly become a second key domain (the firmware set
+    // additional_data[0] = 1 for it, changing the HKDF salt), which is how
+    // vault.js ended up fetching its public key in one domain and doing its
+    // ECDH in the other. One label now means one key.
     var KEYACTION = {
         DERIVE_PUBLIC_KEY: 1,
-        DERIVE_SHARED_SECRET: 2,
-        DERIVE_PUBLIC_KEY_REQ_PRESS: 3,
-        DERIVE_SHARED_SECRET_REQ_PRESS: 4
+        DERIVE_SHARED_SECRET: 2
     };
 
     // Uint8Array.from() is NOT a string encoder. Given a string it treats it as
@@ -312,7 +322,7 @@ module.exports = function(imports, onlykeyApi) {
             }
             Array.prototype.push.apply(message, dataHash);
 
-            var keyAction = press_required ? KEYACTION.DERIVE_PUBLIC_KEY_REQ_PRESS : KEYACTION.DERIVE_PUBLIC_KEY;
+            var keyAction = KEYACTION.DERIVE_PUBLIC_KEY;   // press_required ignored, see KEYACTION
 
             var enc_resp = 1;
             await onlykeyApi.ctaphid_via_webauthn(cmd, keyAction, keytype, enc_resp, message, 60000).then(async(response) => {
@@ -413,7 +423,7 @@ module.exports = function(imports, onlykeyApi) {
             //msg("input pubkey -> " + pubkey)
             //msg("full message -> " + message)
 
-            var keyAction = press_required ? KEYACTION.DERIVE_SHARED_SECRET_REQ_PRESS : KEYACTION.DERIVE_SHARED_SECRET;
+            var keyAction = KEYACTION.DERIVE_SHARED_SECRET; // press_required ignored; the device always prompts
 
             var enc_resp = 1;
             await onlykeyApi.ctaphid_via_webauthn(cmd, keyAction, keytype, enc_resp, message, 60000).then(async(response) => {
@@ -523,9 +533,7 @@ module.exports = function(imports, onlykeyApi) {
             Array.prototype.push.apply(message, labelHash);
             if (ctX) Array.prototype.push.apply(message, Array.from(ctX));
 
-            var keyAction = ctX
-                ? (press_required ? KEYACTION.DERIVE_SHARED_SECRET_REQ_PRESS : KEYACTION.DERIVE_SHARED_SECRET)
-                : (press_required ? KEYACTION.DERIVE_PUBLIC_KEY_REQ_PRESS : KEYACTION.DERIVE_PUBLIC_KEY);
+            var keyAction = ctX ? KEYACTION.DERIVE_SHARED_SECRET : KEYACTION.DERIVE_PUBLIC_KEY;
 
             // If the OnlyKey is set to "Challenge Code" for web derived keys
             // (webderivemode 0), a shared-secret derive makes the device wait
