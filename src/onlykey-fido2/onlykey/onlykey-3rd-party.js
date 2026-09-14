@@ -510,7 +510,12 @@ module.exports = function(imports, onlykeyApi) {
         var XWING_PK = 1216;   // okcrypto.h XWING_PK_SIZE
         var XWING_CT = 1120;   // okcrypto.h XWING_CT_SIZE
         var XWING_SS = 32;     // okcrypto.h XWING_SS_SIZE
-        var RESERVED_KEY_WEB_DERIVATION = 128; // okcore.h
+        // Slot 128 - the web AND agent derivation key. Named for both because it
+        // serves both: this app over FIDO2, and local tools over USB
+        // (onlykey-agent, python-onlykey, age). Deliberately the accessible tier -
+        // reachable by software with nobody in front of it, and correspondingly
+        // less protected than a stored slot.
+        var RESERVED_KEY_WEB_AGENT_DERIVATION = 128; // okcore.h
 
         // Response layout, confirmed live rather than only read off the
         // firmware:
@@ -616,7 +621,7 @@ module.exports = function(imports, onlykeyApi) {
         // on the device.
         //
         // This no longer rides the DERIVE_* extension. It is a chunked
-        // OKDECRYPT to slot RESERVED_KEY_WEB_DERIVATION carrying
+        // OKDECRYPT to slot RESERVED_KEY_WEB_AGENT_DERIVATION carrying
         // [ label32 | ct(1120) ] - the same tunnel composite_decrypt uses -
         // because the whole X-Wing ciphertext has to reach the device now.
         // Previously the host sent only ct_X (32 bytes), got back ss_X plus
@@ -642,7 +647,7 @@ module.exports = function(imports, onlykeyApi) {
                 payload.set(Uint8Array.from(labelHash), 0);
                 payload.set(Uint8Array.from(ciphertext), 32);
 
-                await prime_composite(OKDECRYPT, RESERVED_KEY_WEB_DERIVATION, payload);
+                await prime_composite(OKDECRYPT, RESERVED_KEY_WEB_AGENT_DERIVATION, payload);
                 var ss = await poll_for_response(XWING_SS);
                 api.emit("status", "OnlyKey: Derived X-Wing Decapsulation Complete");
                 if (typeof cb === 'function') cb(null, Uint8Array.from(ss));
