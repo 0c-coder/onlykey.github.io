@@ -26,3 +26,6 @@ module.exports.push(require("./plugins/age-derive/age-derive.js"));
 
 module.exports.push(require("./plugins/pgp-pqc/pgp-pqc.js"));
   
+
+/* vault: prerelease, development builds only */
+module.exports.push(require("./plugins/vault/vault.js"));
