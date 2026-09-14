@@ -507,6 +507,10 @@ module.exports = function(imports, onlykeyApi) {
         //     different key with no error, surfacing much later as "no
         //     identity matched any of the recipients".
         var XWING_WIRE_KEYTYPE = 5;
+        var XWING_PK = 1216;   // okcrypto.h XWING_PK_SIZE
+        var XWING_CT = 1120;   // okcrypto.h XWING_CT_SIZE
+        var XWING_SS = 32;     // okcrypto.h XWING_SS_SIZE
+        var RESERVED_KEY_WEB_DERIVATION = 128; // okcore.h
 
         // Response layout, confirmed live rather than only read off the
         // firmware:
@@ -517,7 +521,7 @@ module.exports = function(imports, onlykeyApi) {
         // ok_extension.cpp forces any truthy opt3 to that mode). The status
         // string's length varies with the firmware version, so the NUL is
         // located rather than a fixed offset assumed.
-        async function xwing_derive(label, ctX, press_required) {
+        async function xwing_derive(label) {
             var message = [255, 255, 255, 255, OKCMD.OKCONNECT];
 
             var currentEpochTime = Math.round(new Date().getTime() / 1000.0).toString(16);
@@ -531,36 +535,19 @@ module.exports = function(imports, onlykeyApi) {
 
             var labelHash = await digestArray(derivationInputBytes(label));
             Array.prototype.push.apply(message, labelHash);
-            if (ctX) Array.prototype.push.apply(message, Array.from(ctX));
 
-            var keyAction = ctX ? KEYACTION.DERIVE_SHARED_SECRET : KEYACTION.DERIVE_PUBLIC_KEY;
-
-            // If the OnlyKey is set to "Challenge Code" for web derived keys
-            // (webderivemode 0), a shared-secret derive makes the device wait
-            // for a 3-digit code before it will answer. The device computes the
-            // code as SHA-256 over the exact request payload it received - the
-            // 32-byte label hash followed by the 32-byte ct_X (okcore.cpp's
-            // done_process_packets over packet_buffer, and the web_derive_gate
-            // in ok_extension.cpp) - taking bytes 0, 15 and 31 mod 6 (mod 3 on a
-            // DUO), each plus one. The device only shows a spinning light, not
-            // the digits, so we compute the same code here and surface it; the
-            // page displays it while the WebAuthn prompt is up. A key in Button
-            // Press or No Press mode simply ignores it. Public-key derives are
-            // never gated, so only ct_X (shared-secret) requests get a code.
-            if (ctX) {
-                try {
-                    // [keytype | label32 | ct_X32]: the exact bytes both the FIDO2 gate
-                    // and the raw-HID derived decaps hash (protocol derived_key_hid)
-                    var codeInput = Uint8Array.from([protocol.KEYTYPE.XWING].concat(labelHash, Array.from(ctX)));
-                    var codeHash = await digestArray(codeInput);
-                    var challengeCode = protocol.challengeCodeFromHash(codeHash, onlykeyApi.hw === 'DUO');
-                    api.emit("challenge", challengeCode);
-                    api.emit("status", "OnlyKey: if it asks for a challenge code, enter " + challengeCode.join(" ") + " (or just press the button)");
-                } catch (codeErr) {
-                    // Never let a display convenience block the actual operation.
-                    api.emit("status", "OnlyKey: could not precompute the challenge code (" + (codeErr && codeErr.message ? codeErr.message : codeErr) + ")");
-                }
-            }
+            // Public-key derivation only. DERIVE_SHAREDSEC is no longer served
+            // on this path at all: decapsulation now needs the whole 1120-byte
+            // X-Wing ciphertext on the device, which does not fit this
+            // single-shot client_handle request, and the device must hold the
+            // ML-KEM half rather than hand the host a seed to expand. See
+            // derive_xwing_decap() below for where it went.
+            //
+            // Nothing here is gated, so there is no challenge code to
+            // precompute and display: a public key is public data and the
+            // caller cannot turn it into a secret. The gate lives on the
+            // decapsulation path - the one that decrypts.
+            var keyAction = KEYACTION.DERIVE_PUBLIC_KEY;
 
             var enc_resp = 1;
             var response = await onlykeyApi.ctaphid_via_webauthn(
@@ -579,28 +566,45 @@ module.exports = function(imports, onlykeyApi) {
 
             var nulAt = tail.indexOf(0);
             if (nulAt === -1) throw new Error('X-Wing derive: no NUL-terminated status string in response');
-            var payload = tail.slice(nulAt + 1);
-            if (payload.length !== 64) {
-                throw new Error('X-Wing derive: expected 64 bytes after the status string, got ' + payload.length);
+            var head = Uint8Array.from(tail.slice(nulAt + 1));
+
+            // The recipient is XWING_PK (1216) bytes - far past what one
+            // WebAuthn assertion carries - so the firmware stages it in
+            // large_resp_buffer and serves it in MAX_LARGE_RESP_CHUNK pieces.
+            // Whatever rode along with this first response is its head; the
+            // rest is polled exactly as an ML-DSA-65 signature is.
+            //
+            // It used to be 64 bytes inline: [ pk_X(32) | mlkem_seed(32) ].
+            // The seed is private key material - it yields sk_M - so that was
+            // a private key returned in answer to a request for a public one.
+            // ML-KEM has no short public key (the only 32-byte value that
+            // reproduces pk_M also reproduces sk_M), so the public key itself
+            // has to be what crosses the wire.
+            var pk;
+            if (head.length >= XWING_PK) {
+                pk = head.slice(0, XWING_PK);
+            } else {
+                var rest = await poll_for_response(XWING_PK - head.length);
+                pk = new Uint8Array(XWING_PK);
+                pk.set(head, 0);
+                pk.set(Uint8Array.from(rest), head.length);
             }
 
-            if (ctX) api.emit("challenge", null); // clear the displayed code
-
             return {
-                pkOrSsX: Uint8Array.from(payload.slice(0, 32)),
-                mlkemSeed: Uint8Array.from(payload.slice(32, 64)),
+                recipient: pk,
                 status: bytes2string(tail.slice(0, nulAt)),
             };
         }
 
-        // cb(error, pk_X, mlkemSeed) - the recipient half. age-derive.js feeds
-        // both straight into age_pqc.js's buildRecipient().
-        api.derive_xwing_recipient = async function(label, press_required, cb) {
+        // cb(error, recipient) - the full 1216-byte X-Wing public key, ready
+        // for agePqc.xwingEncapsHost(). age-derive.js no longer builds it from
+        // halves, because the device no longer hands out the ML-KEM half's seed.
+        api.derive_xwing_recipient = async function(label, cb) {
             api.emit("status", "OnlyKey: Requesting Derived X-Wing Recipient");
             try {
-                var r = await xwing_derive(label, null, press_required);
+                var r = await xwing_derive(label);
                 api.emit("status", "OnlyKey: Derived X-Wing Recipient Complete");
-                if (typeof cb === 'function') cb(null, r.pkOrSsX, r.mlkemSeed);
+                if (typeof cb === 'function') cb(null, r.recipient);
             }
             catch (e) {
                 api.emit("status", "OnlyKey: Problem Requesting Derived X-Wing Recipient");
@@ -608,15 +612,40 @@ module.exports = function(imports, onlykeyApi) {
             }
         };
 
-        // cb(error, ss_X) - decapsulation. Same call with ct_X appended; the
-        // device returns the X25519 shared secret in the slot pk_X occupies
-        // above, which is why both share one implementation.
-        api.derive_xwing_decap = async function(label, ctX, press_required, cb) {
-            api.emit("status", "OnlyKey: Requesting Derived X-Wing Decapsulation");
+        // cb(error, ss) - the 32-byte X-Wing shared secret, fully decapsulated
+        // on the device.
+        //
+        // This no longer rides the DERIVE_* extension. It is a chunked
+        // OKDECRYPT to slot RESERVED_KEY_WEB_DERIVATION carrying
+        // [ label32 | ct(1120) ] - the same tunnel composite_decrypt uses -
+        // because the whole X-Wing ciphertext has to reach the device now.
+        // Previously the host sent only ct_X (32 bytes), got back ss_X plus
+        // the ML-KEM seed, and finished the ML-KEM half itself; ct_M never
+        // reached the device and the seed always reached the host. Both are
+        // reversed, so the derived path custodies its whole key exactly as the
+        // stored path does.
+        //
+        // The confirmation is the device's, not ours: the firmware computes
+        // the challenge digits over the reassembled label and ciphertext and
+        // floors at a button press for a shared secret whatever field 30 says.
+        // We no longer precompute and display a code here - the previous code
+        // hashed [keytype | label32 | ct_X32], which is not what the device
+        // hashes now, and a wrong code shown confidently is worse than none.
+        api.derive_xwing_decap = async function(label, ciphertext, cb) {
+            api.emit("status", "OnlyKey: Requesting Derived X-Wing Decapsulation - confirm on the device");
             try {
-                var r = await xwing_derive(label, ctX, press_required);
+                if (!ciphertext || ciphertext.length !== XWING_CT) {
+                    throw new Error('X-Wing ct must be ' + XWING_CT + ' bytes, got ' + (ciphertext ? ciphertext.length : 0));
+                }
+                var labelHash = await digestArray(derivationInputBytes(label));
+                var payload = new Uint8Array(32 + XWING_CT);
+                payload.set(Uint8Array.from(labelHash), 0);
+                payload.set(Uint8Array.from(ciphertext), 32);
+
+                await prime_composite(OKDECRYPT, RESERVED_KEY_WEB_DERIVATION, payload);
+                var ss = await poll_for_response(XWING_SS);
                 api.emit("status", "OnlyKey: Derived X-Wing Decapsulation Complete");
-                if (typeof cb === 'function') cb(null, r.pkOrSsX);
+                if (typeof cb === 'function') cb(null, Uint8Array.from(ss));
             }
             catch (e) {
                 api.emit("status", "OnlyKey: Problem Requesting Derived X-Wing Decapsulation");

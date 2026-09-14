@@ -273,12 +273,10 @@ function encryptAgeFile(plaintext, { ciphertext, sharedSecret }) {
 // Decrypts a full age v1 file containing (at least) one mlkem768x25519
 // stanza. deriveSharedSecret(ciphertext) is called with the full 1120-byte
 // X-Wing ciphertext from the stanza and must return (sync or async) the
-// 32-byte combined X-Wing shared secret for this file's recipient - the
-// caller already knows pk_X/mlkem_seed for the label and is expected to
-// use ctXOf(ciphertext) to get the 32 bytes the device's
-// DERIVE_SHARED_SECRET call needs, then call splitDecapsulate() itself
-// (it needs the *full* ciphertext too, for the ML-KEM half - not just
-// ct_X). Returns the decrypted plaintext as a Uint8Array.
+// 32-byte combined X-Wing shared secret for this file's recipient. The caller
+// hands that whole ciphertext to the device, which decapsulates both halves
+// and answers with the finished shared secret; there is no host-side ML-KEM
+// step and nothing to split. Returns the decrypted plaintext as a Uint8Array.
 async function decryptAgeFile(fileBytes, deriveSharedSecret) {
     const bytes = fileBytes instanceof Uint8Array ? fileBytes : new Uint8Array(fileBytes);
     const { stanzas, headerNoMac, mac, headerEndOffset } = parseHeader(bytes);
