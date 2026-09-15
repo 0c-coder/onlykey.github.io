@@ -60,9 +60,21 @@ if (!!(process.env.NODE_ENV === "production")) {//is production
   
   //production only plugins (we should have sister plugins enabled in plugins-devel.js)
   
-  /* debug console omitter (remove console output)
-      you can use `window.console` to force output in production  */
-  module.exports.push(require("./plugins/console/console.js"));
+  // ------------------------------------------------------------------------
+  // TODO BEFORE REAL PRODUCTION RELEASE: re-enable the console omitter below.
+  //
+  // onlyagent.app is currently a TEST deployment - the real production site
+  // will be a different host - and this build is what we test the firmware
+  // against. With the omitter on, the app reported absolutely nothing when
+  // the FIDO2 derived-key path hung on 2026-09-15: no error, no log, just a
+  // page that never finished. Diagnosing that from the firmware's serial log
+  // alone cost hours. Keep console output ON while onlyagent.app is the test
+  // site, and turn this back on when cutting the real production build.
+  //
+  // /* debug console omitter (remove console output)
+  //     you can use `window.console` to force output in production  */
+  // module.exports.push(require("./plugins/console/console.js"));
+  // ------------------------------------------------------------------------
   
 }else{//is development
   //instead of including DEV plugins in production builds, 
