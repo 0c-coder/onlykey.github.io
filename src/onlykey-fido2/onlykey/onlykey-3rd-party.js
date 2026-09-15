@@ -571,14 +571,49 @@ module.exports = function(imports, onlykeyApi) {
 
             var okPub = data.slice(0, 32);
             var transit_key = Uint8Array.from(nacl.box.before(Uint8Array.from(okPub), appKey.secretKey));
-            var tail = await aesgcm_decrypt(data.slice(32, data.length), transit_key);
-            tail = Array.from(tail);
-            console.log('[XWTRACE] decrypted tail', tail.length, 'nulAt', tail.indexOf(0));
 
+            // Reassemble the CIPHERTEXT first, decrypt once at the end.
+            //
+            // Everything after the transit pubkey is ONE AES-GCM blob that the
+            // device encrypted in a single call over the whole staged response
+            // (store_FIDO_response(), encrypt == 2). The chunk boundaries are a
+            // transport artefact and mean nothing to the cipher.
+            //
+            // Decrypting the first chunk and then appending the polled chunks
+            // raw - which is what this did - splices plaintext onto ciphertext.
+            // It looked plausible because aesgcm_decrypt() runs with
+            // tagLength 0, so a prefix DOES decrypt correctly on its own and
+            // the first 446 bytes of the recipient were right. The remaining
+            // 770 were ciphertext. agePqc rejected the result with "ML-KEM.
+            // encapsulate: wrong publicKey modulus" - measured on hardware
+            // 2026-09-15, the first symptom of this that was visible at all.
+            var cipher = Array.from(data).slice(32);
+            if (cipher.length >= MAX_LARGE_RESP_CHUNK - 32) {
+                // untilShort: the host cannot compute the total. The staged
+                // response is [ transit pubkey(32) | status field | pk(1216) ]
+                // and the status field's width is sizeof(UNLOCKED)+1 - a
+                // firmware build constant that changes with the version string.
+                var rest = await poll_for_response(0, null, true);
+                cipher = cipher.concat(Array.from(rest));
+            }
+
+            var tail = Array.from(await aesgcm_decrypt(cipher, transit_key));
+            console.log('[XWTRACE] cipher', cipher.length, 'tail', tail.length, 'nulAt', tail.indexOf(0));
+
+            // Take the recipient as the LAST XWING_PK bytes rather than
+            // everything after the first NUL. The status field is a fixed-width
+            // slot, NOT a tight string: the firmware copies sizeof(UNLOCKED)+1
+            // bytes into it, so short version strings leave trailing padding
+            // between the NUL and the recipient. Slicing at nulAt+1 prepended
+            // that padding to pk_M and corrupted it.
+            if (tail.length < XWING_PK) {
+                throw new Error('X-Wing derive: short response, got ' + tail.length +
+                                ' bytes, need at least ' + XWING_PK);
+            }
             var nulAt = tail.indexOf(0);
             if (nulAt === -1) throw new Error('X-Wing derive: no NUL-terminated status string in response');
-            var head = Uint8Array.from(tail.slice(nulAt + 1));
-            console.log('[XWTRACE] head', head.length, 'need', XWING_PK, 'will poll for', XWING_PK - head.length);
+            var head = Uint8Array.from(tail.slice(tail.length - XWING_PK));
+            console.log('[XWTRACE] recipient', head.length, 'header field was', tail.length - XWING_PK, 'bytes');
 
             // The recipient is XWING_PK (1216) bytes - far past what one
             // WebAuthn assertion carries - so the firmware stages it in
@@ -592,18 +627,11 @@ module.exports = function(imports, onlykeyApi) {
             // ML-KEM has no short public key (the only 32-byte value that
             // reproduces pk_M also reproduces sk_M), so the public key itself
             // has to be what crosses the wire.
-            var pk;
-            if (head.length >= XWING_PK) {
-                pk = head.slice(0, XWING_PK);
-            } else {
-                var rest = await poll_for_response(XWING_PK - head.length);
-                pk = new Uint8Array(XWING_PK);
-                pk.set(head, 0);
-                pk.set(Uint8Array.from(rest), head.length);
-            }
-
+            // head is already exactly XWING_PK bytes: the ciphertext was
+            // reassembled and decrypted above, and the recipient taken off the
+            // end of it.
             return {
-                recipient: pk,
+                recipient: head,
                 status: bytes2string(tail.slice(0, nulAt)),
             };
         }
@@ -774,7 +802,7 @@ module.exports = function(imports, onlykeyApi) {
         // a limit being hit. Sizing a total cap for the largest possible
         // response would also destroy its only real job - spotting a wedged
         // device.
-        async function poll_for_response(expected, maxMs) {
+        async function poll_for_response(expected, maxMs, untilShort) {
             var deadline = Date.now() + (maxMs || POLL_BUDGET_MS);
             var parts = [];
             var total = 0;
@@ -850,6 +878,20 @@ module.exports = function(imports, onlykeyApi) {
                         deadline = Date.now() + (maxMs || POLL_BUDGET_MS); // progress: re-arm
                         api.emit("status", "OnlyKey: Receiving response (" + total +
                             (expected ? " of " + expected : "") + " bytes)");
+                        // untilShort: drain the staged response without being
+                        // told its length. send_stored_response() serves
+                        // MAX_LARGE_RESP_CHUNK bytes per poll until the tail, so
+                        // the first chunk SHORTER than that is the last one.
+                        // Used by the X-Wing derive, where the host cannot
+                        // compute the total: the staged response is
+                        // [ transit pubkey(32) | status field | recipient(1216) ]
+                        // and the status field's width is a firmware build
+                        // constant (sizeof(UNLOCKED)+1) that the host has no way
+                        // to know.
+                        if (untilShort) {
+                            if (resp.data.length === MAX_LARGE_RESP_CHUNK) continue;
+                            return Uint8Array.from([].concat.apply([], parts));
+                        }
                         if (!expected || total >= expected) {
                             var out = [].concat.apply([], parts);
                             return Uint8Array.from(expected ? out.slice(0, expected) : out);
