@@ -559,6 +559,11 @@ module.exports = function(imports, onlykeyApi) {
                 OKCMD.OKCONNECT, keyAction, XWING_WIRE_KEYTYPE, enc_resp, message, 60000
             );
 
+            console.log('[XWTRACE] assertion returned', {
+                status: response && response.status,
+                error: response && response.error,
+                dataLen: response && response.data ? response.data.length : null
+            });
             if (!response || !response.data) {
                 throw new Error(response && response.error ? response.error : 'no response from OnlyKey');
             }
@@ -568,10 +573,12 @@ module.exports = function(imports, onlykeyApi) {
             var transit_key = Uint8Array.from(nacl.box.before(Uint8Array.from(okPub), appKey.secretKey));
             var tail = await aesgcm_decrypt(data.slice(32, data.length), transit_key);
             tail = Array.from(tail);
+            console.log('[XWTRACE] decrypted tail', tail.length, 'nulAt', tail.indexOf(0));
 
             var nulAt = tail.indexOf(0);
             if (nulAt === -1) throw new Error('X-Wing derive: no NUL-terminated status string in response');
             var head = Uint8Array.from(tail.slice(nulAt + 1));
+            console.log('[XWTRACE] head', head.length, 'need', XWING_PK, 'will poll for', XWING_PK - head.length);
 
             // The recipient is XWING_PK (1216) bytes - far past what one
             // WebAuthn assertion carries - so the firmware stages it in
@@ -612,6 +619,7 @@ module.exports = function(imports, onlykeyApi) {
                 if (typeof cb === 'function') cb(null, r.recipient);
             }
             catch (e) {
+                console.error('[XWTRACE] derive_xwing_recipient threw', e && e.name, e && e.message, e);
                 api.emit("status", "OnlyKey: Problem Requesting Derived X-Wing Recipient");
                 if (typeof cb === 'function') cb(e.message || e);
             }
@@ -774,9 +782,11 @@ module.exports = function(imports, onlykeyApi) {
             var lastStatus = null;
             var waited = 0;
 
+            console.log('[XWTRACE] poll_for_response entered, expected', expected);
             while (Date.now() < deadline) {
                 var resp = await onlykeyApi.ctaphid_via_webauthn(OKPING, 0, 0, 0, new Uint8Array(), PING_TIMEOUT_MS);
                 lastStatus = resp && resp.status;
+                console.log('[XWTRACE] poll ->', lastStatus, 'len', resp && resp.data ? resp.data.length : null, 'err', resp && resp.error, 'total', total);
                 // Fail fast on anything that cannot improve by polling again.
                 // The deadline is a backstop for "still working", not a
                 // penalty box to sit out once the answer is already known.
