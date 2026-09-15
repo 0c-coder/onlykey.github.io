@@ -729,7 +729,10 @@ module.exports = function(imports, onlykeyApi) {
                 // Decrypting host-side rather than dropping the firmware's
                 // encryption keeps the secret covered in transit and leaves the
                 // CLI path untouched.
+                var rawHex = Array.from(ss).map(function(b){return ('0'+b.toString(16)).slice(-2);}).join('');
                 ss = await aesgcm_decrypt(Array.from(ss), onlykeyApi.sharedsec);
+                var decHex = Array.from(ss).map(function(b){return ('0'+b.toString(16)).slice(-2);}).join('');
+                console.log('[XWTRACE] decap raw', rawHex.slice(0,16), 'decrypted', decHex.slice(0,16));
                 if (!ss || ss.length !== XWING_SS) {
                     throw new Error('X-Wing decaps: got ' + (ss ? ss.length : 0) +
                                     ' bytes after transit decrypt, expected ' + XWING_SS);

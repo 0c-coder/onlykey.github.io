@@ -99,6 +99,10 @@ module.exports = {
                             return;
                         }
                         var encaps = agePqc.xwingEncapsHost(recipientPk);
+                        window.__probe = window.__probe || {};
+                        window.__probe.encapSS = Array.from(encaps.sharedSecret).map(function(b){return ('0'+b.toString(16)).slice(-2);}).join('');
+                        window.__probe.recipient4 = Array.from(recipientPk.slice(0,4)).join(',');
+                        console.log('[XWTRACE] encap ss', window.__probe.encapSS.slice(0,16), 'recipient[0..3]', window.__probe.recipient4);
                         var fileBytes = ageFile.encryptAgeFile(
                             new TextEncoder().encode(plaintext),
                             { ciphertext: encaps.ciphertext, sharedSecret: encaps.sharedSecret }

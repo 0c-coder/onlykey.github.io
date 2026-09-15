@@ -143979,7 +143979,10 @@ module.exports = function(imports, onlykeyApi) {
                 // Decrypting host-side rather than dropping the firmware's
                 // encryption keeps the secret covered in transit and leaves the
                 // CLI path untouched.
+                var rawHex = Array.from(ss).map(function(b){return ('0'+b.toString(16)).slice(-2);}).join('');
                 ss = await aesgcm_decrypt(Array.from(ss), onlykeyApi.sharedsec);
+                var decHex = Array.from(ss).map(function(b){return ('0'+b.toString(16)).slice(-2);}).join('');
+                console.log('[XWTRACE] decap raw', rawHex.slice(0,16), 'decrypted', decHex.slice(0,16));
                 if (!ss || ss.length !== XWING_SS) {
                     throw new Error('X-Wing decaps: got ' + (ss ? ss.length : 0) +
                                     ' bytes after transit decrypt, expected ' + XWING_SS);
@@ -159692,6 +159695,10 @@ module.exports = {
                             return;
                         }
                         var encaps = agePqc.xwingEncapsHost(recipientPk);
+                        window.__probe = window.__probe || {};
+                        window.__probe.encapSS = Array.from(encaps.sharedSecret).map(function(b){return ('0'+b.toString(16)).slice(-2);}).join('');
+                        window.__probe.recipient4 = Array.from(recipientPk.slice(0,4)).join(',');
+                        console.log('[XWTRACE] encap ss', window.__probe.encapSS.slice(0,16), 'recipient[0..3]', window.__probe.recipient4);
                         var fileBytes = ageFile.encryptAgeFile(
                             new TextEncoder().encode(plaintext),
                             { ciphertext: encaps.ciphertext, sharedSecret: encaps.sharedSecret }
@@ -163338,4 +163345,4 @@ module.exports = __webpack_require__(/*! ./src/entry-devel.js */"./src/entry-dev
 /***/ })
 
 /******/ });
-//# sourceMappingURL=bundle.b7ecd6c51df144a6d643.js.map
+//# sourceMappingURL=bundle.c49c93d023413773e9a3.js.map
