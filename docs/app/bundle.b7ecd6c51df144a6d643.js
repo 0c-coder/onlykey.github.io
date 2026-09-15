@@ -143822,6 +143822,25 @@ module.exports = function(imports, onlykeyApi) {
             var okPub = data.slice(0, 32);
             var transit_key = Uint8Array.from(nacl.box.before(Uint8Array.from(okPub), appKey.secretKey));
 
+            // This request was an OKCONNECT, so the device has just REPLACED its
+            // transit_key with one derived from the keypair generated above.
+            // transit_key is a single global on the device - the last OKCONNECT
+            // always wins - while onlykeyApi.sharedsec still held the key from
+            // the api's own connect at page load.
+            //
+            // Everything composite goes out under onlykeyApi.sharedsec
+            // (prime_composite -> aesgcm_encrypt), so after any derive those two
+            // disagreed and the device decrypted the OKDECRYPT chunks with the
+            // wrong key. It does not fail loudly: the chunk count is right, the
+            // request reassembles to 1152 bytes of garbage, the device
+            // decapsulates that garbage and hands back a perfectly well-formed
+            // 32-byte secret which simply is not the right one. age reports
+            // "invalid tag" - measured on hardware 2026-09-15, after a correct
+            // derive, a correct encrypt and a confirmed press on the key.
+            //
+            // Adopt the key the device now actually holds.
+            onlykeyApi.sharedsec = transit_key;
+
             // Reassemble the CIPHERTEXT first, decrypt once at the end.
             //
             // Everything after the transit pubkey is ONE AES-GCM blob that the
@@ -163319,4 +163338,4 @@ module.exports = __webpack_require__(/*! ./src/entry-devel.js */"./src/entry-dev
 /***/ })
 
 /******/ });
-//# sourceMappingURL=bundle.ad0feb4d498bf615e15a.js.map
+//# sourceMappingURL=bundle.b7ecd6c51df144a6d643.js.map
