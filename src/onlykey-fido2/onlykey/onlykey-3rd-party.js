@@ -685,6 +685,36 @@ module.exports = function(imports, onlykeyApi) {
 
                 await prime_composite(OKDECRYPT, RESERVED_KEY_WEB_AGENT_DERIVATION, payload);
                 var ss = await poll_for_response(XWING_SS);
+
+                // The shared secret comes back TRANSIT-ENCRYPTED and has to be
+                // decrypted here.
+                //
+                // okcrypto.cpp returns it with
+                //   send_transport_response(ss, XWING_SS_SIZE, true, true)
+                // and that `true` only bites on this transport:
+                // send_transport_response() ignores the flag on the raw-HID
+                // branch (it memcpys straight into resp_buffer) and honours it
+                // on the WebAuthn branch, where store_FIDO_response() AES-GCMs
+                // the whole 32 bytes under the transit key. So the CLI's
+                // derive_decaps(), which uses the bytes raw, is right to - and
+                // this path was wrong to.
+                //
+                // Every okpqc composite return passes false instead
+                // (okpqc.cpp:251 X25519_SS, :262 MLKEM_SS), which is why
+                // composite_decrypt() can use its poll result directly and why
+                // copying that shape here produced a plausible-looking 32 bytes
+                // that were simply ciphertext. age reported it as "invalid
+                // tag" - measured on hardware 2026-09-15, after the device had
+                // decapsulated correctly and the user had confirmed on the key.
+                //
+                // Decrypting host-side rather than dropping the firmware's
+                // encryption keeps the secret covered in transit and leaves the
+                // CLI path untouched.
+                ss = await aesgcm_decrypt(Array.from(ss), onlykeyApi.sharedsec);
+                if (!ss || ss.length !== XWING_SS) {
+                    throw new Error('X-Wing decaps: got ' + (ss ? ss.length : 0) +
+                                    ' bytes after transit decrypt, expected ' + XWING_SS);
+                }
                 api.emit("status", "OnlyKey: Derived X-Wing Decapsulation Complete");
                 if (typeof cb === 'function') cb(null, Uint8Array.from(ss));
             }
