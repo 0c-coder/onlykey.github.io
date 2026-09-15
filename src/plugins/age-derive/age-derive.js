@@ -102,7 +102,8 @@ module.exports = {
                         window.__probe = window.__probe || {};
                         window.__probe.encapSS = Array.from(encaps.sharedSecret).map(function(b){return ('0'+b.toString(16)).slice(-2);}).join('');
                         window.__probe.recipient4 = Array.from(recipientPk.slice(0,4)).join(',');
-                        console.log('[XWTRACE] encap ss', window.__probe.encapSS.slice(0,16), 'recipient[0..3]', window.__probe.recipient4);
+                        window.__probe.ctEnc = Array.from(encaps.ciphertext.slice(0,4)).join(',') + '|' + Array.from(encaps.ciphertext.slice(-4)).join(',') + '|len' + encaps.ciphertext.length;
+                        console.log('[XWTRACE] encap ss', window.__probe.encapSS.slice(0,16), 'recipient[0..3]', window.__probe.recipient4, 'ct', window.__probe.ctEnc);
                         var fileBytes = ageFile.encryptAgeFile(
                             new TextEncoder().encode(plaintext),
                             { ciphertext: encaps.ciphertext, sharedSecret: encaps.sharedSecret }
@@ -130,6 +131,10 @@ module.exports = {
                             // finished 32-byte shared secret, so the recipient
                             // lookup that used to be needed here (to feed pk_X
                             // and the seed into splitDecapsulate) is gone.
+                            console.log('[XWTRACE] decap ct',
+                                Array.from(ciphertext.slice(0,4)).join(',') + '|' +
+                                Array.from(ciphertext.slice(-4)).join(',') + '|len' + ciphertext.length,
+                                'encapWas', window.__probe && window.__probe.ctEnc);
                             ok.derive_xwing_decap(label, ciphertext, function(error, ss) {
                                 if (error) { reject(new Error(error)); return; }
                                 resolve(ss);
