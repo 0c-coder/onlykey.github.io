@@ -7,24 +7,11 @@ if (!!(process.env.NODE_ENV === "production")) {
 //just in case this file gets included somehow in production
 console.log("WARNING! ------------- LOADING DEVEL PLUGINS! ------------- WARNING!");
 
-
 module.exports = [];
-
 
 /* debug console emitter */
 module.exports.push(require("./plugins/console/console_debug.js"));
 
-/* chat plugin */
-module.exports.push(require("./plugins/chat/chat.js"));
-
-/* for encrypted data to for onlykey devices */
-
-
-module.exports.push(require("./plugins/password-generator/password-generator.js"));
-
-module.exports.push(require("./plugins/age-derive/age-derive.js"));
-
-module.exports.push(require("./plugins/pgp-pqc/pgp-pqc.js"));
   
 
 /* vault: prerelease, development builds only */

@@ -47,6 +47,15 @@ module.exports.push(require("./plugins/search/search.js"));
 
 module.exports.push(require("./plugins/ok-status-icon/ok-status-icon.js"));
 
+// The PQC pages ship. They were in plugins-devel.js, which is development-only
+// and throws if it ever reaches a production bundle - so `BUILD.sh 1` produced
+// a site with no /app/age-derive.html and no /app/pgp-pqc.html at all, while
+// the deployed site (a dev build) had them. That split meant the thing being
+// released was never the thing being built for release.
+module.exports.push(require("./plugins/age-derive/age-derive.js"));
+
+module.exports.push(require("./plugins/pgp-pqc/pgp-pqc.js"));
+
 if (!!(process.env.NODE_ENV === "production")) {//is production
   
   //production only plugins (we should have sister plugins enabled in plugins-devel.js)
