@@ -73042,130 +73042,6 @@ module.exports = {
 
 /***/ }),
 
-/***/ "./src/lib/history.js":
-/*!****************************!*\
-  !*** ./src/lib/history.js ***!
-  \****************************/
-/*! no static exports found */
-/***/ (function(module, exports) {
-
-//change   _template_  to your plugin name  
-module.exports = {
-  consumes: ["app", "onlykey3rd", "newGun", "forge", "SEA"],
-  provides: ["history"],
-
-  setup: async function(options, imports, register) {
-    var historyAPI = {};
-
-    var onlykey3rd = imports.onlykey3rd;
-    var ok = onlykey3rd(1, 0);
-    var newGun = imports.newGun;
-    var SEA = imports.SEA;
-    var forge = imports.forge;
-    
-    var gun = newGun();
-
-    /**/
-
-    var disconnected_PK = window.localStorage.onlykey_has_history;
-    if (!disconnected_PK) {
-      disconnected_PK = JSON.stringify(await SEA.pair());
-      window.localStorage.onlykey_has_history = disconnected_PK;
-    }
-
-    disconnected_PK = JSON.parse(disconnected_PK);
-
-    // var disconnected_PUBKEY = disconnected_PK.epub;
-    var disconnected_SECRET = await SEA.secret(disconnected_PK, disconnected_PK);
-
-    historyAPI.historyEnabled = false;
-
-    var historyPUBKEY = false;
-    var historySECRET = false;
-
-    historyAPI.ready = false;
-
-    historyAPI.init = function() {
-
-    }
-
-    historyAPI.setup = function() {
-
-    }
-
-    function doGunAuth(finished) {
-      var gunUID = forge.sha256.create().update(historyPUBKEY).digest().toHex();
-      var gunPASS = forge.sha256.create().update(historySECRET).digest().toHex();
-      gun.user().auth(gunUID, gunPASS, async function(err, res) {
-        if (err.err) {
-          gun.user().create(gunUID, gunPASS, finished);
-        }
-        else
-          finished();
-      });
-    }
-
-    var encrypt = function(message) {
-      if (!historySECRET)
-        return ok.encrypt(message, disconnected_SECRET);
-      return ok.encrypt(message, historySECRET);
-    };
-    var decrypt = function(message) {
-      if (!historySECRET)
-        return ok.decrypt(message, disconnected_SECRET);
-      return ok.decrypt(message, historySECRET);
-    };
-
-
-    historyAPI.history = {
-      get: async function(key) {
-        var hist = gun.user().get("history");
-        return decrypt(await hist.get(key));
-      },
-      set: async function(key, message) {
-        var hist = gun.user().get("history");
-        return hist.get(key).put(await encrypt(message));
-      }
-    };
-    /*
-
-    if (ok.history) {
-      $("#pgpkeyurl2").val(await ok.history.get("pgpkeyurl2"));
-      $("#pgpkeyurl2").change(function() {
-        ok.history.set("pgpkeyurl2", $("#pgpkeyurl2").val());
-      });
-
-      $("#pgpkeyurl").val(await ok.history.get("pgpkeyurl"));
-      $("#pgpkeyurl").change(function() {
-        ok.history.set("pgpkeyurl", $("#pgpkeyurl").val());
-      });
-    }*/
-
-    function doConnect() {
-      return new Promise(async function(resolve) {
-        ok.connect(function() {
-          if (ok.derive_public_key) {
-            // disable_onlykey = false;
-            ok.derive_public_key("onlykey-gun", function(error, historyPubkey) {
-              ok.derive_shared_secret("onlykey-gun", historyPubkey, async function(error, historySecret) {
-
-              });
-            });
-          }
-        });
-      });
-    }
-    
-    register(null, {
-      history: historyAPI
-    });
-
-  }
-
-};
-
-/***/ }),
-
 /***/ "./src/lib/jquery.history.js":
 /*!***********************************!*\
   !*** ./src/lib/jquery.history.js ***!
@@ -77183,12 +77059,10 @@ function encryptAgeFile(plaintext, { ciphertext, sharedSecret }) {
 // Decrypts a full age v1 file containing (at least) one mlkem768x25519
 // stanza. deriveSharedSecret(ciphertext) is called with the full 1120-byte
 // X-Wing ciphertext from the stanza and must return (sync or async) the
-// 32-byte combined X-Wing shared secret for this file's recipient - the
-// caller already knows pk_X/mlkem_seed for the label and is expected to
-// use ctXOf(ciphertext) to get the 32 bytes the device's
-// DERIVE_SHARED_SECRET call needs, then call splitDecapsulate() itself
-// (it needs the *full* ciphertext too, for the ML-KEM half - not just
-// ct_X). Returns the decrypted plaintext as a Uint8Array.
+// 32-byte combined X-Wing shared secret for this file's recipient. The caller
+// hands that whole ciphertext to the device, which decapsulates both halves
+// and answers with the finished shared secret; there is no host-side ML-KEM
+// step and nothing to split. Returns the decrypted plaintext as a Uint8Array.
 async function decryptAgeFile(fileBytes, deriveSharedSecret) {
     const bytes = fileBytes instanceof Uint8Array ? fileBytes : new Uint8Array(fileBytes);
     const { stanzas, headerNoMac, mac, headerEndOffset } = parseHeader(bytes);
@@ -77240,15 +77114,23 @@ module.exports = {
 // replaced by the real bech32 scheme (see derived_xwing.py/bech32.py) - the
 // old scheme here was stale/superseded and `age` rejects it outright.
 //
-// Wire contract this mirrors (see okcrypto.cpp's okcrypto_xwing_web_derive,
+// Wire contract this mirrors (see okcrypto.cpp's okcrypto_xwing_derive_*,
 // RESERVED_KEY_WEB_DERIVATION + KEYTYPE_XWING dispatch):
-//   DERIVE_PUBLIC_KEY -> [ pk_X(32) | mlkem_seed(32) ]
-//   DERIVE_SHAREDSEC  -> [ ss_X(32) | mlkem_seed(32) ]
-// The device never returns sk_X or the ML-KEM secret key - only a one-way
-// SHA256(sk_X || tag)-derived seed the host expands locally.
+//   DERIVE_PUBLIC_KEY          -> [ pk_M(1184) | pk_X(32) ] = the recipient
+//   OKDECRYPT to slot 128 with
+//     [ label32 | ct(1120) ]   -> [ ss(32) ] = the X-Wing shared secret
+//
+// SPLIT CUSTODY IS GONE. The device used to return a 32-byte ML-KEM seed and
+// let the host expand it, run ML-KEM decapsulation and combine the halves. The
+// seed is private key material - it yields sk_M - so that was a private key
+// handed out in answer to a request for a public one, and the ML-KEM half of
+// a "hardware" key really lived in the browser. The device now holds both
+// halves and does the whole decapsulation, so mlkemKeypairFromSeed(),
+// buildRecipient(), splitDecapsulate() and ctXOf() have no callers and are
+// gone with them. What remains here is host/sender-side math on public values.
 
 const { ml_kem768 } = __webpack_require__(/*! @noble/post-quantum/ml-kem.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/post-quantum/ml-kem.js");
-const { shake256, sha3_256 } = __webpack_require__(/*! @noble/hashes/sha3.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/hashes/sha3.js");
+const { sha3_256 } = __webpack_require__(/*! @noble/hashes/sha3.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/hashes/sha3.js"); // shake256 went with the seed expansion
 const { sha256 } = __webpack_require__(/*! @noble/hashes/sha2.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/hashes/sha2.js");
 const { x25519 } = __webpack_require__(/*! @noble/curves/ed25519.js */ "./src/onlykey-fido2/onlykey/vendor/@noble/curves/ed25519.js");
 
@@ -77278,56 +77160,10 @@ function deriveLabelTag(label) {
     return sha256(Buffer.from(label, 'utf8'));
 }
 
-// Expands the 32-byte device-derived seed (SHAKE256 -> 64-byte d||z) into an
-// ML-KEM-768 keypair. Matches the firmware (xwing_shake256/keypair_derand)
-// and python-onlykey's mlkem_keypair_from_seed() (kyber_py's
-// _keygen_internal(d, z)) - @noble/post-quantum's ml_kem768.keygen(seed64)
-// splits the same way internally (seed[:32]=d, seed[32:]=z; see
-// createKyber() in @noble/post-quantum's ml-kem.ts).
-function mlkemKeypairFromSeed(mlkemSeed) {
-    if (mlkemSeed.length !== SEED) {
-        throw new Error(`mlkem_seed must be ${SEED} bytes, got ${mlkemSeed.length}`);
-    }
-    const seed64 = shake256(mlkemSeed, { dkLen: 64 });
-    return ml_kem768.keygen(seed64); // { publicKey, secretKey }
-}
-
-// Builds the 1216-byte X-Wing recipient public key (pk_M || pk_X).
-function buildRecipient(pkX, mlkemSeed) {
-    if (pkX.length !== 32) {
-        throw new Error(`pk_X must be 32 bytes, got ${pkX.length}`);
-    }
-    const { publicKey: pkM } = mlkemKeypairFromSeed(mlkemSeed);
-    return concatBytes(pkM, pkX);
-}
-
 // X-Wing Combiner (draft-connolly-cfrg-xwing-kem-09 Section 5.3):
 // SHA3-256(ss_M || ss_X || ct_X || pk_X || XWingLabel)
 function xwingCombiner(ssM, ssX, ctX, pkX) {
     return sha3_256(concatBytes(ssM, ssX, ctX, pkX, XWING_LABEL));
-}
-
-// Finishes X-Wing decapsulation given the device's ss_X and the seed.
-// ssX: 32-byte X25519 shared secret from the device (sk_X stays there)
-// ciphertext: 1120-byte X-Wing ct (ct_M || ct_X) from the age stanza
-// pkX: recipient X25519 public key
-// mlkemSeed: 32-byte ML-KEM seed from the device
-// Returns the 32-byte X-Wing shared secret. ct_M never leaves the host.
-function splitDecapsulate(ssX, ciphertext, pkX, mlkemSeed) {
-    if (ssX.length !== 32) throw new Error('ss_X must be 32 bytes');
-    if (ciphertext.length !== XWING_CT) {
-        throw new Error(`X-Wing ct must be ${XWING_CT} bytes, got ${ciphertext.length}`);
-    }
-    const ctM = ciphertext.subarray(0, MLKEM_CT);
-    const ctX = ciphertext.subarray(MLKEM_CT, XWING_CT);
-    const { secretKey: skM } = mlkemKeypairFromSeed(mlkemSeed);
-    const ssM = ml_kem768.decapsulate(ctM, skM);
-    return xwingCombiner(ssM, ssX, ctX, pkX);
-}
-
-// Returns ct_X (the 32 bytes the device needs) from a stanza ciphertext.
-function ctXOf(ciphertext) {
-    return ciphertext.subarray(MLKEM_CT, XWING_CT);
 }
 
 // Standard X-Wing Encapsulation (host/sender side, for encrypt). Mirrors
@@ -77486,11 +77322,7 @@ function decodeIdentity(s) {
 }
 
 module.exports = {
-    mlkemKeypairFromSeed,
-    buildRecipient,
     xwingCombiner,
-    splitDecapsulate,
-    ctXOf,
     xwingEncapsHost,
     deriveLabelTag,
     encodeRecipient,
@@ -143477,11 +143309,21 @@ module.exports = function(imports, onlykeyApi) {
         CURVE25519: 3
     };
 
+    // 3 and 4 (DERIVE_*_REQ_PRESS) were removed from the firmware and the
+    // numbers are burned, not reused - sending either now gets
+    // CTAP2_ERR_EXTENSION_NOT_SUPPORTED rather than being reinterpreted.
+    //
+    // The `press_required` argument these mapped to is now IGNORED, and kept
+    // only so existing callers still parse. Presence is decided by the device
+    // from what is being asked for: deriving a public key never prompts,
+    // deriving a shared secret always does, with no setting to turn it off.
+    // The suffix had also quietly become a second key domain (the firmware set
+    // additional_data[0] = 1 for it, changing the HKDF salt), which is how
+    // vault.js ended up fetching its public key in one domain and doing its
+    // ECDH in the other. One label now means one key.
     var KEYACTION = {
         DERIVE_PUBLIC_KEY: 1,
-        DERIVE_SHARED_SECRET: 2,
-        DERIVE_PUBLIC_KEY_REQ_PRESS: 3,
-        DERIVE_SHARED_SECRET_REQ_PRESS: 4
+        DERIVE_SHARED_SECRET: 2
     };
 
     // Uint8Array.from() is NOT a string encoder. Given a string it treats it as
@@ -143730,7 +143572,7 @@ module.exports = function(imports, onlykeyApi) {
             }
             Array.prototype.push.apply(message, dataHash);
 
-            var keyAction = press_required ? KEYACTION.DERIVE_PUBLIC_KEY_REQ_PRESS : KEYACTION.DERIVE_PUBLIC_KEY;
+            var keyAction = KEYACTION.DERIVE_PUBLIC_KEY;   // press_required ignored, see KEYACTION
 
             var enc_resp = 1;
             await onlykeyApi.ctaphid_via_webauthn(cmd, keyAction, keytype, enc_resp, message, 60000).then(async(response) => {
@@ -143831,7 +143673,7 @@ module.exports = function(imports, onlykeyApi) {
             //msg("input pubkey -> " + pubkey)
             //msg("full message -> " + message)
 
-            var keyAction = press_required ? KEYACTION.DERIVE_SHARED_SECRET_REQ_PRESS : KEYACTION.DERIVE_SHARED_SECRET;
+            var keyAction = KEYACTION.DERIVE_SHARED_SECRET; // press_required ignored; the device always prompts
 
             var enc_resp = 1;
             await onlykeyApi.ctaphid_via_webauthn(cmd, keyAction, keytype, enc_resp, message, 60000).then(async(response) => {
@@ -143915,6 +143757,15 @@ module.exports = function(imports, onlykeyApi) {
         //     different key with no error, surfacing much later as "no
         //     identity matched any of the recipients".
         var XWING_WIRE_KEYTYPE = 5;
+        var XWING_PK = 1216;   // okcrypto.h XWING_PK_SIZE
+        var XWING_CT = 1120;   // okcrypto.h XWING_CT_SIZE
+        var XWING_SS = 32;     // okcrypto.h XWING_SS_SIZE
+        // Slot 128 - the web AND agent derivation key. Named for both because it
+        // serves both: this app over FIDO2, and local tools over USB
+        // (onlykey-agent, python-onlykey, age). Deliberately the accessible tier -
+        // reachable by software with nobody in front of it, and correspondingly
+        // less protected than a stored slot.
+        var RESERVED_KEY_WEB_AGENT_DERIVATION = 128; // okcore.h
 
         // Response layout, confirmed live rather than only read off the
         // firmware:
@@ -143925,7 +143776,7 @@ module.exports = function(imports, onlykeyApi) {
         // ok_extension.cpp forces any truthy opt3 to that mode). The status
         // string's length varies with the firmware version, so the NUL is
         // located rather than a fixed offset assumed.
-        async function xwing_derive(label, ctX, press_required) {
+        async function xwing_derive(label) {
             var message = [255, 255, 255, 255, OKCMD.OKCONNECT];
 
             var currentEpochTime = Math.round(new Date().getTime() / 1000.0).toString(16);
@@ -143939,44 +143790,30 @@ module.exports = function(imports, onlykeyApi) {
 
             var labelHash = await digestArray(derivationInputBytes(label));
             Array.prototype.push.apply(message, labelHash);
-            if (ctX) Array.prototype.push.apply(message, Array.from(ctX));
 
-            var keyAction = ctX
-                ? (press_required ? KEYACTION.DERIVE_SHARED_SECRET_REQ_PRESS : KEYACTION.DERIVE_SHARED_SECRET)
-                : (press_required ? KEYACTION.DERIVE_PUBLIC_KEY_REQ_PRESS : KEYACTION.DERIVE_PUBLIC_KEY);
-
-            // If the OnlyKey is set to "Challenge Code" for web derived keys
-            // (webderivemode 0), a shared-secret derive makes the device wait
-            // for a 3-digit code before it will answer. The device computes the
-            // code as SHA-256 over the exact request payload it received - the
-            // 32-byte label hash followed by the 32-byte ct_X (okcore.cpp's
-            // done_process_packets over packet_buffer, and the web_derive_gate
-            // in ok_extension.cpp) - taking bytes 0, 15 and 31 mod 6 (mod 3 on a
-            // DUO), each plus one. The device only shows a spinning light, not
-            // the digits, so we compute the same code here and surface it; the
-            // page displays it while the WebAuthn prompt is up. A key in Button
-            // Press or No Press mode simply ignores it. Public-key derives are
-            // never gated, so only ct_X (shared-secret) requests get a code.
-            if (ctX) {
-                try {
-                    // [keytype | label32 | ct_X32]: the exact bytes both the FIDO2 gate
-                    // and the raw-HID derived decaps hash (protocol derived_key_hid)
-                    var codeInput = Uint8Array.from([protocol.KEYTYPE.XWING].concat(labelHash, Array.from(ctX)));
-                    var codeHash = await digestArray(codeInput);
-                    var challengeCode = protocol.challengeCodeFromHash(codeHash, onlykeyApi.hw === 'DUO');
-                    api.emit("challenge", challengeCode);
-                    api.emit("status", "OnlyKey: if it asks for a challenge code, enter " + challengeCode.join(" ") + " (or just press the button)");
-                } catch (codeErr) {
-                    // Never let a display convenience block the actual operation.
-                    api.emit("status", "OnlyKey: could not precompute the challenge code (" + (codeErr && codeErr.message ? codeErr.message : codeErr) + ")");
-                }
-            }
+            // Public-key derivation only. DERIVE_SHAREDSEC is no longer served
+            // on this path at all: decapsulation now needs the whole 1120-byte
+            // X-Wing ciphertext on the device, which does not fit this
+            // single-shot client_handle request, and the device must hold the
+            // ML-KEM half rather than hand the host a seed to expand. See
+            // derive_xwing_decap() below for where it went.
+            //
+            // Nothing here is gated, so there is no challenge code to
+            // precompute and display: a public key is public data and the
+            // caller cannot turn it into a secret. The gate lives on the
+            // decapsulation path - the one that decrypts.
+            var keyAction = KEYACTION.DERIVE_PUBLIC_KEY;
 
             var enc_resp = 1;
             var response = await onlykeyApi.ctaphid_via_webauthn(
                 OKCMD.OKCONNECT, keyAction, XWING_WIRE_KEYTYPE, enc_resp, message, 60000
             );
 
+            console.log('[XWTRACE] assertion returned', {
+                status: response && response.status,
+                error: response && response.error,
+                dataLen: response && response.data ? response.data.length : null
+            });
             if (!response || !response.data) {
                 throw new Error(response && response.error ? response.error : 'no response from OnlyKey');
             }
@@ -143984,49 +143821,174 @@ module.exports = function(imports, onlykeyApi) {
 
             var okPub = data.slice(0, 32);
             var transit_key = Uint8Array.from(nacl.box.before(Uint8Array.from(okPub), appKey.secretKey));
-            var tail = await aesgcm_decrypt(data.slice(32, data.length), transit_key);
-            tail = Array.from(tail);
 
-            var nulAt = tail.indexOf(0);
-            if (nulAt === -1) throw new Error('X-Wing derive: no NUL-terminated status string in response');
-            var payload = tail.slice(nulAt + 1);
-            if (payload.length !== 64) {
-                throw new Error('X-Wing derive: expected 64 bytes after the status string, got ' + payload.length);
+            // This request was an OKCONNECT, so the device has just REPLACED its
+            // transit_key with one derived from the keypair generated above.
+            // transit_key is a single global on the device - the last OKCONNECT
+            // always wins - while onlykeyApi.sharedsec still held the key from
+            // the api's own connect at page load.
+            //
+            // Everything composite goes out under onlykeyApi.sharedsec
+            // (prime_composite -> aesgcm_encrypt), so after any derive those two
+            // disagreed and the device decrypted the OKDECRYPT chunks with the
+            // wrong key. It does not fail loudly: the chunk count is right, the
+            // request reassembles to 1152 bytes of garbage, the device
+            // decapsulates that garbage and hands back a perfectly well-formed
+            // 32-byte secret which simply is not the right one. age reports
+            // "invalid tag" - measured on hardware 2026-09-15, after a correct
+            // derive, a correct encrypt and a confirmed press on the key.
+            //
+            // Adopt the key the device now actually holds.
+            onlykeyApi.sharedsec = transit_key;
+
+            // Reassemble the CIPHERTEXT first, decrypt once at the end.
+            //
+            // Everything after the transit pubkey is ONE AES-GCM blob that the
+            // device encrypted in a single call over the whole staged response
+            // (store_FIDO_response(), encrypt == 2). The chunk boundaries are a
+            // transport artefact and mean nothing to the cipher.
+            //
+            // Decrypting the first chunk and then appending the polled chunks
+            // raw - which is what this did - splices plaintext onto ciphertext.
+            // It looked plausible because aesgcm_decrypt() runs with
+            // tagLength 0, so a prefix DOES decrypt correctly on its own and
+            // the first 446 bytes of the recipient were right. The remaining
+            // 770 were ciphertext. agePqc rejected the result with "ML-KEM.
+            // encapsulate: wrong publicKey modulus" - measured on hardware
+            // 2026-09-15, the first symptom of this that was visible at all.
+            var cipher = Array.from(data).slice(32);
+            if (cipher.length >= MAX_LARGE_RESP_CHUNK - 32) {
+                // untilShort: the host cannot compute the total. The staged
+                // response is [ transit pubkey(32) | status field | pk(1216) ]
+                // and the status field's width is sizeof(UNLOCKED)+1 - a
+                // firmware build constant that changes with the version string.
+                var rest = await poll_for_response(0, null, true);
+                cipher = cipher.concat(Array.from(rest));
             }
 
-            if (ctX) api.emit("challenge", null); // clear the displayed code
+            var tail = Array.from(await aesgcm_decrypt(cipher, transit_key));
+            console.log('[XWTRACE] cipher', cipher.length, 'tail', tail.length, 'nulAt', tail.indexOf(0));
 
+            // Take the recipient as the LAST XWING_PK bytes rather than
+            // everything after the first NUL. The status field is a fixed-width
+            // slot, NOT a tight string: the firmware copies sizeof(UNLOCKED)+1
+            // bytes into it, so short version strings leave trailing padding
+            // between the NUL and the recipient. Slicing at nulAt+1 prepended
+            // that padding to pk_M and corrupted it.
+            if (tail.length < XWING_PK) {
+                throw new Error('X-Wing derive: short response, got ' + tail.length +
+                                ' bytes, need at least ' + XWING_PK);
+            }
+            var nulAt = tail.indexOf(0);
+            if (nulAt === -1) throw new Error('X-Wing derive: no NUL-terminated status string in response');
+            var head = Uint8Array.from(tail.slice(tail.length - XWING_PK));
+            console.log('[XWTRACE] recipient', head.length, 'header field was', tail.length - XWING_PK, 'bytes');
+
+            // The recipient is XWING_PK (1216) bytes - far past what one
+            // WebAuthn assertion carries - so the firmware stages it in
+            // large_resp_buffer and serves it in MAX_LARGE_RESP_CHUNK pieces.
+            // Whatever rode along with this first response is its head; the
+            // rest is polled exactly as an ML-DSA-65 signature is.
+            //
+            // It used to be 64 bytes inline: [ pk_X(32) | mlkem_seed(32) ].
+            // The seed is private key material - it yields sk_M - so that was
+            // a private key returned in answer to a request for a public one.
+            // ML-KEM has no short public key (the only 32-byte value that
+            // reproduces pk_M also reproduces sk_M), so the public key itself
+            // has to be what crosses the wire.
+            // head is already exactly XWING_PK bytes: the ciphertext was
+            // reassembled and decrypted above, and the recipient taken off the
+            // end of it.
             return {
-                pkOrSsX: Uint8Array.from(payload.slice(0, 32)),
-                mlkemSeed: Uint8Array.from(payload.slice(32, 64)),
+                recipient: head,
                 status: bytes2string(tail.slice(0, nulAt)),
             };
         }
 
-        // cb(error, pk_X, mlkemSeed) - the recipient half. age-derive.js feeds
-        // both straight into age_pqc.js's buildRecipient().
-        api.derive_xwing_recipient = async function(label, press_required, cb) {
+        // cb(error, recipient) - the full 1216-byte X-Wing public key, ready
+        // for agePqc.xwingEncapsHost(). age-derive.js no longer builds it from
+        // halves, because the device no longer hands out the ML-KEM half's seed.
+        api.derive_xwing_recipient = async function(label, cb) {
             api.emit("status", "OnlyKey: Requesting Derived X-Wing Recipient");
             try {
-                var r = await xwing_derive(label, null, press_required);
+                var r = await xwing_derive(label);
                 api.emit("status", "OnlyKey: Derived X-Wing Recipient Complete");
-                if (typeof cb === 'function') cb(null, r.pkOrSsX, r.mlkemSeed);
+                if (typeof cb === 'function') cb(null, r.recipient);
             }
             catch (e) {
+                console.error('[XWTRACE] derive_xwing_recipient threw', e && e.name, e && e.message, e);
                 api.emit("status", "OnlyKey: Problem Requesting Derived X-Wing Recipient");
                 if (typeof cb === 'function') cb(e.message || e);
             }
         };
 
-        // cb(error, ss_X) - decapsulation. Same call with ct_X appended; the
-        // device returns the X25519 shared secret in the slot pk_X occupies
-        // above, which is why both share one implementation.
-        api.derive_xwing_decap = async function(label, ctX, press_required, cb) {
-            api.emit("status", "OnlyKey: Requesting Derived X-Wing Decapsulation");
+        // cb(error, ss) - the 32-byte X-Wing shared secret, fully decapsulated
+        // on the device.
+        //
+        // This no longer rides the DERIVE_* extension. It is a chunked
+        // OKDECRYPT to slot RESERVED_KEY_WEB_AGENT_DERIVATION carrying
+        // [ label32 | ct(1120) ] - the same tunnel composite_decrypt uses -
+        // because the whole X-Wing ciphertext has to reach the device now.
+        // Previously the host sent only ct_X (32 bytes), got back ss_X plus
+        // the ML-KEM seed, and finished the ML-KEM half itself; ct_M never
+        // reached the device and the seed always reached the host. Both are
+        // reversed, so the derived path custodies its whole key exactly as the
+        // stored path does.
+        //
+        // The confirmation is the device's, not ours: the firmware computes
+        // the challenge digits over the reassembled label and ciphertext and
+        // floors at a button press for a shared secret whatever field 30 says.
+        // We no longer precompute and display a code here - the previous code
+        // hashed [keytype | label32 | ct_X32], which is not what the device
+        // hashes now, and a wrong code shown confidently is worse than none.
+        api.derive_xwing_decap = async function(label, ciphertext, cb) {
+            api.emit("status", "OnlyKey: Requesting Derived X-Wing Decapsulation - confirm on the device");
             try {
-                var r = await xwing_derive(label, ctX, press_required);
+                if (!ciphertext || ciphertext.length !== XWING_CT) {
+                    throw new Error('X-Wing ct must be ' + XWING_CT + ' bytes, got ' + (ciphertext ? ciphertext.length : 0));
+                }
+                var labelHash = await digestArray(derivationInputBytes(label));
+                var payload = new Uint8Array(32 + XWING_CT);
+                payload.set(Uint8Array.from(labelHash), 0);
+                payload.set(Uint8Array.from(ciphertext), 32);
+
+                await prime_composite(OKDECRYPT, RESERVED_KEY_WEB_AGENT_DERIVATION, payload);
+                var ss = await poll_for_response(XWING_SS);
+
+                // The shared secret comes back TRANSIT-ENCRYPTED and has to be
+                // decrypted here.
+                //
+                // okcrypto.cpp returns it with
+                //   send_transport_response(ss, XWING_SS_SIZE, true, true)
+                // and that `true` only bites on this transport:
+                // send_transport_response() ignores the flag on the raw-HID
+                // branch (it memcpys straight into resp_buffer) and honours it
+                // on the WebAuthn branch, where store_FIDO_response() AES-GCMs
+                // the whole 32 bytes under the transit key. So the CLI's
+                // derive_decaps(), which uses the bytes raw, is right to - and
+                // this path was wrong to.
+                //
+                // Every okpqc composite return passes false instead
+                // (okpqc.cpp:251 X25519_SS, :262 MLKEM_SS), which is why
+                // composite_decrypt() can use its poll result directly and why
+                // copying that shape here produced a plausible-looking 32 bytes
+                // that were simply ciphertext. age reported it as "invalid
+                // tag" - measured on hardware 2026-09-15, after the device had
+                // decapsulated correctly and the user had confirmed on the key.
+                //
+                // Decrypting host-side rather than dropping the firmware's
+                // encryption keeps the secret covered in transit and leaves the
+                // CLI path untouched.
+                var rawHex = Array.from(ss).map(function(b){return ('0'+b.toString(16)).slice(-2);}).join('');
+                ss = await aesgcm_decrypt(Array.from(ss), onlykeyApi.sharedsec);
+                var decHex = Array.from(ss).map(function(b){return ('0'+b.toString(16)).slice(-2);}).join('');
+                console.log('[XWTRACE] decap raw', rawHex.slice(0,16), 'decrypted', decHex.slice(0,16));
+                if (!ss || ss.length !== XWING_SS) {
+                    throw new Error('X-Wing decaps: got ' + (ss ? ss.length : 0) +
+                                    ' bytes after transit decrypt, expected ' + XWING_SS);
+                }
                 api.emit("status", "OnlyKey: Derived X-Wing Decapsulation Complete");
-                if (typeof cb === 'function') cb(null, r.pkOrSsX);
+                if (typeof cb === 'function') cb(null, Uint8Array.from(ss));
             }
             catch (e) {
                 api.emit("status", "OnlyKey: Problem Requesting Derived X-Wing Decapsulation");
@@ -144142,7 +144104,7 @@ module.exports = function(imports, onlykeyApi) {
         // a limit being hit. Sizing a total cap for the largest possible
         // response would also destroy its only real job - spotting a wedged
         // device.
-        async function poll_for_response(expected, maxMs) {
+        async function poll_for_response(expected, maxMs, untilShort) {
             var deadline = Date.now() + (maxMs || POLL_BUDGET_MS);
             var parts = [];
             var total = 0;
@@ -144150,9 +144112,11 @@ module.exports = function(imports, onlykeyApi) {
             var lastStatus = null;
             var waited = 0;
 
+            console.log('[XWTRACE] poll_for_response entered, expected', expected);
             while (Date.now() < deadline) {
                 var resp = await onlykeyApi.ctaphid_via_webauthn(OKPING, 0, 0, 0, new Uint8Array(), PING_TIMEOUT_MS);
                 lastStatus = resp && resp.status;
+                console.log('[XWTRACE] poll ->', lastStatus, 'len', resp && resp.data ? resp.data.length : null, 'err', resp && resp.error, 'total', total);
                 // Fail fast on anything that cannot improve by polling again.
                 // The deadline is a backstop for "still working", not a
                 // penalty box to sit out once the answer is already known.
@@ -144216,6 +144180,20 @@ module.exports = function(imports, onlykeyApi) {
                         deadline = Date.now() + (maxMs || POLL_BUDGET_MS); // progress: re-arm
                         api.emit("status", "OnlyKey: Receiving response (" + total +
                             (expected ? " of " + expected : "") + " bytes)");
+                        // untilShort: drain the staged response without being
+                        // told its length. send_stored_response() serves
+                        // MAX_LARGE_RESP_CHUNK bytes per poll until the tail, so
+                        // the first chunk SHORTER than that is the last one.
+                        // Used by the X-Wing derive, where the host cannot
+                        // compute the total: the staged response is
+                        // [ transit pubkey(32) | status field | recipient(1216) ]
+                        // and the status field's width is a firmware build
+                        // constant (sizeof(UNLOCKED)+1) that the host has no way
+                        // to know.
+                        if (untilShort) {
+                            if (resp.data.length === MAX_LARGE_RESP_CHUNK) continue;
+                            return Uint8Array.from([].concat.apply([], parts));
+                        }
                         if (!expected || total >= expected) {
                             var out = [].concat.apply([], parts);
                             return Uint8Array.from(expected ? out.slice(0, expected) : out);
@@ -147655,8 +147633,13 @@ module.exports = (function() {
     9: ['hmac'],
   };
   P.KEY_FEATURE = { DECRYPT: 32, SIGN: 64, BACKUP: 128 };
-  P.RESERVED_SLOT = { WEB_DERIVATION: 128, HMACSHA1_2: 129, HMACSHA1_1: 130, DEFAULT_BACKUP: 131, DERIVATION: 132 };
+  P.RESERVED_SLOT = { WEB_DERIVATION: 128, HMACSHA1_2: 129, HMACSHA1_1: 130, DEFAULT_BACKUP: 131, DERIVATION: 132, DERIVATION_V2: 232 };
   P.DERIVE_ACTION = { DERIVE_PUBLIC_KEY: 1, DERIVE_SHARED_SECRET: 2, DERIVE_PUBLIC_KEY_REQ_PRESS: 3, DERIVE_SHARED_SECRET_REQ_PRESS: 4 };
+  // SSH/GPG agent derivation codes: v1 = released SHA256 KDF, v2 = HKDF
+  P.AGENT_DERIVATION = {
+    v1: { pubkey_slot: 132, sign: { ED25519: 201, P256R1: 202, P256K1: 203 }, decrypt: { P256R1: 202, P256K1: 203, CURVE25519: 204 } },
+    v2: { pubkey_slot: 232, sign: { ED25519: 221, P256R1: 222, P256K1: 223 }, decrypt: { P256R1: 222, P256K1: 223, CURVE25519: 224 } },
+  };
 
   P.CHALLENGE_INDICES = [0, 15, 31];
   P.CHALLENGE_MODULUS = 6;
@@ -159518,26 +159501,16 @@ if (false) {}
 //just in case this file gets included somehow in production
 console.log("WARNING! ------------- LOADING DEVEL PLUGINS! ------------- WARNING!");
 
-
 module.exports = [];
-
 
 /* debug console emitter */
 module.exports.push(__webpack_require__(/*! ./plugins/console/console_debug.js */ "./src/plugins/console/console_debug.js"));
 
-/* chat plugin */
-module.exports.push(__webpack_require__(/*! ./plugins/chat/chat.js */ "./src/plugins/chat/chat.js"));
-
-/* for encrypted data to for onlykey devices */
-module.exports.push(__webpack_require__(/*! ./lib/history.js */ "./src/lib/history.js"));
-
-
-module.exports.push(__webpack_require__(/*! ./plugins/password-generator/password-generator.js */ "./src/plugins/password-generator/password-generator.js"));
-
-module.exports.push(__webpack_require__(/*! ./plugins/age-derive/age-derive.js */ "./src/plugins/age-derive/age-derive.js"));
-
-module.exports.push(__webpack_require__(/*! ./plugins/pgp-pqc/pgp-pqc.js */ "./src/plugins/pgp-pqc/pgp-pqc.js"));
   
+
+/* vault: prerelease, development builds only */
+module.exports.push(__webpack_require__(/*! ./plugins/vault/vault.js */ "./src/plugins/vault/vault.js"));
+
 
 /***/ }),
 
@@ -159595,9 +159568,16 @@ module.exports.push(__webpack_require__(/*! ./plugins/decrypt/decrypt.js */ "./s
 
 module.exports.push(__webpack_require__(/*! ./plugins/search/search.js */ "./src/plugins/search/search.js"));
 
-module.exports.push(__webpack_require__(/*! ./plugins/vault/vault.js */ "./src/plugins/vault/vault.js"));
-
 module.exports.push(__webpack_require__(/*! ./plugins/ok-status-icon/ok-status-icon.js */ "./src/plugins/ok-status-icon/ok-status-icon.js"));
+
+// The PQC pages ship. They were in plugins-devel.js, which is development-only
+// and throws if it ever reaches a production bundle - so `BUILD.sh 1` produced
+// a site with no /app/age-derive.html and no /app/pgp-pqc.html at all, while
+// the deployed site (a dev build) had them. That split meant the thing being
+// released was never the thing being built for release.
+module.exports.push(__webpack_require__(/*! ./plugins/age-derive/age-derive.js */ "./src/plugins/age-derive/age-derive.js"));
+
+module.exports.push(__webpack_require__(/*! ./plugins/pgp-pqc/pgp-pqc.js */ "./src/plugins/pgp-pqc/pgp-pqc.js"));
 
 if (false) {}else{//is development
   //instead of including DEV plugins in production builds, 
@@ -159672,16 +159652,16 @@ module.exports = {
                 var ok = onlykey3rd(1, 0);
                 var $ = app.$;
 
-                // press_required=false requests the non-REQ_PRESS "derived
-                // keys per site without touch" path (same device setting
-                // password-generator.js relies on), matching this
-                // feature's non-interactive encrypt/decrypt flow.
-                var press_required = false;
-
-                // Show the 3-digit challenge code the device will ask for when
-                // web derived keys are set to Challenge Code mode. onlykey-3rd-
-                // party.js emits it right before the WebAuthn prompt goes up and
-                // emits null to clear it once the derive returns.
+                // The REQ_PRESS opcode variants are gone - one label, one key -
+                // and there is no press_required argument any more. Whether a
+                // confirmation is required now follows from what is being
+                // asked for: a public key never needs one, a shared secret
+                // always does, and the device enforces that itself.
+                //
+                // The challenge code is no longer precomputed here either. The
+                // device hashes the reassembled label and ciphertext and shows
+                // the digits itself; this listener stays for the event, but
+                // nothing emits a code on the derived path now.
                 ok.on("challenge", function(code) {
                     var box = document.getElementById("challenge_code_box");
                     var out = document.getElementById("challenge_code");
@@ -159707,13 +159687,19 @@ module.exports = {
                     var label = currentLabel();
                     var plaintext = $("#plaintext").val();
                     $("#age_file_out").val("");
-                    ok.derive_xwing_recipient(label, press_required, function(error, pkX, mlkemSeed) {
+                    // The device returns the whole 1216-byte recipient now,
+                    // so there is nothing to assemble from halves here.
+                    ok.derive_xwing_recipient(label, function(error, recipientPk) {
                         if (error) {
                             $("#age_file_out").val("ERROR: " + error);
                             return;
                         }
-                        var recipientPk = agePqc.buildRecipient(pkX, mlkemSeed);
                         var encaps = agePqc.xwingEncapsHost(recipientPk);
+                        window.__probe = window.__probe || {};
+                        window.__probe.encapSS = Array.from(encaps.sharedSecret).map(function(b){return ('0'+b.toString(16)).slice(-2);}).join('');
+                        window.__probe.recipient4 = Array.from(recipientPk.slice(0,4)).join(',');
+                        window.__probe.ctEnc = Array.from(encaps.ciphertext.slice(0,4)).join(',') + '|' + Array.from(encaps.ciphertext.slice(-4)).join(',') + '|len' + encaps.ciphertext.length;
+                        console.log('[XWTRACE] encap ss', window.__probe.encapSS.slice(0,16), 'recipient[0..3]', window.__probe.recipient4, 'ct', window.__probe.ctEnc);
                         var fileBytes = ageFile.encryptAgeFile(
                             new TextEncoder().encode(plaintext),
                             { ciphertext: encaps.ciphertext, sharedSecret: encaps.sharedSecret }
@@ -159736,17 +159722,18 @@ module.exports = {
 
                     ageFile.decryptAgeFile(fileBytes, function(ciphertext) {
                         return new Promise(function(resolve, reject) {
-                            ok.derive_xwing_recipient(label, press_required, function(error, pkX, mlkemSeed) {
+                            // One call, and no host-side ML-KEM. The device
+                            // takes the whole X-Wing ciphertext and returns the
+                            // finished 32-byte shared secret, so the recipient
+                            // lookup that used to be needed here (to feed pk_X
+                            // and the seed into splitDecapsulate) is gone.
+                            console.log('[XWTRACE] decap ct',
+                                Array.from(ciphertext.slice(0,4)).join(',') + '|' +
+                                Array.from(ciphertext.slice(-4)).join(',') + '|len' + ciphertext.length,
+                                'encapWas', window.__probe && window.__probe.ctEnc);
+                            ok.derive_xwing_decap(label, ciphertext, function(error, ss) {
                                 if (error) { reject(new Error(error)); return; }
-                                var ctX = agePqc.ctXOf(ciphertext);
-                                ok.derive_xwing_decap(label, ctX, press_required, function(error2, ssX) {
-                                    if (error2) { reject(new Error(error2)); return; }
-                                    try {
-                                        resolve(agePqc.splitDecapsulate(ssX, ciphertext, pkX, mlkemSeed));
-                                    } catch (e) {
-                                        reject(e);
-                                    }
-                                });
+                                resolve(ss);
                             });
                         });
                     }).then(function(plaintextBytes) {
@@ -159874,80 +159861,6 @@ module.exports = {
         
     }
 };
-
-/***/ }),
-
-/***/ "./src/plugins/chat/chat.js":
-/*!**********************************!*\
-  !*** ./src/plugins/chat/chat.js ***!
-  \**********************************/
-/*! no static exports found */
-/***/ (function(module, exports, __webpack_require__) {
-
-
-
-var pagesList = {
-  "chat":{
-      icon:"fa-comments-o",
-      sort:40
-  }
-};
-
-module.exports = {
-    pagesList: pagesList,
-    consumes: ["app"],
-    provides: ["plugin_chat"],
-    setup: function(options, imports, register) {
-        
-        var init = false;
-        
-        console.log("chat plugin")
-        
-        var page = {
-            view : __webpack_require__(/*! ./chat.page.html */ "./src/plugins/chat/chat.page.html").default,
-            init:function(app, $page, pathname){
-                init = true;
-                
-                page.setup(app, $page, pathname);
-            },
-            setup:function(app, $page, pathname){
-                 if (!init)
-                    return page.init(app, $page, pathname);
-                    
-                app.$(".app-head").hide();
-                
-            },
-            dispose:function(app, pathname){
-                app.$(".app-head").show();
-            }
-        };
-        
-        pagesList["chat"] = page;
-        
-        // console.log("pre-init");
-        
-        register(null, {
-            plugin_chat:{
-                pagesList:pagesList
-            }
-        });
-        
-        
-    }
-};
-
-/***/ }),
-
-/***/ "./src/plugins/chat/chat.page.html":
-/*!*****************************************!*\
-  !*** ./src/plugins/chat/chat.page.html ***!
-  \*****************************************/
-/*! exports provided: default */
-/***/ (function(module, __webpack_exports__, __webpack_require__) {
-
-"use strict";
-__webpack_require__.r(__webpack_exports__);
-/* harmony default export */ __webpack_exports__["default"] = ("<h1>Chat Page</h1>");
 
 /***/ }),
 
@@ -161624,107 +161537,6 @@ module.exports = {
 
   }
 };
-
-/***/ }),
-
-/***/ "./src/plugins/password-generator/password-generator.js":
-/*!**************************************************************!*\
-  !*** ./src/plugins/password-generator/password-generator.js ***!
-  \**************************************************************/
-/*! no static exports found */
-/***/ (function(module, exports, __webpack_require__) {
-
-//change   _template_  to your plugin name  
-
-var pagesList = {
-    "password-generator": {
-        sort:35,
-        icon: "fa-key",
-        //   title: "Chat"
-    }
-};
-
-
-module.exports = {
-    pagesList: pagesList,
-    consumes: ["app"],
-    provides: ["plugin_password-generator"],
-    setup: function(options, imports, register) {
-
-        var init = false;
-        var page = {
-            view: __webpack_require__(/*! ./password-generator.page.html */ "./src/plugins/password-generator/password-generator.page.html").default,
-            init: function(app, $page, pathname) {
-                init = true;
-
-
-                page.setup(app, $page, pathname);
-            },
-            setup: function(app, $page, pathname) {
-                if (!init)
-                    return page.init(app, $page, pathname);
-
-
-                // node-onlykey's onlykey3rd() constructor (function
-                // onlykey(), onlykey-3rd-party.js) takes no arguments in the
-                // currently-bundled library version - keytype/press_required
-                // are per-call arguments on derive_public_key/
-                // derive_shared_secret themselves, not bound at construction.
-                // The `onlykey3rd(1, 0)` call below is a harmless no-op
-                // (extra args to a zero-arg function), kept only to match
-                // history.js's still-working call for consistency.
-                var onlykey3rd = app.onlykey3rd;
-                var ok = onlykey3rd(1, 0);
-                var $ = app.$;
-
-                // KEYTYPE.P256R1 = 1 - the only keytype for which
-                // derive_public_key()/derive_shared_secret() do a real
-                // ECDH derivation (P256, via ONLYKEY_ECDH_P256_to_EPUB /
-                // EPUB_TO_ONLYKEY_ECDH_P256), matching this two-step
-                // pubkey -> shared-secret pattern. press_required=false
-                // requests the non-REQ_PRESS "derived keys per site
-                // without touch" path (device setting gated behind
-                // derived_key_challenge_mode bit 3).
-                var KEYTYPE_P256R1 = 1;
-                var press_required = false;
-
-                $("#onlykey_start").click(async function() {
-                    var phrase = $("#phrase").val();
-                    ok.derive_public_key(phrase, KEYTYPE_P256R1, press_required, function(error, phrasePubkey) {
-                        if (error) return; // e.g. CTAP2_ERR_EXTENSION_NOT_SUPPORTED when blocked
-                        ok.derive_shared_secret(phrase, phrasePubkey, KEYTYPE_P256R1, press_required, async function(error, phrasePubkeySecret) {
-                            if (error) return;
-                            $("#phrase_out").val(phrasePubkeySecret);
-                        });
-                    });
-                });
-            }
-        };
-
-        pagesList["password-generator"] = page;
-        
-        register(null, {
-            "plugin_password-generator": {
-                pagesList: pagesList
-            }
-        });
-
-
-    }
-};
-
-/***/ }),
-
-/***/ "./src/plugins/password-generator/password-generator.page.html":
-/*!*********************************************************************!*\
-  !*** ./src/plugins/password-generator/password-generator.page.html ***!
-  \*********************************************************************/
-/*! exports provided: default */
-/***/ (function(module, __webpack_exports__, __webpack_require__) {
-
-"use strict";
-__webpack_require__.r(__webpack_exports__);
-/* harmony default export */ __webpack_exports__["default"] = ("<h4>\n    <font size=\"+2\">Securely create static passwords with\n        <a href=\"https://onlykey.io\" target=\"_blank\">OnlyKey</a></font>\n</h4>\n<fieldset>\n    <textarea placeholder=\"Enter username@service.com+passphrase\" rows=\"1\" id=\"phrase\"></textarea>\n    <input readonly=\"readonly\" type=\"text\" placeholder=\"Output Password\" rows=\"1\" id=\"phrase_out\" />\n    <!--</textarea>-->\n    <button type=\"submit\" id=\"onlykey_start\" value=\"Generate Password\">Generate Password</button>\n</fieldset>\n<div>\n    <h3>Console Messages from OnlyKey Appear Below</h3>\n    <pre>\n            <code data-language=\"javascript\">\n                <font color=\"008700\">\n                    <div id=\"messages\"></div>\n                </font>\n            </code>\n        </pre>\n</div>");
 
 /***/ }),
 
@@ -163538,4 +163350,4 @@ module.exports = __webpack_require__(/*! ./src/entry-devel.js */"./src/entry-dev
 /***/ })
 
 /******/ });
-//# sourceMappingURL=bundle.ec54b1a2108ecf924f09.js.map
+//# sourceMappingURL=bundle.84e4c7b359a99337d31c.js.map

@@ -45,17 +45,38 @@ module.exports.push(require("./plugins/decrypt/decrypt.js"));
 
 module.exports.push(require("./plugins/search/search.js"));
 
-module.exports.push(require("./plugins/vault/vault.js"));
-
 module.exports.push(require("./plugins/ok-status-icon/ok-status-icon.js"));
+
+// The PQC pages ship. They were in plugins-devel.js, which is development-only
+// and throws if it ever reaches a production bundle - so `BUILD.sh 1` produced
+// a site with no /app/age-derive.html and no /app/pgp-pqc.html at all, while
+// the deployed site (a dev build) had them. That split meant the thing being
+// released was never the thing being built for release.
+module.exports.push(require("./plugins/age-derive/age-derive.js"));
+
+module.exports.push(require("./plugins/pgp-pqc/pgp-pqc.js"));
 
 if (!!(process.env.NODE_ENV === "production")) {//is production
   
   //production only plugins (we should have sister plugins enabled in plugins-devel.js)
   
-  /* debug console omitter (remove console output)
-      you can use `window.console` to force output in production  */
-  module.exports.push(require("./plugins/console/console.js"));
+  // ------------------------------------------------------------------------
+  // TODO BEFORE REAL PRODUCTION RELEASE: swap console_debug.js back to
+  // console.js here.
+  //
+  // Both plugins PROVIDE the "console" service that other plugins consume -
+  // console.js registers no-op methods (output suppressed), console_debug.js
+  // registers the real console. Removing the line entirely breaks the app
+  // with "Could not resolve dependencies / Missing services: console", so the
+  // swap has to be console.js <-> console_debug.js, not a deletion.
+  //
+  // onlyagent.app is a TEST deployment - real production will be a different
+  // host - and this build is what we test firmware against. With output
+  // suppressed the app reported nothing at all when the FIDO2 derived-key
+  // path hung on 2026-09-15: no error, no log, just a page that never
+  // finished, leaving only the device's (lossy) serial log to diagnose from.
+  module.exports.push(require("./plugins/console/console_debug.js"));
+  // ------------------------------------------------------------------------
   
 }else{//is development
   //instead of including DEV plugins in production builds, 
