@@ -292,7 +292,125 @@ module.exports = function(imports) {
   };
 
 
-  var counter = 0;
+  // ---- FIDO2 transit framing -------------------------------------------
+  //
+  // v1 (aesgcm_encrypt / aesgcm_decrypt below) is AES-GCM under the transit
+  // key with `counter` pinned at 0 - an all-zero IV on every message of a
+  // session, in both directions - and tagLength 0, i.e. no authentication at
+  // all. Same key and same IV means the same keystream, so any two messages in
+  // a session XOR to the XOR of their plaintexts, and the device's own status
+  // string is available in the clear from the plain OKCONNECT response to seed
+  // it. A derived X-Wing shared secret is 32 bytes and starts at keystream
+  // offset zero.
+  //
+  // v2 frames every message as
+  //
+  //     [counter big-endian(4)][ciphertext(n)][tag(16)]
+  //
+  // with IV = [dir(1)][counter(4)][zero(7)], dir 0 device->host and 1
+  // host->device so the two directions can never collide on an IV. The counter
+  // travels on the wire rather than being tracked on both sides: Windows 10
+  // 1903 delivers every FIDO2 request twice, and a derive request rekeys the
+  // device mid-session, so any receiver-side counter would drift and then fail
+  // every message after the drift.
+  //
+  // v1 is kept because it is what older firmware speaks. transit_select() picks
+  // the scheme from the firmware version, which the host learns from the plain
+  // OKCONNECT response - that one is NOT encrypted (opt3 is 0 on that request),
+  // so it is readable before any of this applies.
+  var counter = 0;   // v1 only. Deliberately never incremented; see above.
+
+  var TRANSIT_V2_MIN = [3, 0, 5];
+  var transit = { v2: false, ctrOut: 0 };
+  $exports.transit = transit;
+
+  /** Pick v1 or v2 from a firmware version string like "v3.0.5-prod". */
+  $exports.transit_select = function transit_select(fwversion) {
+    var m = /v?(\d+)\.(\d+)\.(\d+)/.exec(String(fwversion || ''));
+    transit.v2 = false;
+    if (m) {
+      var got = [+m[1], +m[2], +m[3]];
+      for (var i = 0; i < 3; i++) {
+        if (got[i] !== TRANSIT_V2_MIN[i]) { transit.v2 = got[i] > TRANSIT_V2_MIN[i]; break; }
+        if (i === 2) transit.v2 = true;
+      }
+    }
+    transit.ctrOut = 0;
+    console.info('Transit framing:', transit.v2 ? 'v2 (counter + tag)' : 'v1 (legacy)');
+    return transit.v2;
+  };
+
+  /** Restart the counter. MUST be called wherever the transit key is replaced -
+   *  which includes every derive, because a derive request is itself an
+   *  OKCONNECT and the device rolls its key on each one. */
+  $exports.transit_reset = function transit_reset() {
+    transit.ctrOut = 0;
+  };
+
+  function transit_iv(dir, ctr) {
+    return Uint8Array.from([
+      dir,
+      (ctr >>> 24) & 0xff, (ctr >>> 16) & 0xff, (ctr >>> 8) & 0xff, ctr & 0xff,
+      0, 0, 0, 0, 0, 0, 0
+    ]);
+  }
+
+  function bytesFromHex(hex) {
+    if (!hex) return [];
+    return hex.match(/.{2}/g).map($exports.hexStrToDec);
+  }
+
+  /**
+   * Seal a host->device message. Returns [counter(4)][ciphertext][tag(16)].
+   * Falls back to v1 against older firmware.
+   */
+  $exports.transit_seal = function transit_seal(plaintext, shared_sec) {
+    if (!transit.v2) return $exports.aesgcm_encrypt(plaintext, shared_sec);
+    return new Promise(resolve => {
+      forge.options.usePureJavaScript = true;
+      var ctr = transit.ctrOut++;
+      var key = $exports.sha256(shared_sec); //AES256 key sha256 hash of shared secret
+      var cipher = forge.cipher.createCipher('AES-GCM', key);
+      cipher.start({ iv: transit_iv(1, ctr), tagLength: 128 });
+      cipher.update(forge.util.createBuffer(Uint8Array.from(plaintext)));
+      cipher.finish();
+      var frame = [(ctr >>> 24) & 0xff, (ctr >>> 16) & 0xff, (ctr >>> 8) & 0xff, ctr & 0xff];
+      resolve(frame.concat(bytesFromHex(cipher.output.toHex()),
+                           bytesFromHex(cipher.mode.tag.toHex())));
+    });
+  };
+
+  /**
+   * Open a device->host message. Throws if the tag does not verify - the bytes
+   * did not come from something holding the transit key, and there is no
+   * partial acceptance.
+   */
+  $exports.transit_open = function transit_open(frame, shared_sec) {
+    if (!transit.v2) return $exports.aesgcm_decrypt(frame, shared_sec);
+    return new Promise((resolve, reject) => {
+      forge.options.usePureJavaScript = true;
+      frame = Array.from(frame);
+      if (frame.length < 20) {
+        return reject(new Error('transit: frame too short (' + frame.length + ' bytes)'));
+      }
+      var ctr = ((frame[0] << 24) >>> 0) + (frame[1] << 16) + (frame[2] << 8) + frame[3];
+      var ct = frame.slice(4, frame.length - 16);
+      var tag = frame.slice(frame.length - 16);
+      var key = $exports.sha256(shared_sec);
+      var decipher = forge.cipher.createDecipher('AES-GCM', key);
+      decipher.start({
+        iv: transit_iv(0, ctr),
+        tagLength: 128,
+        tag: forge.util.createBuffer(Uint8Array.from(tag))
+      });
+      if (ct.length) decipher.update(forge.util.createBuffer(Uint8Array.from(ct)));
+      if (!decipher.finish()) {
+        return reject(new Error('transit: message failed authentication'));
+      }
+      resolve(bytesFromHex(decipher.output.toHex()));
+    });
+  };
+
   /**
    * Perform AES_256_GCM decryption using NACL shared secret
    * @param {Array} encrypted

@@ -17,8 +17,8 @@ module.exports = function(imports) {
       // getOS,
       // ctap_error_codes,
       // getAllUrlParams,
-      aesgcm_decrypt,
-      aesgcm_encrypt
+      transit_seal,
+      transit_open
     } = require("./onlykey.extra.js")(imports);
 
 
@@ -144,7 +144,7 @@ module.exports = function(imports) {
           message = [];
           var ciphertext = new Uint8Array(64).fill(0);
           Array.prototype.push.apply(message, ciphertext);
-          encryptedkeyHandle = await aesgcm_encrypt(message, onlykeyApi.sharedsec);
+          encryptedkeyHandle = await transit_seal(message, onlykeyApi.sharedsec);
           _$status('waiting_ping');
           cmd = OKPING;
           //}
@@ -188,8 +188,25 @@ module.exports = function(imports) {
                 _$status('pending_challenge');
               }
               else {
-                console.log("Shared Secret", onlykeyApi.sharedsec)    
-                data = await aesgcm_decrypt(response, onlykeyApi.sharedsec);
+                // The session key is NOT logged. It was, on this line, until
+                // this change: a console line carrying onlykeyApi.sharedsec
+                // hands the whole session to anything that can read the console.
+                try {
+                  data = await transit_open(response, onlykeyApi.sharedsec);
+                } catch (e) {
+                  // The device sends its error strings in the CLEAR - hidprint()
+                  // goes through send_transport_response() with encrypt = 0 - so
+                  // a failure here is usually an error message, not an attack.
+                  //
+                  // Accept such a response ONLY as an error, never as a result.
+                  // Falling back to the raw bytes as `data` would mean anything
+                  // that strips the tag off a real response gets it treated as a
+                  // signature or a decryption, which is the hole the tag exists
+                  // to close.
+                  var text = bytes2string(Array.from(response).slice(0, 64));
+                  console.warn('OKPING response did not authenticate:', e.message);
+                  return cb(text.indexOf('Error') === 0 ? text : (e.message || String(e)), null);
+                }
                 console.log("DECODED RESPONSE:", response);
                 console.log("DECRYPTED RESPONSE:", data);
               }
@@ -217,7 +234,15 @@ module.exports = function(imports) {
       async function u2fSignBuffer(slot, cipherText, mainCallback) {
         // this function should recursively call itself until all bytes are sent in chunks
         var message = []; //Add header and message type
-        var maxPacketSize = 228; //57 (OK packet size) * 4, + 4 byte 0xFF header, has to be less than 255 - header
+        // 224, down from 228. A credential id is 255 bytes with a 10-byte
+        // header, so one assertion carries 245, and the transit framing costs
+        // 20 of those (4-byte counter + 16-byte tag): 224 + 20 = 244.
+        //
+        // This changes no chunk count. RSA-4096 is 512 bytes and still takes 3
+        // chunks, an ML-KEM-768 ciphertext is 1088 and still takes 5, and a
+        // derived X-Wing [label(32) | ct(1120)] is 1152 and still takes 6. The
+        // tag is free in round trips; it only eats slack.
+        var maxPacketSize = 224; //57 (OK packet size) * 4 - 4, leaving room for the transit frame
         var finalPacket = cipherText.length - maxPacketSize <= 0;
         var ctChunk;
         packetnum++;
@@ -228,7 +253,7 @@ module.exports = function(imports) {
           ctChunk = cipherText.slice(0, maxPacketSize);
         }
         Array.prototype.push.apply(message, ctChunk);
-        var encryptedmsg = await aesgcm_encrypt(message, onlykeyApi.sharedsec);
+        var encryptedmsg = await transit_seal(message, onlykeyApi.sharedsec);
         if (OKSIGN == slot) imports.app.emit("ok-signing");
         if (OKDECRYPT == slot) imports.app.emit("ok-decrypting");
 
