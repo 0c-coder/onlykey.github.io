@@ -205,7 +205,6 @@ module.exports = function(imports, onlykeyApi) {
 
                     var OK_SEA_epub = keydata.x + '.' + keydata.y;
 
-
                     if (callback)
                         callback(OK_SEA_epub);
 
@@ -226,7 +225,6 @@ module.exports = function(imports, onlykeyApi) {
 
         api.connect = async function(cb) {
             var delay = 0;
-
 
             console.log("-------------------------------------------");
             // msg("Requesting OnlyKey Secure Connection (" + getOS() + ")");
@@ -283,7 +281,6 @@ module.exports = function(imports, onlykeyApi) {
                     if (typeof cb === 'function') cb(null);
                 });
             });
-
 
         }
 
@@ -362,7 +359,6 @@ module.exports = function(imports, onlykeyApi) {
                 // msg("OnlyKey Derive Public Key Complete");
 
                 api.emit("status", "OnlyKey: Requested Derived Public Key Complete");
-
 
                 if (keytype == KEYTYPE.P256R1) { //KEYTYPE_P256R1
                     ONLYKEY_ECDH_P256_to_EPUB(sharedPub, function(epub) {
@@ -459,7 +455,6 @@ module.exports = function(imports, onlykeyApi) {
                 }
                 //Private ECC key will be 32 bytes for all supported ECC key types
                 var sharedsec = encrypted_response.slice(encrypted_response.length - 32, encrypted_response.length);
-
 
                 // msg("OnlyKey Shared Secret Completed\n");
                 api.emit("status", "OnlyKey: Shared Secret Complete");
@@ -558,12 +553,6 @@ module.exports = function(imports, onlykeyApi) {
             var response = await onlykeyApi.ctaphid_via_webauthn(
                 OKCMD.OKCONNECT, keyAction, XWING_WIRE_KEYTYPE, enc_resp, message, 60000
             );
-
-            console.log('[XWTRACE] assertion returned', {
-                status: response && response.status,
-                error: response && response.error,
-                dataLen: response && response.data ? response.data.length : null
-            });
             if (!response || !response.data) {
                 throw new Error(response && response.error ? response.error : 'no response from OnlyKey');
             }
@@ -617,7 +606,6 @@ module.exports = function(imports, onlykeyApi) {
             }
 
             var tail = Array.from(await aesgcm_decrypt(cipher, transit_key));
-            console.log('[XWTRACE] cipher', cipher.length, 'tail', tail.length, 'nulAt', tail.indexOf(0));
 
             // Take the recipient as the LAST XWING_PK bytes rather than
             // everything after the first NUL. The status field is a fixed-width
@@ -632,7 +620,6 @@ module.exports = function(imports, onlykeyApi) {
             var nulAt = tail.indexOf(0);
             if (nulAt === -1) throw new Error('X-Wing derive: no NUL-terminated status string in response');
             var head = Uint8Array.from(tail.slice(tail.length - XWING_PK));
-            console.log('[XWTRACE] recipient', head.length, 'header field was', tail.length - XWING_PK, 'bytes');
 
             // The recipient is XWING_PK (1216) bytes - far past what one
             // WebAuthn assertion carries - so the firmware stages it in
@@ -666,7 +653,6 @@ module.exports = function(imports, onlykeyApi) {
                 if (typeof cb === 'function') cb(null, r.recipient);
             }
             catch (e) {
-                console.error('[XWTRACE] derive_xwing_recipient threw', e && e.name, e && e.message, e);
                 api.emit("status", "OnlyKey: Problem Requesting Derived X-Wing Recipient");
                 if (typeof cb === 'function') cb(e.message || e);
             }
@@ -729,10 +715,7 @@ module.exports = function(imports, onlykeyApi) {
                 // Decrypting host-side rather than dropping the firmware's
                 // encryption keeps the secret covered in transit and leaves the
                 // CLI path untouched.
-                var rawHex = Array.from(ss).map(function(b){return ('0'+b.toString(16)).slice(-2);}).join('');
                 ss = await aesgcm_decrypt(Array.from(ss), onlykeyApi.sharedsec);
-                var decHex = Array.from(ss).map(function(b){return ('0'+b.toString(16)).slice(-2);}).join('');
-                console.log('[XWTRACE] decap raw', rawHex.slice(0,16), 'decrypted', decHex.slice(0,16));
                 if (!ss || ss.length !== XWING_SS) {
                     throw new Error('X-Wing decaps: got ' + (ss ? ss.length : 0) +
                                     ' bytes after transit decrypt, expected ' + XWING_SS);
@@ -862,11 +845,9 @@ module.exports = function(imports, onlykeyApi) {
             var lastStatus = null;
             var waited = 0;
 
-            console.log('[XWTRACE] poll_for_response entered, expected', expected);
             while (Date.now() < deadline) {
                 var resp = await onlykeyApi.ctaphid_via_webauthn(OKPING, 0, 0, 0, new Uint8Array(), PING_TIMEOUT_MS);
                 lastStatus = resp && resp.status;
-                console.log('[XWTRACE] poll ->', lastStatus, 'len', resp && resp.data ? resp.data.length : null, 'err', resp && resp.error, 'total', total);
                 // Fail fast on anything that cannot improve by polling again.
                 // The deadline is a backstop for "still working", not a
                 // penalty box to sit out once the answer is already known.
@@ -1107,8 +1088,6 @@ module.exports = function(imports, onlykeyApi) {
 
         return api;
     }
-
-
 
     return onlykey;
 };
