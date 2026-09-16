@@ -24,10 +24,14 @@ module.exports = function(imports, onlykeyApi) {
         // ctap_error_codes,
         // getAllUrlParams,
         aesgcm_decrypt,
-        // Needed by the composite_sign/composite_decrypt payload encryption
-        // below; was commented out while nothing in this file sent encrypted
-        // data to the device.
-        aesgcm_encrypt,
+        // transit_seal / transit_open are the framed (counter + tag) forms and
+        // are what everything here uses. aesgcm_decrypt is kept for the ONE
+        // call below that runs against a response the device never encrypted.
+        transit_seal,
+        transit_open,
+        transit_framed,
+        transit_select,
+        transit_reset,
         digestBuff,
         digestArray,
         arrayBufToBase64UrlDecode,
@@ -272,6 +276,14 @@ module.exports = function(imports, onlykeyApi) {
                 var FWversion = bytes2string(response.slice(32 + 8, 32 + 19));
                 var OKversion = response[32 + 19] == 99 ? 'Color' : 'Go';
                 var sharedsec = nacl.box.before(Uint8Array.from(okPub), appKey.secretKey);
+                // This response is NOT encrypted - a plain OKCONNECT goes out
+                // with opt3 = 0 - which is exactly why the version can be read
+                // here, before any framing has been chosen. (The aesgcm_decrypt
+                // above hashes an already-hashed key and decrypts cleartext; it
+                // has never produced anything anyone uses. Left alone rather
+                // than moved to transit_open(), which would refuse it for having
+                // no tag.)
+                transit_select(FWversion);
 
                 //msg("message -> " + message)
                 // msg("OnlyKey " + OKversion + " " + FWversion + " connection established\n");
@@ -341,8 +353,16 @@ module.exports = function(imports, onlykeyApi) {
                     // Decrypt with transit_key
                     var transit_key = nacl.box.before(Uint8Array.from(okPub), appKey.secretKey);
                     transit_key = Uint8Array.from(transit_key); //await digestBuff(Uint8Array.from(transit_key)); //AES256 key sha256 hash of shared secret
+                    // This request was an OKCONNECT, so the device has REPLACED
+                    // its transit key and restarted its counters. Adopt both, or
+                    // the next composite request goes out under the old key and
+                    // the wrong counter. The X-Wing path below already did this;
+                    // it is the same bug here, and the tag now makes it fatal
+                    // instead of silent.
+                    onlykeyApi.sharedsec = transit_key;
+                    transit_reset();
                     var encrypted = response.slice(32, response.length);
-                    encrypted_response = await aesgcm_decrypt(encrypted, transit_key);
+                    encrypted_response = await transit_open(encrypted, transit_key);
                 }
 
                 // OnlyKey version and model info
@@ -439,8 +459,10 @@ module.exports = function(imports, onlykeyApi) {
                     // Decrypt with transit_key
                     var transit_key = nacl.box.before(Uint8Array.from(okPub), appKey.secretKey);
                     transit_key = Uint8Array.from(transit_key); //await digestBuff(Uint8Array.from(transit_key)); //AES256 key sha256 hash of shared secret
+                    onlykeyApi.sharedsec = transit_key; // see derive_public_key
+                    transit_reset();
                     var encrypted = response.slice(32, response.length);
-                    encrypted_response = await aesgcm_decrypt(encrypted, transit_key);
+                    encrypted_response = await transit_open(encrypted, transit_key);
                 }
 
                 var FWversion = bytes2string(encrypted_response.slice(8, 19));
@@ -577,8 +599,10 @@ module.exports = function(imports, onlykeyApi) {
             // "invalid tag" - measured on hardware 2026-09-15, after a correct
             // derive, a correct encrypt and a confirmed press on the key.
             //
-            // Adopt the key the device now actually holds.
+            // Adopt the key the device now actually holds - and its counter
+            // space, which the device restarted along with the key.
             onlykeyApi.sharedsec = transit_key;
+            transit_reset();
 
             // Reassemble the CIPHERTEXT first, decrypt once at the end.
             //
@@ -605,7 +629,7 @@ module.exports = function(imports, onlykeyApi) {
                 cipher = cipher.concat(Array.from(rest));
             }
 
-            var tail = Array.from(await aesgcm_decrypt(cipher, transit_key));
+            var tail = Array.from(await transit_open(cipher, transit_key));
 
             // Take the recipient as the LAST XWING_PK bytes rather than
             // everything after the first NUL. The status field is a fixed-width
@@ -689,7 +713,7 @@ module.exports = function(imports, onlykeyApi) {
                 payload.set(Uint8Array.from(ciphertext), 32);
 
                 await prime_composite(OKDECRYPT, RESERVED_KEY_WEB_AGENT_DERIVATION, payload);
-                var ss = await poll_for_response(XWING_SS);
+                var ss = await poll_for_response(transit_framed(XWING_SS));
 
                 // The shared secret comes back TRANSIT-ENCRYPTED and has to be
                 // decrypted here.
@@ -715,7 +739,7 @@ module.exports = function(imports, onlykeyApi) {
                 // Decrypting host-side rather than dropping the firmware's
                 // encryption keeps the secret covered in transit and leaves the
                 // CLI path untouched.
-                ss = await aesgcm_decrypt(Array.from(ss), onlykeyApi.sharedsec);
+                ss = await transit_open(Array.from(ss), onlykeyApi.sharedsec);
                 if (!ss || ss.length !== XWING_SS) {
                     throw new Error('X-Wing decaps: got ' + (ss ? ss.length : 0) +
                                     ' bytes after transit decrypt, expected ' + XWING_SS);
@@ -846,7 +870,21 @@ module.exports = function(imports, onlykeyApi) {
             var waited = 0;
 
             while (Date.now() < deadline) {
-                var resp = await onlykeyApi.ctaphid_via_webauthn(OKPING, 0, 0, 0, new Uint8Array(), PING_TIMEOUT_MS);
+                // A SEALED empty payload, not a bare empty one.
+                //
+                // Every message that reaches the device's protected branch now
+                // has to authenticate, and okcrypto_transit_open() rejects
+                // anything shorter than its 20 bytes of framing - which an empty
+                // keyhandle is. The poll would have been refused on arrival, and
+                // a refused poll is indistinguishable from "not ready yet", so a
+                // composite decrypt would simply have spun out its budget.
+                //
+                // Sealing nothing costs 20 bytes and yields plaintext length 0,
+                // which is what the OKPING branch already expects. Against v1
+                // firmware transit_seal() falls through to aesgcm_encrypt(),
+                // which returns the same empty array as before.
+                var ping = await transit_seal([], onlykeyApi.sharedsec);
+                var resp = await onlykeyApi.ctaphid_via_webauthn(OKPING, 0, 0, 0, Uint8Array.from(ping), PING_TIMEOUT_MS);
                 lastStatus = resp && resp.status;
                 // Fail fast on anything that cannot improve by polling again.
                 // The deadline is a backstop for "still working", not a
@@ -979,7 +1017,14 @@ module.exports = function(imports, onlykeyApi) {
         //
         // opt2 is what tells the device the input is complete; without it the
         // device keeps waiting for more and never primes the challenge.
-        var COMPOSITE_MAX_PACKET = 228; // 57 (OK packet size) * 4, under 255 - header
+        // 224, down from 228: a credential id is 255 bytes with a 10-byte
+        // header, so one assertion carries 245, and the transit frame costs 20
+        // of those (4-byte counter + 16-byte tag). 224 + 20 = 244.
+        //
+        // No chunk count changes. An ML-KEM-768 ciphertext is 1088 bytes and
+        // still takes 5 chunks; a derived X-Wing [label(32) | ct(1120)] is 1152
+        // and still takes 6; RSA-4096 is 512 and still takes 3.
+        var COMPOSITE_MAX_PACKET = 224; // 57 (OK packet size) * 4 - 4, under 255 - header - frame
 
         // opt3 must INCREASE ACROSS OPERATIONS, not restart per operation.
         //
@@ -1032,7 +1077,7 @@ module.exports = function(imports, onlykeyApi) {
                 bytes = bytes.slice(COMPOSITE_MAX_PACKET);
                 var finalPacket = bytes.length === 0 ? 1 : 0;
                 var packetnum = next_packetnum();
-                var encrypted = await aesgcm_encrypt(chunk, onlykeyApi.sharedsec);
+                var encrypted = await transit_seal(chunk, onlykeyApi.sharedsec);
                 last = await onlykeyApi.ctaphid_via_webauthn(
                     cmd, slot, finalPacket, packetnum, encrypted, 10000
                 );
@@ -1052,10 +1097,15 @@ module.exports = function(imports, onlykeyApi) {
             payload[0] = half;
             payload.set(Uint8Array.from(digest), 1);
             await prime_composite(OKSIGN, slot, payload);
-            var expected = half === HALF_ECC ? ED25519_SIG_LEN : MLDSA_SIG_LEN;
-            var sig = await poll_for_response(expected);
+            // The device seals this now (okpqc.cpp sends every composite
+            // response with encrypt = 1, where it used to send them bare), so
+            // poll_for_response() is told the FRAMED length - its chunk-shape
+            // check compares against what is actually on the wire - and the
+            // frame is opened once the whole thing is reassembled.
+            var expected = transit_framed(half === HALF_ECC ? ED25519_SIG_LEN : MLDSA_SIG_LEN);
+            var sig = await transit_open(await poll_for_response(expected), onlykeyApi.sharedsec);
             api.emit("status", "OnlyKey: Signature complete");
-            return sig;
+            return Uint8Array.from(sig);
         };
 
         // The device half of composite decryption. okpqc_decrypt() infers
@@ -1069,9 +1119,15 @@ module.exports = function(imports, onlykeyApi) {
             // reply of any size and skipped the chunk-shape check entirely -
             // which is exactly how a short or off-cursor reply gets accepted as
             // a shared secret. Both halves answer 32 bytes.
-            var out = await poll_for_response(COMPOSITE_SS_LEN);
+            //
+            // Sealed since okpqc.cpp stopped sending composite results bare -
+            // these two 32-byte values are the shared secrets the whole
+            // operation exists to produce, and they used to cross the tunnel in
+            // the clear while the classical half encrypted the same thing.
+            var out = await transit_open(await poll_for_response(transit_framed(COMPOSITE_SS_LEN)),
+                                         onlykeyApi.sharedsec);
             api.emit("status", "OnlyKey: Decryption complete");
-            return out;
+            return Uint8Array.from(out);
         };
 
         api.encode_key = encode_key;

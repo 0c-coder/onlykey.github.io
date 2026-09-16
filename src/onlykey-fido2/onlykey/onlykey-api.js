@@ -30,6 +30,7 @@ module.exports = function(imports) {
     getAllUrlParams,
     aesgcm_decrypt,
     getBrowser,
+    transit_select,
     // aesgcm_encrypt
   } = require("./onlykey.extra.js")(imports);
   onlykey_api.extra = require("./onlykey.extra.js")(imports);
@@ -179,9 +180,24 @@ module.exports = function(imports) {
                 transit_key = await digestBuff(Uint8Array.from(transit_key)); //AES256 key sha256 hash of shared secret
                 var encrypted  = response.slice(32, response.length);
                 onlykey_api.FWversion = bytes2string(response.slice(32+8, 32+20));
+                // A PLAIN OKCONNECT goes out with opt3 = 0, so the device does
+                // not encrypt this response - store_FIDO_response() takes the
+                // unencrypted branch. This aesgcm_decrypt() has therefore always
+                // been decrypting cleartext into noise; it survived only because
+                // the one value read out of it, response[32+19], lands past the
+                // end of the 21-byte result and reads undefined, which compares
+                // unequal to 99 and yields 'Go' - the same answer the raw bytes
+                // give. Left as v1 rather than moved to transit_open(), which
+                // would now (correctly) refuse it for having no tag.
+                //
+                // It is also why the version above can be read before any
+                // framing is chosen: the handshake response is in the clear.
                 response = await aesgcm_decrypt(encrypted, transit_key);
                 onlykey_api.OKversion = response[32+19] == 99 ? 'Color' : 'Go';
                 onlykey_api.sharedsec = nacl.box.before(Uint8Array.from(okPub), appKey.secretKey);
+                // New key on the device, so a new counter space here. This also
+                // selects the framing for the rest of the session.
+                transit_select(onlykey_api.FWversion);
                 console.info("Version:",[onlykey_api.OKversion, onlykey_api.FWversion]);
                 imports.app.emit("ok-connected");
                 cb(null);
@@ -192,6 +208,7 @@ module.exports = function(imports) {
                 onlykey_api.sharedsec = nacl.box.before(Uint8Array.from(okPub), appKey.secretKey);
                 onlykey_api.OKversion = response[19] == 99 ? 'Color' : 'Original';
                 onlykey_api.FWversion = bytes2string(response.slice(8, 20));
+                transit_select(onlykey_api.FWversion); // v0.2-beta.8c: always v1
                 console.info("Version:",[onlykey_api.OKversion, onlykey_api.FWversion]);
                 imports.app.emit("ok-connected");
                 cb(null);
