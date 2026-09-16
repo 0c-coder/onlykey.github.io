@@ -42,7 +42,6 @@ module.exports = {
             init: function(app, $page, pathname) {
                 init = true;
 
-
                 page.setup(app, $page, pathname);
             },
             setup: function(app, $page, pathname) {
@@ -56,16 +55,16 @@ module.exports = {
                 var ok = onlykey3rd(1, 0);
                 var $ = app.$;
 
-                // press_required=false requests the non-REQ_PRESS "derived
-                // keys per site without touch" path (same device setting
-                // password-generator.js relies on), matching this
-                // feature's non-interactive encrypt/decrypt flow.
-                var press_required = false;
-
-                // Show the 3-digit challenge code the device will ask for when
-                // web derived keys are set to Challenge Code mode. onlykey-3rd-
-                // party.js emits it right before the WebAuthn prompt goes up and
-                // emits null to clear it once the derive returns.
+                // The REQ_PRESS opcode variants are gone - one label, one key -
+                // and there is no press_required argument any more. Whether a
+                // confirmation is required now follows from what is being
+                // asked for: a public key never needs one, a shared secret
+                // always does, and the device enforces that itself.
+                //
+                // The challenge code is no longer precomputed here either. The
+                // device hashes the reassembled label and ciphertext and shows
+                // the digits itself; this listener stays for the event, but
+                // nothing emits a code on the derived path now.
                 ok.on("challenge", function(code) {
                     var box = document.getElementById("challenge_code_box");
                     var out = document.getElementById("challenge_code");
@@ -91,12 +90,13 @@ module.exports = {
                     var label = currentLabel();
                     var plaintext = $("#plaintext").val();
                     $("#age_file_out").val("");
-                    ok.derive_xwing_recipient(label, press_required, function(error, pkX, mlkemSeed) {
+                    // The device returns the whole 1216-byte recipient now,
+                    // so there is nothing to assemble from halves here.
+                    ok.derive_xwing_recipient(label, function(error, recipientPk) {
                         if (error) {
                             $("#age_file_out").val("ERROR: " + error);
                             return;
                         }
-                        var recipientPk = agePqc.buildRecipient(pkX, mlkemSeed);
                         var encaps = agePqc.xwingEncapsHost(recipientPk);
                         var fileBytes = ageFile.encryptAgeFile(
                             new TextEncoder().encode(plaintext),
@@ -120,17 +120,14 @@ module.exports = {
 
                     ageFile.decryptAgeFile(fileBytes, function(ciphertext) {
                         return new Promise(function(resolve, reject) {
-                            ok.derive_xwing_recipient(label, press_required, function(error, pkX, mlkemSeed) {
+                            // One call, and no host-side ML-KEM. The device
+                            // takes the whole X-Wing ciphertext and returns the
+                            // finished 32-byte shared secret, so the recipient
+                            // lookup that used to be needed here (to feed pk_X
+                            // and the seed into splitDecapsulate) is gone.
+                            ok.derive_xwing_decap(label, ciphertext, function(error, ss) {
                                 if (error) { reject(new Error(error)); return; }
-                                var ctX = agePqc.ctXOf(ciphertext);
-                                ok.derive_xwing_decap(label, ctX, press_required, function(error2, ssX) {
-                                    if (error2) { reject(new Error(error2)); return; }
-                                    try {
-                                        resolve(agePqc.splitDecapsulate(ssX, ciphertext, pkX, mlkemSeed));
-                                    } catch (e) {
-                                        reject(e);
-                                    }
-                                });
+                                resolve(ss);
                             });
                         });
                     }).then(function(plaintextBytes) {
@@ -149,7 +146,6 @@ module.exports = {
                 pagesList: pagesList
             }
         });
-
 
     }
 };

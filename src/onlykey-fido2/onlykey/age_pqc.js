@@ -6,15 +6,23 @@
 // replaced by the real bech32 scheme (see derived_xwing.py/bech32.py) - the
 // old scheme here was stale/superseded and `age` rejects it outright.
 //
-// Wire contract this mirrors (see okcrypto.cpp's okcrypto_xwing_web_derive,
+// Wire contract this mirrors (see okcrypto.cpp's okcrypto_xwing_derive_*,
 // RESERVED_KEY_WEB_DERIVATION + KEYTYPE_XWING dispatch):
-//   DERIVE_PUBLIC_KEY -> [ pk_X(32) | mlkem_seed(32) ]
-//   DERIVE_SHAREDSEC  -> [ ss_X(32) | mlkem_seed(32) ]
-// The device never returns sk_X or the ML-KEM secret key - only a one-way
-// SHA256(sk_X || tag)-derived seed the host expands locally.
+//   DERIVE_PUBLIC_KEY          -> [ pk_M(1184) | pk_X(32) ] = the recipient
+//   OKDECRYPT to slot 128 with
+//     [ label32 | ct(1120) ]   -> [ ss(32) ] = the X-Wing shared secret
+//
+// SPLIT CUSTODY IS GONE. The device used to return a 32-byte ML-KEM seed and
+// let the host expand it, run ML-KEM decapsulation and combine the halves. The
+// seed is private key material - it yields sk_M - so that was a private key
+// handed out in answer to a request for a public one, and the ML-KEM half of
+// a "hardware" key really lived in the browser. The device now holds both
+// halves and does the whole decapsulation, so mlkemKeypairFromSeed(),
+// buildRecipient(), splitDecapsulate() and ctXOf() have no callers and are
+// gone with them. What remains here is host/sender-side math on public values.
 
 const { ml_kem768 } = require('@noble/post-quantum/ml-kem.js');
-const { shake256, sha3_256 } = require('@noble/hashes/sha3.js');
+const { sha3_256 } = require('@noble/hashes/sha3.js'); // shake256 went with the seed expansion
 const { sha256 } = require('@noble/hashes/sha2.js');
 const { x25519 } = require('@noble/curves/ed25519.js');
 
@@ -44,56 +52,10 @@ function deriveLabelTag(label) {
     return sha256(Buffer.from(label, 'utf8'));
 }
 
-// Expands the 32-byte device-derived seed (SHAKE256 -> 64-byte d||z) into an
-// ML-KEM-768 keypair. Matches the firmware (xwing_shake256/keypair_derand)
-// and python-onlykey's mlkem_keypair_from_seed() (kyber_py's
-// _keygen_internal(d, z)) - @noble/post-quantum's ml_kem768.keygen(seed64)
-// splits the same way internally (seed[:32]=d, seed[32:]=z; see
-// createKyber() in @noble/post-quantum's ml-kem.ts).
-function mlkemKeypairFromSeed(mlkemSeed) {
-    if (mlkemSeed.length !== SEED) {
-        throw new Error(`mlkem_seed must be ${SEED} bytes, got ${mlkemSeed.length}`);
-    }
-    const seed64 = shake256(mlkemSeed, { dkLen: 64 });
-    return ml_kem768.keygen(seed64); // { publicKey, secretKey }
-}
-
-// Builds the 1216-byte X-Wing recipient public key (pk_M || pk_X).
-function buildRecipient(pkX, mlkemSeed) {
-    if (pkX.length !== 32) {
-        throw new Error(`pk_X must be 32 bytes, got ${pkX.length}`);
-    }
-    const { publicKey: pkM } = mlkemKeypairFromSeed(mlkemSeed);
-    return concatBytes(pkM, pkX);
-}
-
 // X-Wing Combiner (draft-connolly-cfrg-xwing-kem-09 Section 5.3):
 // SHA3-256(ss_M || ss_X || ct_X || pk_X || XWingLabel)
 function xwingCombiner(ssM, ssX, ctX, pkX) {
     return sha3_256(concatBytes(ssM, ssX, ctX, pkX, XWING_LABEL));
-}
-
-// Finishes X-Wing decapsulation given the device's ss_X and the seed.
-// ssX: 32-byte X25519 shared secret from the device (sk_X stays there)
-// ciphertext: 1120-byte X-Wing ct (ct_M || ct_X) from the age stanza
-// pkX: recipient X25519 public key
-// mlkemSeed: 32-byte ML-KEM seed from the device
-// Returns the 32-byte X-Wing shared secret. ct_M never leaves the host.
-function splitDecapsulate(ssX, ciphertext, pkX, mlkemSeed) {
-    if (ssX.length !== 32) throw new Error('ss_X must be 32 bytes');
-    if (ciphertext.length !== XWING_CT) {
-        throw new Error(`X-Wing ct must be ${XWING_CT} bytes, got ${ciphertext.length}`);
-    }
-    const ctM = ciphertext.subarray(0, MLKEM_CT);
-    const ctX = ciphertext.subarray(MLKEM_CT, XWING_CT);
-    const { secretKey: skM } = mlkemKeypairFromSeed(mlkemSeed);
-    const ssM = ml_kem768.decapsulate(ctM, skM);
-    return xwingCombiner(ssM, ssX, ctX, pkX);
-}
-
-// Returns ct_X (the 32 bytes the device needs) from a stanza ciphertext.
-function ctXOf(ciphertext) {
-    return ciphertext.subarray(MLKEM_CT, XWING_CT);
 }
 
 // Standard X-Wing Encapsulation (host/sender side, for encrypt). Mirrors
@@ -252,11 +214,7 @@ function decodeIdentity(s) {
 }
 
 module.exports = {
-    mlkemKeypairFromSeed,
-    buildRecipient,
     xwingCombiner,
-    splitDecapsulate,
-    ctXOf,
     xwingEncapsHost,
     deriveLabelTag,
     encodeRecipient,
