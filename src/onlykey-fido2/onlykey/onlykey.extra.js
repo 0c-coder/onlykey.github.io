@@ -340,6 +340,13 @@ module.exports = function(imports) {
     return transit.v2;
   };
 
+  /** Wire length of a message whose plaintext is n bytes. Callers that have to
+   *  state an expected response size up front - poll_for_response() checks the
+   *  chunk shape against it - need the FRAMED size, not the plaintext size. */
+  $exports.transit_framed = function transit_framed(n) {
+    return transit.v2 ? n + 4 + 16 : n;
+  };
+
   /** Restart the counter. MUST be called wherever the transit key is replaced -
    *  which includes every derive, because a derive request is itself an
    *  OKCONNECT and the device rolls its key on each one. */

@@ -29,6 +29,7 @@ module.exports = function(imports, onlykeyApi) {
         // call below that runs against a response the device never encrypted.
         transit_seal,
         transit_open,
+        transit_framed,
         transit_select,
         transit_reset,
         digestBuff,
@@ -712,7 +713,7 @@ module.exports = function(imports, onlykeyApi) {
                 payload.set(Uint8Array.from(ciphertext), 32);
 
                 await prime_composite(OKDECRYPT, RESERVED_KEY_WEB_AGENT_DERIVATION, payload);
-                var ss = await poll_for_response(XWING_SS);
+                var ss = await poll_for_response(transit_framed(XWING_SS));
 
                 // The shared secret comes back TRANSIT-ENCRYPTED and has to be
                 // decrypted here.
@@ -1096,10 +1097,15 @@ module.exports = function(imports, onlykeyApi) {
             payload[0] = half;
             payload.set(Uint8Array.from(digest), 1);
             await prime_composite(OKSIGN, slot, payload);
-            var expected = half === HALF_ECC ? ED25519_SIG_LEN : MLDSA_SIG_LEN;
-            var sig = await poll_for_response(expected);
+            // The device seals this now (okpqc.cpp sends every composite
+            // response with encrypt = 1, where it used to send them bare), so
+            // poll_for_response() is told the FRAMED length - its chunk-shape
+            // check compares against what is actually on the wire - and the
+            // frame is opened once the whole thing is reassembled.
+            var expected = transit_framed(half === HALF_ECC ? ED25519_SIG_LEN : MLDSA_SIG_LEN);
+            var sig = await transit_open(await poll_for_response(expected), onlykeyApi.sharedsec);
             api.emit("status", "OnlyKey: Signature complete");
-            return sig;
+            return Uint8Array.from(sig);
         };
 
         // The device half of composite decryption. okpqc_decrypt() infers
@@ -1113,9 +1119,15 @@ module.exports = function(imports, onlykeyApi) {
             // reply of any size and skipped the chunk-shape check entirely -
             // which is exactly how a short or off-cursor reply gets accepted as
             // a shared secret. Both halves answer 32 bytes.
-            var out = await poll_for_response(COMPOSITE_SS_LEN);
+            //
+            // Sealed since okpqc.cpp stopped sending composite results bare -
+            // these two 32-byte values are the shared secrets the whole
+            // operation exists to produce, and they used to cross the tunnel in
+            // the clear while the classical half encrypted the same thing.
+            var out = await transit_open(await poll_for_response(transit_framed(COMPOSITE_SS_LEN)),
+                                         onlykeyApi.sharedsec);
             api.emit("status", "OnlyKey: Decryption complete");
-            return out;
+            return Uint8Array.from(out);
         };
 
         api.encode_key = encode_key;
