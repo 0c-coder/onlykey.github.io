@@ -68,14 +68,18 @@ font{font-size:inherit!important}
 .oa-brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:18px;letter-spacing:-.01em;color:var(--text)}
 .oa-brand:hover{color:var(--text)}
 .oa-brand .oa-dot{
-  flex:none;width:22px;height:22px;border-radius:6px;background:#fff;
-  /* The keypad glyph that stands in for the O in the OnlyKey wordmark: a 3x3
-     grid of squares knocked out of a white tile. Inline so it needs no new
-     asset and no change to the webpack copy step. */
-  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 22 22'%3E%3Cg fill='%230a0a0a'%3E%3Crect x='5' y='5' width='3.4' height='3.4' rx='.8'/%3E%3Crect x='9.3' y='5' width='3.4' height='3.4' rx='.8'/%3E%3Crect x='13.6' y='5' width='3.4' height='3.4' rx='.8'/%3E%3Crect x='5' y='9.3' width='3.4' height='3.4' rx='.8'/%3E%3Crect x='9.3' y='9.3' width='3.4' height='3.4' rx='.8'/%3E%3Crect x='13.6' y='9.3' width='3.4' height='3.4' rx='.8'/%3E%3Crect x='5' y='13.6' width='3.4' height='3.4' rx='.8'/%3E%3Crect x='9.3' y='13.6' width='3.4' height='3.4' rx='.8'/%3E%3Crect x='13.6' y='13.6' width='3.4' height='3.4' rx='.8'/%3E%3C/g%3E%3C/svg%3E");
-  background-size:contain;background-repeat:no-repeat;
-}
-.oa-brand img{height:30px;width:auto;display:block}
+  /* The glyph that stands in for the O in the OnlyKey wordmark: a keypad of SIX
+     keys, 3 across and 2 down, inside a heavy rounded frame. Measured off
+     OnlyKey_Logo_360x.png rather than eyeballed - the mark is 51x41, so it is
+     wider than tall, the frame ring is 6 units thick, and the keys are 7x7 on a
+     grid at x 11/22/33, y 12/22.
+     Inverted for a dark nav: the frame and keys are white and the well is left
+     transparent, so the nav's blur shows through rather than a flat patch.
+     Inline as a data URI - no new asset, no change to the webpack copy step. */
+  flex:none;width:26px;height:21px;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 51 41'%3E%3Crect x='3' y='3' width='45' height='35' rx='10' fill='none' stroke='%23fff' stroke-width='6'/%3E%3Cg fill='%23fff'%3E%3Crect x='11' y='12' width='7' height='7'/%3E%3Crect x='22' y='12' width='7' height='7'/%3E%3Crect x='33' y='12' width='7' height='7'/%3E%3Crect x='11' y='22' width='7' height='7'/%3E%3Crect x='22' y='22' width='7' height='7'/%3E%3Crect x='33' y='22' width='7' height='7'/%3E%3C/g%3E%3C/svg%3E");
+  background-size:contain;background-repeat:no-repeat;background-position:center;
+}.oa-brand img{height:30px;width:auto;display:block}
 .oa-navlinks{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
 .oa-navlinks a{color:var(--muted);font-size:14px;font-weight:500;padding:8px 12px;border-radius:9px}
 .oa-navlinks a:hover{color:var(--text);background:var(--panel)}
