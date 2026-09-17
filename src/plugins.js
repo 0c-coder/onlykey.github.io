@@ -70,8 +70,11 @@ if (!!(process.env.NODE_ENV === "production")) {//is production
   // with "Could not resolve dependencies / Missing services: console", so the
   // swap has to be console.js <-> console_debug.js, not a deletion.
   //
-  // onlyagent.app is a TEST deployment - real production will be a different
-  // host - and this build is what we test firmware against. With output
+  // onlyagent.app is the STAGING deployment. Production is apps.crp.to and
+  // apps.onlykey.io - the only two origins the firmware trusts
+  // (webcryptcheck(), device.cpp). onlyagent.app is deliberately not among
+  // them: staging runs on DEBUG firmware, which trusts every origin, so it
+  // needs no entry in that table. This build is what we test firmware against. With output
   // suppressed the app reported nothing at all when the FIDO2 derived-key
   // path hung on 2026-09-15: no error, no log, just a page that never
   // finished, leaving only the device's (lossy) serial log to diagnose from.
