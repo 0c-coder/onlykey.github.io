@@ -698,9 +698,42 @@ module.exports = function(imports, onlykeyApi) {
         // The confirmation is the device's, not ours: the firmware computes
         // the challenge digits over the reassembled label and ciphertext and
         // floors at a button press for a shared secret whatever field 30 says.
-        // We no longer precompute and display a code here - the previous code
-        // hashed [keytype | label32 | ct_X32], which is not what the device
-        // hashes now, and a wrong code shown confidently is worse than none.
+        // The code IS precomputed here again - see emit_derive_challenge() and
+        // the note at its call site below. What was wrong with the old one was
+        // the preimage, not the idea.
+
+        /** The three buttons the device is waiting for, or [] when this host
+         *  cannot know them. `req` is the reassembled request the device hashes:
+         *  [label32 | ct1120] for a derived decapsulation. */
+        async function emit_derive_challenge(req) {
+            try {
+                // Six buttons unless we positively know otherwise, which is
+                // also what python-onlykey's challenge_code() does (its `duo`
+                // argument defaults to False).
+                //
+                // onlykeyApi.OKversion is NOT usable for this. It comes from
+                //     OKversion = response[32+19] == 99 ? 'Color' : 'Go'
+                // and UNLOCKED is "UNLOCKED" OKversion - "UNLOCKEDv3.0.5-test",
+                // exactly 19 characters - so index 19 of the status field is its
+                // NUL terminator, not a hardware byte. Every Color reports
+                // itself as 'Go'. Gating the code on that string meant the box
+                // stayed empty on the very hardware it is for - measured
+                // 2026-09-16. The detection wants fixing at the protocol level,
+                // not worked around here.
+                var inner = await digestArray(Uint8Array.from(req));
+                var outer = await digestArray(Uint8Array.from(inner));
+                api.emit("challenge", [
+                    (outer[0]  % 6) + 1,
+                    (outer[15] % 6) + 1,
+                    (outer[31] % 6) + 1
+                ]);
+            } catch (e) {
+                // Never let the display stop the operation: the key still shows
+                // its own prompt, and a button press works in the other modes.
+                api.emit("challenge", []);
+            }
+        }
+
         api.derive_xwing_decap = async function(label, ciphertext, cb) {
             api.emit("status", "OnlyKey: Requesting Derived X-Wing Decapsulation - confirm on the device");
             try {
@@ -711,6 +744,42 @@ module.exports = function(imports, onlykeyApi) {
                 var payload = new Uint8Array(32 + XWING_CT);
                 payload.set(Uint8Array.from(labelHash), 0);
                 payload.set(Uint8Array.from(ciphertext), 32);
+
+                // Show the challenge digits again, computed the way the device
+                // computes them this time.
+                //
+                // Field 30 (web_agent_derive_mode) has three settings, and 0 -
+                // challenge code - is one of them. In that mode the key blinks
+                // and waits for three specific buttons, and the host is the only
+                // thing that can tell the user which. The old precomputation was
+                // removed rather than corrected because it hashed
+                // [keytype | label32 | ct_X32], which stopped being what the
+                // firmware hashes; with nothing in its place the page printed
+                // "press these in order:" followed by an empty box, and a press
+                // on a key in challenge mode gets
+                //
+                //     Error incorrect challenge was entered
+                //
+                // - measured on hardware 2026-09-16.
+                //
+                // The device's derivation, from okcrypto.cpp and
+                // okcore_prime_user_confirmation():
+                //
+                //     inner = SHA256(derive_label(32) || large_buffer(1120))
+                //     outer = SHA256(inner)
+                //     button_n = (outer[{0,15,31}] % 6) + 1
+                //
+                // `payload` IS [label32 | ct1120], so it is the inner hash's
+                // input exactly, and the second hash is the one
+                // okcore_prime_user_confirmation() applies to whatever it is
+                // primed with. Two hashes, not one - that is easy to get wrong
+                // by reading only the call site.
+                //
+                // The % 6 is the six-button layout. OnlyKey DUO uses % 3 and
+                // this library has no reliable way to detect one, so it shows
+                // the six-button code unconditionally - the same default
+                // python-onlykey ships. See emit_derive_challenge().
+                await emit_derive_challenge(payload);
 
                 await prime_composite(OKDECRYPT, RESERVED_KEY_WEB_AGENT_DERIVATION, payload);
                 var ss = await poll_for_response(transit_framed(XWING_SS));
@@ -745,10 +814,15 @@ module.exports = function(imports, onlykeyApi) {
                                     ' bytes after transit decrypt, expected ' + XWING_SS);
                 }
                 api.emit("status", "OnlyKey: Derived X-Wing Decapsulation Complete");
+                // Take the digits off the screen. They are bound to this one
+                // request; left up, they are a code for an operation that is
+                // over and the next prompt inherits stale numbers.
+                api.emit("challenge", []);
                 if (typeof cb === 'function') cb(null, Uint8Array.from(ss));
             }
             catch (e) {
                 api.emit("status", "OnlyKey: Problem Requesting Derived X-Wing Decapsulation");
+                api.emit("challenge", []);
                 if (typeof cb === 'function') cb(e.message || e);
             }
         };
@@ -1017,14 +1091,44 @@ module.exports = function(imports, onlykeyApi) {
         //
         // opt2 is what tells the device the input is complete; without it the
         // device keeps waiting for more and never primes the challenge.
-        // 224, down from 228: a credential id is 255 bytes with a 10-byte
-        // header, so one assertion carries 245, and the transit frame costs 20
-        // of those (4-byte counter + 16-byte tag). 224 + 20 = 244.
+        // THIS MUST BE A MULTIPLE OF 57, and it is the binding constraint -
+        // not the keyhandle capacity.
         //
-        // No chunk count changes. An ML-KEM-768 ciphertext is 1088 bytes and
-        // still takes 5 chunks; a derived X-Wing [label(32) | ct(1120)] is 1152
-        // and still takes 6; RSA-4096 is 512 and still takes 3.
-        var COMPOSITE_MAX_PACKET = 224; // 57 (OK packet size) * 4 - 4, under 255 - header - frame
+        // ok_extension.cpp re-chunks each arriving keyhandle into 57-byte
+        // device packets:
+        //
+        //     recv_buffer[6] = 0xFF;
+        //     if (opt2 && handle_len<=57) recv_buffer[6] = handle_len;
+        //
+        // 0xFF means "a full 57 bytes, more coming", and the real length is
+        // written only when opt2 marks the FINAL host chunk. There is no way to
+        // say "n bytes, more coming". So on every chunk but the last, a tail
+        // shorter than 57 still counts as 57 and the device advances its offset
+        // past bytes the host never sent.
+        //
+        // 224 (= 228 - 20/5, picked to fit the transit frame) broke that
+        // silently. Each 224-byte chunk splits 57+57+57+53, the 53 counts as
+        // 57, and a derived X-Wing [label(32) | ct(1120)] = 1152 sends five
+        // non-final chunks, so the device reached 1140 where the host had sent
+        // 1120 and the 32-byte tail took it to 1172 against a 1152 total. That
+        // is 20 over, past the 16-byte padding tolerance, and the request was
+        // refused with "Error derived decaps payload size" - measured on
+        // hardware 2026-09-16, v3.0.5-test, on the decapsulation half of the
+        // age-derive round trip. RSA-4096 decrypt (512 B, two non-final chunks)
+        // overshot by 8 the same way.
+        //
+        // Sizing, in order:
+        //   * a credential id is 255 bytes with a 10-byte header, so one
+        //     assertion carries 245;
+        //   * the transit frame costs 20 (4-byte counter + 16-byte tag),
+        //     leaving 225 of plaintext;
+        //   * the largest multiple of 57 at or below 225 is 171.
+        //
+        // 171 + 20 = 191 on the wire. Chunk counts go up - ML-KEM-768 (1088 B)
+        // 5 -> 7, derived X-Wing (1152 B) 6 -> 7, RSA-4096 (512 B) 3 -> 3 - and
+        // each chunk is a full WebAuthn ceremony, so priming is slower. That is
+        // the price of the framing; correctness is not negotiable against it.
+        var COMPOSITE_MAX_PACKET = 171; // 57 (OK packet size) * 3; + 20-byte frame = 191 <= 245
 
         // opt3 must INCREASE ACROSS OPERATIONS, not restart per operation.
         //
@@ -1081,6 +1185,25 @@ module.exports = function(imports, onlykeyApi) {
                 last = await onlykeyApi.ctaphid_via_webauthn(
                     cmd, slot, finalPacket, packetnum, encrypted, 10000
                 );
+                // A failed chunk must END the send, not be stepped over.
+                //
+                // This loop used to ignore what came back. Any ceremony that
+                // failed - a cancelled prompt, a tab the browser refused to run
+                // WebAuthn in, an unplugged key mid-send - simply did not reach
+                // the device, and the loop went on to the next chunk and
+                // eventually set opt2. The device then reassembled a payload
+                // short by however many chunks were lost and refused it with
+                //
+                //     Error derived decaps payload size
+                //
+                // which blames the payload for a transport failure and sent me
+                // looking at chunk arithmetic that was correct. Whatever the
+                // cause, the honest report is the chunk that did not land.
+                if (!last || last.error) {
+                    throw new Error('chunk ' + (sent + 1) + ' of ' + total +
+                                    ' did not reach the device: ' +
+                                    ((last && last.error) || 'no response'));
+                }
                 sent++;
                 api.emit("status", "OnlyKey: Sending data to device (packet " + sent + " of " + total + ")");
             }

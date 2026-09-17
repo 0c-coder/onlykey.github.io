@@ -234,15 +234,23 @@ module.exports = function(imports) {
       async function u2fSignBuffer(slot, cipherText, mainCallback) {
         // this function should recursively call itself until all bytes are sent in chunks
         var message = []; //Add header and message type
-        // 224, down from 228. A credential id is 255 bytes with a 10-byte
-        // header, so one assertion carries 245, and the transit framing costs
-        // 20 of those (4-byte counter + 16-byte tag): 224 + 20 = 244.
+        // THIS MUST BE A MULTIPLE OF 57. See the long note on
+        // COMPOSITE_MAX_PACKET in onlykey-3rd-party.js - same constraint, same
+        // reason, and this copy is the one the classic RSA path uses.
         //
-        // This changes no chunk count. RSA-4096 is 512 bytes and still takes 3
-        // chunks, an ML-KEM-768 ciphertext is 1088 and still takes 5, and a
-        // derived X-Wing [label(32) | ct(1120)] is 1152 and still takes 6. The
-        // tag is free in round trips; it only eats slack.
-        var maxPacketSize = 224; //57 (OK packet size) * 4 - 4, leaving room for the transit frame
+        // ok_extension.cpp re-chunks the arriving keyhandle into 57-byte device
+        // packets and writes the true length only when opt2 marks the FINAL
+        // host chunk; every other short tail is sent as 0xFF and counted as a
+        // full 57. 224 splits 57+57+57+53, so each non-final chunk advanced the
+        // device four bytes past what was sent.
+        //
+        // A credential id is 255 bytes with a 10-byte header, so one assertion
+        // carries 245; the transit frame costs 20 (4-byte counter + 16-byte
+        // tag), leaving 225; and the largest multiple of 57 at or below 225 is
+        // 171. 171 + 20 = 191 on the wire.
+        //
+        // RSA-4096 is 512 bytes and still takes 3 chunks (171 + 171 + 170).
+        var maxPacketSize = 171; //57 (OK packet size) * 3, leaving room for the transit frame
         var finalPacket = cipherText.length - maxPacketSize <= 0;
         var ctChunk;
         packetnum++;
@@ -266,6 +274,24 @@ module.exports = function(imports) {
         var ctaphid_response = await onlykeyApi.ctaphid_via_webauthn(slot, slotid(slot), finalPacket, packetnum, encryptedmsg, 6000, function(aerr, data) {
           // console.log(data);
         });
+
+        // A failed chunk must END the send, not be stepped over. Without this,
+        // `response` stayed 1, `if (result)` was still truthy, and the recursion
+        // moved on to the next chunk as though the failed one had landed - so
+        // the device reassembled a payload short by however many ceremonies
+        // failed and refused it for its size. Same gap as prime_composite()'s
+        // in onlykey-3rd-party.js; see the note there.
+        //
+        // packetnum is deliberately NOT reset here. The device keeps a
+        // high-water mark of opt3 across operations and drops anything not
+        // strictly greater, so restarting at 1 after an abort would make the
+        // next operation's first chunk vanish silently.
+        if (!ctaphid_response || ctaphid_response.error) {
+          console.warn("OnlyKey: packet " + packetnum + " did not reach the device:",
+                       (ctaphid_response && ctaphid_response.error) || "no response");
+          imports.app.emit("ok-error");
+          return;
+        }
 
         var response = 1;
 
