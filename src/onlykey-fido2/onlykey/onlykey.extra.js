@@ -1,3 +1,29 @@
+// ---- transit framing state (module singleton, NOT per-instance) ----------
+//
+// This file is a FACTORY: every `require("./onlykey.extra.js")(imports)` runs
+// the function below again and hands back a fresh $exports. onlykey-api.js
+// calls it twice, onlykey-pgp.js once and onlykey-3rd-party.js once, so there
+// are four independent copies of everything declared inside it.
+//
+// The framing state must not be one of them. It describes the DEVICE SESSION -
+// which scheme the firmware on the other end speaks, and where its host->device
+// counter has got to - and there is exactly one of those. Declared inside the
+// factory, transit_select() in onlykey-api.js's copy set v2 = true while
+// onlykey-3rd-party.js's copy stayed at its `false` default, so the whole
+// derive/composite path silently framed v1 at a v2 device: transit_seal() fell
+// through to aesgcm_encrypt(), transit_open() to aesgcm_decrypt(), and
+// transit_framed() understated every expected length by 20 bytes.
+//
+// The first symptom was "Cannot read properties of null (reading 'map')" out of
+// the age-derive encrypt - aesgcm_encrypt([]) produces an empty hex string and
+// ''.match(/.{2}/g) is null - which says nothing about framing at all. Measured
+// on hardware 2026-09-16 against v3.0.5-test, with the connect banner reporting
+// "Transit framing: v2" from the other copy at the same time.
+//
+// Hoisted here, all four copies share one object.
+var TRANSIT_V2_MIN = [3, 0, 5];
+var transit = { v2: false, ctrOut: 0 };
+
 module.exports = function(imports) {
 
   /* global TextEncoder */
@@ -320,8 +346,8 @@ module.exports = function(imports) {
   // so it is readable before any of this applies.
   var counter = 0;   // v1 only. Deliberately never incremented; see above.
 
-  var TRANSIT_V2_MIN = [3, 0, 5];
-  var transit = { v2: false, ctrOut: 0 };
+  // TRANSIT_V2_MIN and `transit` live at module scope - see the top of this
+  // file. Every copy of $exports points at the same object on purpose.
   $exports.transit = transit;
 
   /** Pick v1 or v2 from a firmware version string like "v3.0.5-prod". */
@@ -447,7 +473,12 @@ module.exports = function(imports) {
       //console.log("Plaintext", plaintext);
       //console.log("Decrypted AES-GCM Hex", forge.util.bytesToHex(decrypted).match(/.{2}/g).map(hexStrToDec));
       //encrypted = forge.util.bytesToHex(decrypted).match(/.{2}/g).map(hexStrToDec);
-      resolve(plaintext.match(/.{2}/g).map($exports.hexStrToDec));
+      // bytesFromHex, not .match().map(): forge returns '' for a zero-length
+      // input and ''.match(/.{2}/g) is null, so the bare form threw
+      // "Cannot read properties of null (reading 'map')" - a message that
+      // points nowhere near the actual problem. An empty message decrypts to
+      // an empty message.
+      resolve(bytesFromHex(plaintext));
     });
   };
 
@@ -475,8 +506,10 @@ module.exports = function(imports) {
       cipher.update(forge.util.createBuffer(Uint8Array.from(plaintext)));
       cipher.finish();
       var ciphertext = cipher.output;
-      ciphertext = ciphertext.toHex(),
-        resolve(ciphertext.match(/.{2}/g).map($exports.hexStrToDec));
+      ciphertext = ciphertext.toHex();
+      // See aesgcm_decrypt above. poll_for_response() seals an EMPTY payload
+      // for its OKPING, so this path is reached on every poll of a v1 session.
+      resolve(bytesFromHex(ciphertext));
     });
   };
 

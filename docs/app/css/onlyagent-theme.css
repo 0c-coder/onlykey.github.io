@@ -1,16 +1,30 @@
 /* ==========================================================================
-   OnlyAgent — app design system (matches the onlyagent.us landing page)
+   OnlyKey — app design system
    src/assets/css/onlyagent-theme.css  ·  link LAST in the shells.
-   Visual only — no JS/crypto changes. Restyles the WebCrypt app into a
-   card-based, professional dark UI.
+
+   Visual only — no JS/crypto changes.
+
+   Monochrome, to match the OnlyKey wordmark, which is flat black type with a
+   keypad glyph for the O. One accent — white — carries links, focus rings and
+   emphasis. Exactly one hue survives, red, and only for errors: a failed
+   decrypt or a bad signature is the one state a user must not misread, and it
+   is the one place hue earns its keep. Success and warning are carried by a
+   left rule and weight instead.
+
+   The filename still says onlyagent. It is referenced by both HTML shells and
+   by the webpack asset copy, and renaming it buys nothing a comment cannot.
    ========================================================================== */
 
 :root{
-  --bg:#070b10; --bg-2:#0c131c; --panel:#0f1822; --panel-2:#13202c;
-  --line:#1d2a38; --line-2:#26384a; --text:#e8eef5; --muted:#93a3b5;
-  --accent:#3ad6c4; --accent-2:#2f8fff; --danger:#ff6b6b; --ok:#3ad6c4;
+  --bg:#0a0a0a; --bg-2:#111111; --panel:#151515; --panel-2:#1c1c1c;
+  --line:#2a2a2a; --line-2:#3b3b3b; --text:#f5f5f5; --muted:#9a9a9a;
+  --accent:#ffffff; --accent-2:#b8b8b8; --danger:#ff5f5f; --ok:#ffffff;
   --radius:16px; --radius-sm:11px; --max:980px;
-  --grad:linear-gradient(135deg,var(--accent),var(--accent-2));
+  /* Was a teal-to-blue gradient. Kept as a variable because a dozen rules
+     reference it; now a flat white, so a primary button reads as the wordmark
+     inverted rather than as a second brand. */
+  --grad:#ffffff;
+  --on-accent:#0a0a0a;   /* text on a white fill */
   --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
   --mono:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;
 }
@@ -21,48 +35,70 @@ html{scroll-behavior:smooth}
 body{
   margin:0;color:var(--text);font-family:var(--sans);line-height:1.6;
   -webkit-font-smoothing:antialiased;
+  /* Two coloured glows became one faint white one: on near-black it reads as a
+     soft vignette rather than as a colour. */
   background:
-    radial-gradient(1000px 520px at 82% -8%,rgba(47,143,255,.13),transparent 60%),
-    radial-gradient(860px 520px at 4% 2%,rgba(58,214,196,.10),transparent 55%),
+    radial-gradient(1100px 560px at 80% -10%,rgba(255,255,255,.045),transparent 62%),
     var(--bg);
   background-attachment:fixed;min-height:100vh;
 }
 a{color:var(--accent);text-decoration:none;transition:.15s}
 a:hover{color:var(--accent-2)}
+/* Links used to be told apart from body text by hue. With both white, prose
+   links need an underline or they vanish. Scoped so nav items, tool cards and
+   buttons - which have their own affordances - stay clean. */
+.oa-main a:not(.btn):not(.oa-tool):not(.oa-brand):not([class*="oa-btn"]),
+.oa-footer a{
+  text-decoration:underline;text-underline-offset:3px;
+  text-decoration-thickness:1px;text-decoration-color:var(--line-2);
+}
+.oa-main a:not(.btn):not(.oa-tool):not(.oa-brand):not([class*="oa-btn"]):hover,
+.oa-footer a:hover{text-decoration-color:var(--accent)}
 h1,h2,h3,h4,h5,h6{margin:0;letter-spacing:-.02em;font-weight:700;line-height:1.18}
 p{margin:0 0 1rem}
 hr{border:0;border-top:1px solid var(--line);margin:28px 0}
-::selection{background:rgba(58,214,196,.28)}
+::selection{background:rgba(255,255,255,.22);color:var(--text)}
 font{font-size:inherit!important}
 
 /* ---------- top nav (custom .oa-nav, replaces Bootstrap navbar) ---------- */
 .oa-nav{position:sticky;top:0;z-index:50;backdrop-filter:blur(10px);
-  background:rgba(7,11,16,.8);border-bottom:1px solid var(--line)}
+  background:rgba(10,10,10,.82);border-bottom:1px solid var(--line)}
 .oa-nav .inner{max-width:var(--max);margin:0 auto;height:62px;display:flex;
   align-items:center;justify-content:space-between;padding:0 22px;gap:16px}
 .oa-brand{display:flex;align-items:center;gap:10px;font-weight:700;font-size:18px;letter-spacing:-.01em;color:var(--text)}
 .oa-brand:hover{color:var(--text)}
-.oa-brand .oa-dot{flex:none;width:22px;height:22px;border-radius:6px;background:var(--grad)}
-.oa-brand img{height:30px;width:auto;display:block}
+.oa-brand .oa-dot{
+  /* The glyph that stands in for the O in the OnlyKey wordmark: a keypad of SIX
+     keys, 3 across and 2 down, inside a heavy rounded frame. Measured off
+     OnlyKey_Logo_360x.png rather than eyeballed - the mark is 51x41, so it is
+     wider than tall, the frame ring is 6 units thick, and the keys are 7x7 on a
+     grid at x 11/22/33, y 12/22.
+     Inverted for a dark nav: the frame and keys are white and the well is left
+     transparent, so the nav's blur shows through rather than a flat patch.
+     Inline as a data URI - no new asset, no change to the webpack copy step. */
+  flex:none;width:26px;height:21px;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 51 41'%3E%3Crect x='3' y='3' width='45' height='35' rx='10' fill='none' stroke='%23fff' stroke-width='6'/%3E%3Cg fill='%23fff'%3E%3Crect x='11' y='12' width='7' height='7'/%3E%3Crect x='22' y='12' width='7' height='7'/%3E%3Crect x='33' y='12' width='7' height='7'/%3E%3Crect x='11' y='22' width='7' height='7'/%3E%3Crect x='22' y='22' width='7' height='7'/%3E%3Crect x='33' y='22' width='7' height='7'/%3E%3C/g%3E%3C/svg%3E");
+  background-size:contain;background-repeat:no-repeat;background-position:center;
+}.oa-brand img{height:30px;width:auto;display:block}
 .oa-navlinks{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
 .oa-navlinks a{color:var(--muted);font-size:14px;font-weight:500;padding:8px 12px;border-radius:9px}
 .oa-navlinks a:hover{color:var(--text);background:var(--panel)}
 .oa-navlinks a.active{color:var(--text);background:var(--panel);border:1px solid var(--line)}
-.oa-navlinks a i{margin-right:6px;color:var(--accent)}
+.oa-navlinks a i{margin-right:6px;color:inherit;opacity:.85}
 .oa-navlinks .sep{width:1px;height:22px;background:var(--line);margin:0 6px}
 @media(max-width:680px){.oa-navlinks a span{display:none}.oa-navlinks a i{margin:0}}
 
 /* legacy bootstrap navbar fallback (in case a page still uses it) */
-.navbar.bg-dark{background:rgba(7,11,16,.8)!important;border-bottom:1px solid var(--line)}
+.navbar.bg-dark{background:rgba(10,10,10,.82)!important;border-bottom:1px solid var(--line)}
 .navbar .navbar-brand,.navbar a{color:var(--muted)!important}
 .navbar .navbar-brand:hover{color:var(--text)!important}
-.navbar .fa{color:var(--accent)}
+.navbar .fa{color:var(--muted)}
 
 /* ---------- layout ---------- */
 .oa-main{max-width:var(--max);margin:0 auto;padding:0 22px 90px}
 .oa-page-head{text-align:center;padding:46px 0 30px}
 .oa-page-head .eyebrow{display:inline-flex;align-items:center;gap:7px;font-size:12.5px;font-weight:600;
-  color:var(--accent);background:rgba(58,214,196,.08);border:1px solid rgba(58,214,196,.25);
+  color:var(--text);background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.18);
   padding:6px 13px;border-radius:999px;margin-bottom:16px}
 .oa-page-head h1{font-size:clamp(26px,4.4vw,40px);font-weight:800}
 .oa-page-head p{color:var(--muted);max-width:56ch;margin:14px auto 0;font-size:17px}
@@ -94,7 +130,7 @@ textarea{min-height:54px;resize:vertical;line-height:1.5}
 input::placeholder,textarea::placeholder{color:var(--muted)!important;opacity:1}
 input:focus,textarea:focus,select:focus,.form-control:focus,input.focus,textarea.focus{
   outline:none!important;border-color:var(--accent)!important;
-  box-shadow:0 0 0 3px rgba(58,214,196,.15)!important;background:var(--bg-2)!important;color:var(--text)!important;
+  box-shadow:0 0 0 3px rgba(255,255,255,.14)!important;background:var(--bg-2)!important;color:var(--text)!important;
 }
 select{appearance:none;background-image:linear-gradient(45deg,transparent 50%,var(--muted) 50%),linear-gradient(135deg,var(--muted) 50%,transparent 50%);
   background-position:calc(100% - 20px) 19px,calc(100% - 14px) 19px;background-size:6px 6px,6px 6px;background-repeat:no-repeat;padding-right:38px!important}
@@ -128,12 +164,14 @@ input[type="file"]::file-selector-button:hover{border-color:var(--accent)}
 }
 /* primary submit / search */
 button[type="submit"],#onlykey_start,#submit,.btn-success,.oa-btn-primary{
-  width:100%;background:var(--grad)!important;color:#04121a!important;border:0!important;
-  box-shadow:0 10px 26px rgba(47,143,255,.22);margin-top:6px;
+  width:100%;background:var(--grad)!important;color:var(--on-accent)!important;border:0!important;
+  box-shadow:0 10px 26px rgba(0,0,0,.45);margin-top:6px;
 }
-button[type="submit"]:hover,#onlykey_start:hover,#submit:hover,.btn-success:hover{filter:brightness(1.08);transform:translateY(-1px)}
+/* A white fill cannot brighten, so hover dims it slightly instead. */
+button[type="submit"]:hover,#onlykey_start:hover,#submit:hover,.btn-success:hover{background:var(--accent-2)!important;transform:translateY(-1px)}
 .btn-secondary,.btn-light,.btn-default{background:var(--panel-2)!important;border:1px solid var(--line)!important;color:var(--text)!important;width:auto}
 .btn-danger{background:var(--danger)!important;color:#1a0606!important;border:0!important}
+.btn-danger:hover{filter:brightness(1.06)}
 /* generic non-action buttons */
 button{background:var(--panel-2);color:var(--text);border:1px solid var(--line)}
 button:hover{border-color:var(--accent)}
@@ -141,7 +179,11 @@ button:hover{border-color:var(--accent)}
 /* ---------- home page (.oa-tools grid) ---------- */
 .oa-hero{text-align:center;padding:54px 0 8px}
 .oa-hero h1{font-size:clamp(30px,5.2vw,50px);font-weight:800;max-width:16ch;margin:0 auto}
-.oa-hero h1 .g{background:var(--grad);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+/* Was gradient-clipped text. A solid fill would clip to a flat white and look
+   like a bug, so the emphasis is carried by colour weight instead: the rest of
+   the heading sits back, this part is full white. */
+.oa-hero h1{color:var(--muted)}
+.oa-hero h1 .g{color:var(--text)}
 .oa-hero p{color:var(--muted);font-size:18px;max-width:54ch;margin:18px auto 0}
 .oa-tools{display:grid;grid-template-columns:repeat(2,1fr);gap:18px;margin:40px 0}
 @media(max-width:680px){.oa-tools{grid-template-columns:1fr}}
@@ -149,7 +191,7 @@ button:hover{border-color:var(--accent)}
   padding:26px;transition:.18s;color:var(--text)}
 .oa-tool:hover{border-color:var(--line-2);transform:translateY(-3px);box-shadow:0 18px 40px rgba(0,0,0,.35);color:var(--text)}
 .oa-tool .ic{width:46px;height:46px;border-radius:12px;display:grid;place-items:center;font-size:20px;
-  color:#04121a;background:var(--grad);margin-bottom:16px}
+  color:var(--on-accent);background:var(--grad);margin-bottom:16px}
 .oa-tool h3{font-size:19px;margin-bottom:6px}
 .oa-tool p{color:var(--muted);font-size:14.5px;margin:0}
 .oa-cta-row{display:flex;gap:12px;justify-content:center;flex-wrap:wrap;margin-top:8px}
@@ -158,11 +200,11 @@ button:hover{border-color:var(--accent)}
 #fancy-icons{margin:8px 0 0;font-size:22px}
 #fancy-icons .fa{color:var(--accent)}
 #fancy-icons .fi-b{color:var(--muted)}
-.app-head img{filter:drop-shadow(0 8px 30px rgba(58,214,196,.22))}
+.app-head img{filter:drop-shadow(0 8px 30px rgba(255,255,255,.14))}
 
 /* console / code (password-generator) */
 pre{background:var(--bg-2);border:1px solid var(--line);border-radius:var(--radius-sm);padding:16px;overflow:auto;margin-top:6px}
-pre code,code{color:var(--accent);font-family:var(--mono);background:transparent}
+pre code,code{color:var(--text);font-family:var(--mono);background:transparent}
 #messages,#header_messages,#terminal_messages{color:var(--accent)}
 .xterm-viewport,.xterm-screen{background:var(--bg-2)!important;border-radius:10px}
 
@@ -176,13 +218,21 @@ pre code,code{color:var(--accent);font-family:var(--mono);background:transparent
 
 /* tokenizer chips */
 .tokenfield,.tokenizer{background:var(--bg-2)!important;border:1px solid var(--line)!important;border-radius:var(--radius-sm)!important;padding:6px!important;margin-bottom:14px}
-.token,.tokenfield .token{background:rgba(58,214,196,.14)!important;border:1px solid rgba(58,214,196,.35)!important;color:var(--text)!important;border-radius:8px!important}
+.token,.tokenfield .token{background:rgba(255,255,255,.10)!important;border:1px solid rgba(255,255,255,.26)!important;color:var(--text)!important;border-radius:8px!important}
 .token .close{color:var(--accent)}
 
 /* alerts */
-.alert-success{background:rgba(58,214,196,.1)!important;border:1px solid rgba(58,214,196,.35)!important;color:var(--text)!important;border-radius:var(--radius-sm)}
+/* Success and warning no longer differ by hue, so they differ by rule weight
+   and by how solid the left edge is. Danger keeps red: a failed decrypt or a
+   bad signature is the one state a user must not misread. */
+.alert{border-radius:var(--radius-sm)}
+.alert-success{background:rgba(255,255,255,.055)!important;border:1px solid var(--line)!important;
+  border-left:3px solid var(--accent)!important;color:var(--text)!important;border-radius:var(--radius-sm)}
+.alert-warning{background:rgba(255,255,255,.03)!important;border:1px solid var(--line)!important;
+  border-left:3px dashed var(--muted)!important;color:var(--text)!important;border-radius:var(--radius-sm)}
+.alert-danger{background:rgba(255,95,95,.08)!important;border:1px solid rgba(255,95,95,.32)!important;
+  border-left:3px solid var(--danger)!important;color:var(--text)!important;border-radius:var(--radius-sm)}
 .alert-danger,.text-danger{color:var(--danger)!important}
-.alert-warning{background:rgba(255,172,2,.08)!important;border:1px solid rgba(255,172,2,.3)!important;color:#ffce6a!important;border-radius:var(--radius-sm)}
 
 /* ---------- footer ---------- */
 .oa-footer{border-top:1px solid var(--line);padding:34px 22px;margin-top:30px}

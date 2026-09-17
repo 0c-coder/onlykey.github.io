@@ -61,10 +61,14 @@ module.exports = {
                 // asked for: a public key never needs one, a shared secret
                 // always does, and the device enforces that itself.
                 //
-                // The challenge code is no longer precomputed here either. The
-                // device hashes the reassembled label and ciphertext and shows
-                // the digits itself; this listener stays for the event, but
-                // nothing emits a code on the derived path now.
+                // The challenge code comes from the library, which computes it
+                // from the same [label32 | ct1120] the device hashes. It is
+                // emitted before the chunks go out and cleared when the
+                // operation ends, so the box is only ever showing a code for
+                // the request currently in front of the user. An empty array
+                // means there is no code to show right now - the request is
+                // over, or the digest failed - not that no code is wanted; the
+                // box hides rather than leaving stale digits up.
                 ok.on("challenge", function(code) {
                     var box = document.getElementById("challenge_code_box");
                     var out = document.getElementById("challenge_code");
