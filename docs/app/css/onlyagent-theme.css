@@ -88,6 +88,60 @@ font{font-size:inherit!important}
 .oa-navlinks .sep{width:1px;height:22px;background:var(--line);margin:0 6px}
 @media(max-width:680px){.oa-navlinks a span{display:none}.oa-navlinks a i{margin:0}}
 
+/* ---------- mode selector (inside the Encrypt / Decrypt pages) ----------
+   The header now carries three links; which KIND of encrypt or decrypt is
+   picked here. Rendered by src/plugins/pages/mode-tabs.js as real <a> hrefs
+   to real routes - pages.js swaps the view client-side, so the fields change
+   without a page load, and the tabs still work as plain links without JS.
+
+   Deliberately NOT styled like the header: a segmented control reads as
+   "these are alternatives, pick one", where a row of nav links reads as
+   "these are separate places". The distinction is the whole point of the
+   change. */
+.oa-modes{
+  display:flex;gap:4px;flex-wrap:wrap;
+  background:var(--bg-2);border:1px solid var(--line);
+  border-radius:12px;padding:4px;margin:0 0 26px;
+}
+.oa-modes a{
+  flex:1 1 auto;text-align:center;white-space:nowrap;
+  color:var(--muted);font-size:14px;font-weight:600;letter-spacing:.01em;
+  padding:9px 16px;border-radius:9px;border:1px solid transparent;
+  transition:.15s;
+}
+.oa-modes a:hover{color:var(--text);background:var(--panel)}
+.oa-modes a.active{
+  color:var(--on-accent);background:var(--accent);border-color:var(--accent);
+}
+.oa-modes a.active:hover{color:var(--on-accent);background:var(--accent)}
+.oa-modes a:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+@media(max-width:560px){
+  .oa-modes a{flex:1 1 40%;padding:9px 10px;font-size:13px}
+}
+
+/* ---------- device challenge code ----------
+   Was inline styles carrying a light-theme green on a near-white panel, from
+   before the monochrome pass - unreadable on this background.
+
+   `display:none` belongs HERE, not on the element. The markup used to carry
+   style="display:none", and this app's CSP allows style-src 'self' with
+   nonces and no 'unsafe-inline', so that attribute was refused and the box sat
+   open on every page load, telling the user to press buttons for a request
+   nobody had made. The JS toggle is unaffected either way - CSP does not
+   police CSSOM writes, so element.style.display from onlykey-3rd-party.js
+   still overrides this rule to show the code, and still sets "none" to hide
+   it. The default is simply no longer the markup's job. */
+.oa-challenge{
+  display:none;
+  margin:18px 0;padding:14px 18px;text-align:center;
+  background:var(--panel);border:1px solid var(--line-2);border-radius:var(--radius-sm);
+}
+.oa-challenge-hint{font-size:14px;color:var(--muted)}
+.oa-challenge-code{
+  font-family:var(--mono);font-size:32px;font-weight:700;letter-spacing:10px;
+  color:var(--text);margin-top:6px;
+}
+
 /* legacy bootstrap navbar fallback (in case a page still uses it) */
 .navbar.bg-dark{background:rgba(10,10,10,.82)!important;border-bottom:1px solid var(--line)}
 .navbar .navbar-brand,.navbar a{color:var(--muted)!important}
@@ -137,6 +191,33 @@ select{appearance:none;background-image:linear-gradient(45deg,transparent 50%,va
 select option{background:var(--panel);color:var(--text)}
 fieldset{border:0;padding:0;margin:0}
 input[readonly]{background:var(--panel-2)!important;color:var(--accent)!important;font-family:var(--mono)}
+
+/* number was missing from the selector list above, so the RSA-slot field on
+   the PQC-PGP views kept the browser's white default - one bright box in the
+   middle of a dark form. */
+input[type="number"]{
+  width:100%;background:var(--bg-2)!important;color:var(--text)!important;
+  border:1px solid var(--line)!important;border-radius:var(--radius-sm)!important;
+  padding:13px 15px!important;font-family:var(--sans);font-size:15px;margin-bottom:14px;
+  transition:border-color .18s, box-shadow .18s;
+}
+input[type="number"]:focus{
+  outline:none!important;border-color:var(--accent)!important;
+  box-shadow:0 0 0 3px rgba(255,255,255,.14)!important;
+}
+
+/* tokenizer.css hard-codes `background-color:white` on the wrapper it builds
+   around the recipient field, so the one control the encrypt page cares most
+   about was the one that did not match. Overridden rather than edited in
+   place: tokenizer.css is vendored. */
+div.tokenizer>div{
+  background-color:var(--bg-2)!important;color:var(--text);
+  border:1px solid var(--line)!important;border-radius:var(--radius-sm);
+  padding:11px 13px;
+}
+div.tokenizer.focused>div{border-color:var(--accent)!important}
+div.tokenizer ul li span{color:var(--text)}
+div.tokenizer .remove-icon{color:var(--muted)}
 
 /* radio groups -> pill segment look */
 #action,form#action{display:flex;flex-wrap:wrap;gap:10px;justify-content:center;margin-top:18px;color:var(--muted)}
