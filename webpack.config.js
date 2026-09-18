@@ -49,10 +49,27 @@ var cspOptions = {
 
 var pageFiles = getPagesList();
 
+// Cache buster for the stylesheets.
+//
+// The bundle gets `hash: true`, which makes html-webpack-plugin append the
+// compilation hash to the script tag it INJECTS. The <link> tags are written by
+// hand in the templates, so they got nothing: every shell asked for
+// `css/onlyagent-theme.css` at a URL that never changed, and GitHub Pages
+// serves it with a long max-age. A returning visitor therefore kept whatever
+// stylesheet they first downloaded - measured 2026-09-18 on onlyagent.app,
+// where a browser held a pre-monochrome copy while the server had the new one
+// and `fetch()` with a query string returned the correct file.
+//
+// Hashing the css directory's CONTENTS rather than stamping a timestamp means
+// the URL only moves when a stylesheet actually moves, so unchanged builds
+// stay cached.
+var cssVersion = hashDir('./src/assets/css');
+
 let plugins = [
 
     new HtmlWebpackPlugin({
         app_pages: pageFiles,
+        css_v: cssVersion,
         dir_name: "./app",
         filename: './index.html',
         template: './src/index-src.html',
@@ -67,6 +84,7 @@ let plugins = [
 
     new HtmlWebpackPlugin({
         app_pages: pageFiles,
+        css_v: cssVersion,
         dir_name: ".",
         filename: './app/index.html',
         template: './src/index-src.html',
@@ -86,6 +104,7 @@ for (var i in pageFiles) {
     plugins.push(
         new HtmlWebpackPlugin({
             app_pages: pageFiles,
+        css_v: cssVersion,
             page: filename,
             filename: (process.env.NODE_ENV === 'production') ? './app/' + filename + '.html' : './app/' + filename + '.html',
             template: './src/app-src.html',
@@ -168,6 +187,27 @@ module.exports = {
         }]
     },
 };
+
+/** Short content hash of every file in a directory, for cache-busting the
+ *  hand-written <link> tags. Sorted so the result does not depend on readdir
+ *  order, and non-fatal: a missing directory just yields a constant, which is
+ *  no worse than the no-buster behaviour it replaces. */
+function hashDir(dir) {
+    try {
+        var fs = require('fs');
+        var crypto = require('crypto');
+        var h = crypto.createHash('sha256');
+        fs.readdirSync(dir).sort().forEach(function(name) {
+            var p = path.join(dir, name);
+            if (!fs.statSync(p).isFile()) return;
+            h.update(name);
+            h.update(fs.readFileSync(p));
+        });
+        return h.digest('hex').slice(0, 12);
+    } catch (e) {
+        return 'nocss';
+    }
+}
 
 function getPagesList() {
 

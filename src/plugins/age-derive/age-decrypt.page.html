@@ -1,0 +1,32 @@
+<h4>
+    <font size="+2">Derived X-Wing age decryption with
+        <a href="https://onlykey.io" target="_blank">OnlyKey</a></font>
+</h4>
+<fieldset>
+    <label for="label">Label (the same label that derived the recipient this file was encrypted to)</label>
+    <input type="text" placeholder="e.g. me@example.com" id="label" />
+
+    <label for="identity_out">Identity (age -d -i ...)</label>
+    <input readonly="readonly" type="text" id="identity_out" />
+
+    <label for="decrypt_file_in">age file to decrypt (base64)</label>
+    <textarea placeholder="Paste base64 age file" rows="4" id="decrypt_file_in"></textarea>
+    <button type="button" id="decrypt_start" value="Decrypt">Decrypt</button>
+
+    <label for="decrypted_out">Decrypted plaintext</label>
+    <textarea readonly="readonly" rows="3" id="decrypted_out"></textarea>
+</fieldset>
+<div id="challenge_code_box" class="oa-challenge">
+    <div class="oa-challenge-hint">Look at your OnlyKey - <b>tap any button</b> to confirm. If it instead shows a challenge, press these in order:</div>
+    <div id="challenge_code" class="oa-challenge-code"></div>
+</div>
+<div>
+    <h3>Console Messages from OnlyKey Appear Below</h3>
+    <pre>
+            <code data-language="javascript">
+                <font color="008700">
+                    <div id="messages"></div>
+                </font>
+            </code>
+        </pre>
+</div>

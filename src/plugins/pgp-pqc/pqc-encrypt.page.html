@@ -1,0 +1,39 @@
+<h4>
+    <font size="+2">Securely encrypt and sign messages with composite PGP-PQC using
+        <a href="https://onlykey.io" target="_blank">OnlyKey</a></font>
+</h4>
+<fieldset>
+    <label for="pgp_public_key">Recipient's composite public key (armored)</label>
+    <textarea placeholder="Paste the recipient's ML-KEM-768 + ML-DSA-65 composite public key..." rows="6" id="pgp_public_key"></textarea>
+
+    <label for="pgp_slot">RSA slot (1-4) holding your key, for signing</label>
+    <input type="number" min="1" max="4" value="1" id="pgp_slot" />
+
+    <label for="pgp_plaintext">Plaintext to encrypt</label>
+    <textarea placeholder="Compose message here..." rows="3" id="pgp_plaintext"></textarea>
+    <button type="button" id="pgp_encrypt" value="Encrypt">Encrypt</button>
+    <div id="pgp_encrypt_status"></div>
+
+    <label for="pgp_ciphertext_out">Encrypted message (armored)</label>
+    <textarea readonly="readonly" rows="6" id="pgp_ciphertext_out"></textarea>
+</fieldset>
+
+<fieldset>
+    <label for="pgp_sign_plaintext">Plaintext to sign</label>
+    <textarea placeholder="Compose message here..." rows="3" id="pgp_sign_plaintext"></textarea>
+    <button type="button" id="pgp_sign" value="Sign">Sign</button>
+    <div id="pgp_sign_status"></div>
+
+    <label for="pgp_signature_out">Signed message (armored cleartext signature)</label>
+    <textarea readonly="readonly" rows="6" id="pgp_signature_out"></textarea>
+</fieldset>
+<div>
+    <h3>Console Messages from OnlyKey Appear Below</h3>
+    <pre>
+            <code data-language="javascript">
+                <font color="008700">
+                    <div id="messages"></div>
+                </font>
+            </code>
+        </pre>
+</div>

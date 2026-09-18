@@ -1,18 +1,25 @@
 //change   _template_  to your plugin name
 
+// Two routes, not one. The old single "pgp-pqc" page stacked Encrypt,
+// Decrypt, Sign and Verify; those are now the PQC-PGP mode of the Encrypt
+// page (key block + Encrypt + Sign) and of the Decrypt page (Decrypt +
+// Verify). Signing is an outbound act and verifying an inbound one, which is
+// the same split classic PGP already uses on the encrypt and decrypt pages.
+//
+// No icon and no title: app-src.html renders a header link only for entries
+// that have one, so these keep their own /app/<name>.html and their own
+// route while the top nav stays Encrypt | Decrypt | Search.
+//
+// NOTE: /app/pgp-pqc.html is gone. Anything pointing at it wants
+// /app/pqc-encrypt.html or /app/pqc-decrypt.html now.
 var pagesList = {
-    "pgp-pqc": {
-        sort: 33,
-        icon: "fa-lock",
-        //   title: "PGP-PQC"
+    "pqc-encrypt": {
+        sort: 32
+    },
+    "pqc-decrypt": {
+        sort: 33
     }
 };
-
-function bytesToHex(bytes) {
-    var out = '';
-    for (var i = 0; i < bytes.length; i++) out += bytes[i].toString(16).padStart(2, '0');
-    return out;
-}
 
 module.exports = {
     pagesList: pagesList,
@@ -30,8 +37,8 @@ module.exports = {
         var init = false;
         var openpgp = require("../../onlykey-fido2/onlykey/openpgp_loader.js");
         var compositePgp = require("../../onlykey-fido2/onlykey/composite_pgp.js");
+        var modeTabs = require("../pages/mode-tabs.js");
         var page = {
-            view: require("./pgp-pqc.page.html").default,
             init: function(app, $page, pathname) {
                 init = true;
 
@@ -82,7 +89,11 @@ module.exports = {
                 }
 
                 function currentPublicKey() {
-                    var armored = $("#pgp_public_key").val().trim();
+                    // `|| ""` because one setup serves both the PQC-PGP
+                    // encrypt and decrypt views. The message below is the
+                    // right answer either way - no key is no key, whether the
+                    // field is empty or absent.
+                    var armored = ($("#pgp_public_key").val() || "").trim();
                     if (!armored) throw new Error("no public key - generate one, or paste an existing composite public key");
                     return openpgp.readKey({ armoredKey: armored });
                 }
@@ -131,130 +142,29 @@ module.exports = {
                 // than have the page publish them. See
                 // onlykey-testing/test/05-security/02-shipped-bundle-clean.
 
-                // ---- handoff to the command line -------------------------
+                // ---- key creation is NOT in this app -----------------------
                 //
-                // This page cannot load the key itself, so the last step is a
-                // command the user runs. Assembling that command here, from
-                // the blob and slot the page already holds, removes the two
-                // ways a hand-built one goes wrong: a truncated paste of 320
-                // hex characters, and a slot that does not match the one the
-                // decrypt and sign sections below will use.
+                // Generating a composite key, assembling the `setpqc` command
+                // and downloading the 160-byte private blob all used to live
+                // here. They are gone: composite key creation is a
+                // command-line operation.
+                //
+                // The reasoning is not tidiness. Generating a key in a browser
+                // means the private half exists in a JS heap in a tab, and the
+                // handoff then asks the user to carry it to the device by hand
+                // - through the clipboard, or a file on disk, or a command in
+                // shell history. None of those is a place a private key should
+                // be. `onlykey-cli loadpqc` and `setpqc` already do this
+                // against the device's config mode over the vendor interface,
+                // which a browser cannot reach anyway.
+                //
+                // So this page needs no key material and no explanation of
+                // any: a recipient's PUBLIC key to encrypt to, and a slot
+                // number naming a key the device already holds.
                 function currentSlot() {
                     var n = parseInt($("#pgp_slot").val(), 10);
                     return (n >= 1 && n <= 4) ? n : 1;
                 }
-
-                function refreshSetpqcCommand() {
-                    var hex = $("#pgp_blob_hex").val().trim();
-                    if (!hex) {
-                        $("#pgp_setpqc_cmd").val("");
-                        return;
-                    }
-                    $("#pgp_setpqc_cmd").val(
-                        "onlykey-cli setpqc RSA" + currentSlot() + " " + hex);
-                }
-
-                // The slot is an input the user can change AFTER generating, so
-                // the command has to follow it; a displayed command still
-                // naming the old slot would load the key where nothing looks
-                // for it. Namespaced (`input.pqc`) so the .off() cannot detach
-                // a handler some other part of the page put on this field.
-                $("#pgp_slot").off('input.pqc').on('input.pqc', refreshSetpqcCommand);
-
-                $("#pgp_copy_cmd").off('click').click(function() {
-                    var cmd = $("#pgp_setpqc_cmd").val();
-                    if (!cmd) {
-                        $("#pgp_handoff_status").text("Generate a key first.");
-                        return;
-                    }
-                    // navigator.clipboard is unavailable on insecure origins
-                    // and in some embedded webviews; falling back to selecting
-                    // the field means the button always does something useful
-                    // rather than failing silently.
-                    var done = function() { $("#pgp_handoff_status").text("Command copied."); };
-                    if (navigator.clipboard && navigator.clipboard.writeText) {
-                        navigator.clipboard.writeText(cmd).then(done, function() {
-                            $("#pgp_setpqc_cmd").select();
-                            $("#pgp_handoff_status").text("Could not copy - the command is selected, press Ctrl+C.");
-                        });
-                    } else {
-                        $("#pgp_setpqc_cmd").select();
-                        $("#pgp_handoff_status").text("Select-and-copy: the command is selected, press Ctrl+C.");
-                    }
-                });
-
-                $("#pgp_download_blob").off('click').click(function() {
-                    var hex = $("#pgp_blob_hex").val().trim();
-                    if (!hex) {
-                        $("#pgp_handoff_status").text("Generate a key first.");
-                        return;
-                    }
-                    // Written as HEX TEXT rather than raw bytes on purpose:
-                    // `setpqc` tries a file as hex first and falls back to raw,
-                    // so hex works either way and stays greppable/diffable. The
-                    // trailing newline is deliberate too - cli.py strips it.
-                    var blob = new Blob([hex + "\n"], { type: "text/plain" });
-                    var url = URL.createObjectURL(blob);
-                    var a = document.createElement("a");
-                    a.href = url;
-                    a.download = "onlykey-composite-pqc.hex";
-                    document.body.appendChild(a);
-                    a.click();
-                    document.body.removeChild(a);
-                    // Revoking immediately can cancel the download in some
-                    // browsers; one turn of the event loop is enough.
-                    setTimeout(function() { URL.revokeObjectURL(url); }, 0);
-                    $("#pgp_handoff_status").text(
-                        "Saved onlykey-composite-pqc.hex - this file is PRIVATE key material. "
-                        + "Load it with: onlykey-cli setpqc RSA" + currentSlot()
-                        + " onlykey-composite-pqc.hex, then delete it.");
-                });
-
-                // Generate a fresh composite key locally (host-side,
-                // ephemeral) and show its public key + 160-byte blob. The
-                // blob is for the user to load via `onlykey-cli setpqc`
-                // (TC-11 step 2) - this app never loads it itself, since
-                // OKSETPRIV isn't reachable over the browser's WebAuthn
-                // transport (confirmed by direct firmware read - see the
-                // implementation plan). Local private material is
-                // discarded once this function returns; nothing here keeps
-                // it around.
-                // .off('click') first: setup() re-runs (and re-registers
-                // every handler below) each time the SPA router revisits
-                // this page after `init` has already run once - without
-                // this, jQuery's .click() shorthand is additive, so a
-                // second visit fires generate/encrypt/etc TWICE
-                // concurrently, and whichever async call resolves last
-                // silently wins the DOM write race. Confirmed live: this
-                // is exactly what made TC-11's GUI test intermittently
-                // decrypt/encrypt against a key that didn't match the one
-                // actually shown in #pgp_public_key.
-                $("#pgp_generate").off('click').click(function() {
-                    $("#pgp_generate_status").text("Generating...");
-                    // Clear stale output before starting - a caller polling
-                    // these fields for "generation finished" (e.g. the GUI
-                    // test) would otherwise see leftover values from a
-                    // previous generate and stop waiting immediately,
-                    // capturing a key that doesn't match what this call
-                    // ultimately produces.
-                    $("#pgp_public_key").val("");
-                    $("#pgp_blob_hex").val("");
-                    $("#pgp_setpqc_cmd").val("");
-                    $("#pgp_handoff_status").text("");
-                    var userId = $("#pgp_user_email").val().trim();
-                    compositePgp.generateCompositeKey(openpgp, userId ? { userId: { email: userId } } : {})
-                        .then(function(result) {
-                            $("#pgp_public_key").val(result.armoredPublicKey);
-                            $("#pgp_blob_hex").val(bytesToHex(result.blob));
-                            refreshSetpqcCommand();
-                            $("#pgp_generate_status").text(
-                                "Generated. Put the OnlyKey in config mode, then run the command below "
-                                + "(or download the blob and pass the filename instead).");
-                        })
-                        .catch(function(err) {
-                            $("#pgp_generate_status").text("ERROR: " + (err && err.message ? err.message : err));
-                        });
-                });
 
                 // Host-only: encrypt to the composite public key. No
                 // device involved - encryption only ever needs the
@@ -359,7 +269,24 @@ module.exports = {
             }
         };
 
-        pagesList["pgp-pqc"] = page;
+        // Two routes, one setup - see the note on pagesList at the top of this
+        // file, and the matching split in age-derive.js. Encrypt keeps the key
+        // block, Encrypt and Sign; Decrypt keeps a trimmed key block, Decrypt
+        // and Verify. Every handler binds by id, so each view wires only the
+        // controls it actually has.
+        pagesList["pqc-encrypt"] = {
+            view: modeTabs("encrypt", "pqc-encrypt") +
+                require("./pqc-encrypt.page.html").default,
+            init: page.init,
+            setup: page.setup
+        };
+
+        pagesList["pqc-decrypt"] = {
+            view: modeTabs("decrypt", "pqc-decrypt") +
+                require("./pqc-decrypt.page.html").default,
+            init: page.init,
+            setup: page.setup
+        };
 
         register(null, {
             "plugin_pgp-pqc": {

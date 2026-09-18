@@ -1,13 +1,15 @@
 //change   _template_  to your plugin name  
 
+// See the matching note in encrypt.js. "decrypt" keeps its top-nav link;
+// "decrypt-file" keeps its route and its /app/decrypt-file.html but loses its
+// icon, so it is reached from the selector inside the Decrypt page.
 var pagesList = {
     "decrypt": {
         sort: 15,
         icon: "fa-unlock"
     },
     "decrypt-file": {
-        sort: 25,
-        icon: "fa-file-text"
+        sort: 25
     }
 };
 
@@ -40,9 +42,12 @@ module.exports = {
 
         var terminal_applied = false;
 
+        var modeTabs = require("../pages/mode-tabs.js");
+
         var page = {};
         var $page = {
-            view: require("./decrypt.page.html").default,
+            view: modeTabs("decrypt", "decrypt") +
+                require("./decrypt.page.html").default,
             init: function(app, $page, pathname) {
                 init = true;
                 page.setup(app, $page, pathname, init);
@@ -191,10 +196,18 @@ module.exports = {
                     });
                 };
 
-                document.getElementsByTagName('fieldset')[0].style.backgroundColor = app.randomColor({
-                    luminosity: 'bright',
-                    format: 'rgba'
-                });
+                // The fieldset used to get a random 'bright' rgba background on
+                // every render - a different washed-out hue per page and per
+                // visit (olive here, navy on the -file view, something else
+                // tomorrow). It predates the theme and fought it: the panel is
+                // a flat near-black by design, and a translucent colour laid
+                // over it showed as bars wherever the fieldset peeked out
+                // between its children. Removed; the stylesheet decides what
+                // this looks like.
+                //
+                // Note it survived the CSP that refuses style= attributes,
+                // because a CSSOM write is not an inline style. Same mechanism
+                // that makes the challenge box's JS toggle work.
 
                 page.urlinputbox2 = document.getElementById('pgpkeyurl2');
                 page.urlinputbox = document.getElementById('pgpkeyurl');
@@ -386,7 +399,8 @@ module.exports = {
         pagesList["decrypt"] = $page;
 
         pagesList["decrypt-file"] = {
-            view: require("./decrypt-file.page.html").default,
+            view: modeTabs("decrypt", "decrypt-file") +
+                require("./decrypt-file.page.html").default,
             init: $page.init,
             setup: $page.setup
         };

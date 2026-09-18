@@ -1,13 +1,17 @@
 //change   _template_  to your plugin name  
 
+// "encrypt" is one of the three entries that still earn a top-nav link; the
+// kind of encryption - a message, a file, composite PGP-PQC, derived age - is
+// picked from the selector inside the page instead. "encrypt-file" therefore
+// keeps its route and its /app/encrypt-file.html, but loses its icon so
+// app-src.html stops rendering a header link for it.
 var pagesList = {
     "encrypt": {
         sort: 10,
         icon: "fa-lock"
     },
     "encrypt-file": {
-        sort: 20,
-        icon: "fa-file-archive-o"
+        sort: 20
     }
 };
 
@@ -40,9 +44,12 @@ module.exports = {
 
         var terminal_applied = false;
 
+        var modeTabs = require("../pages/mode-tabs.js");
+
         var page = {};
         var $page = {
-            view: require("./encrypt.page.html").default,
+            view: modeTabs("encrypt", "encrypt") +
+                require("./encrypt.page.html").default,
             init: function(app, $page, pathname) {
                 init = true;
                 page.setup(app, $page, pathname, init);
@@ -193,10 +200,18 @@ module.exports = {
                     });
                 };
 
-                document.getElementsByTagName('fieldset')[0].style.backgroundColor = app.randomColor({
-                    luminosity: 'bright',
-                    format: 'rgba'
-                });
+                // The fieldset used to get a random 'bright' rgba background on
+                // every render - a different washed-out hue per page and per
+                // visit (olive here, navy on the -file view, something else
+                // tomorrow). It predates the theme and fought it: the panel is
+                // a flat near-black by design, and a translucent colour laid
+                // over it showed as bars wherever the fieldset peeked out
+                // between its children. Removed; the stylesheet decides what
+                // this looks like.
+                //
+                // Note it survived the CSP that refuses style= attributes,
+                // because a CSSOM write is not an inline style. Same mechanism
+                // that makes the challenge box's JS toggle work.
 
                 page.urlinputbox = document.getElementById('pgpkeyurl');
                 page.urlinputbox2 = document.getElementById('pgpkeyurl2');
@@ -434,7 +449,8 @@ module.exports = {
         pagesList["encrypt"] = $page;
 
         pagesList["encrypt-file"] = {
-            view: require("./encrypt-file.page.html").default,
+            view: modeTabs("encrypt", "encrypt-file") +
+                require("./encrypt-file.page.html").default,
             init: $page.init,
             setup: $page.setup
         };

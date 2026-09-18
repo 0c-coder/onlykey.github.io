@@ -1,0 +1,47 @@
+<h4>
+    <font size="+2">Composite PGP-PQC (ML-KEM-768 + ML-DSA-65) with
+        <a href="https://onlykey.io" target="_blank">OnlyKey</a></font>
+</h4>
+<fieldset>
+    <p>
+        Decrypt runs against the key already loaded on your device; verify is
+        host-only and needs the matching public key. To generate a composite
+        key, or to get the command that loads one onto the device, go to
+        <a href="./pqc-encrypt">Encrypt &rsaquo; PQC-PGP</a>.
+    </p>
+
+    <label for="pgp_public_key">Composite public key (armored) - the key this message was encrypted to, or signed with</label>
+    <textarea rows="6" id="pgp_public_key"></textarea>
+
+    <label for="pgp_slot">RSA slot (1-4) the private key is loaded into</label>
+    <input type="number" min="1" max="4" value="1" id="pgp_slot" />
+</fieldset>
+
+<fieldset>
+    <h4>Decrypt (device round-trip)</h4>
+    <label for="pgp_ciphertext_in">Encrypted message to decrypt (armored)</label>
+    <textarea placeholder="Paste armored PGP message" rows="6" id="pgp_ciphertext_in"></textarea>
+    <button type="button" id="pgp_decrypt" value="Decrypt">Decrypt</button>
+    <div id="pgp_decrypt_status"></div>
+
+    <label for="pgp_plaintext_out">Decrypted plaintext</label>
+    <textarea readonly="readonly" rows="3" id="pgp_plaintext_out"></textarea>
+</fieldset>
+
+<fieldset>
+    <h4>Verify (host-only)</h4>
+    <label for="pgp_verify_in">Signed message to verify (armored cleartext signature)</label>
+    <textarea placeholder="Paste armored cleartext-signed message" rows="6" id="pgp_verify_in"></textarea>
+    <button type="button" id="pgp_verify" value="Verify">Verify</button>
+    <div id="pgp_verify_status"></div>
+</fieldset>
+<div>
+    <h3>Console Messages from OnlyKey Appear Below</h3>
+    <pre>
+            <code data-language="javascript">
+                <font color="008700">
+                    <div id="messages"></div>
+                </font>
+            </code>
+        </pre>
+</div>

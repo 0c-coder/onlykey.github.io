@@ -1,10 +1,22 @@
 //change   _template_  to your plugin name
 
+// Two routes, not one. The old single "age-derive" page carried the encrypt
+// and decrypt halves stacked on top of each other; they are now the AGE mode
+// of the Encrypt page and the AGE mode of the Decrypt page respectively.
+//
+// No icon and no title on either: app-src.html renders a header link only for
+// entries that have one, so these still get their own /app/<name>.html and
+// their own route, but the top nav stays Encrypt | Decrypt | Search. The
+// selector rendered by mode-tabs.js is how you reach them.
+//
+// NOTE: /app/age-derive.html is gone. Anything pointing at it - test briefs,
+// bookmarks - wants /app/age-encrypt.html or /app/age-decrypt.html now.
 var pagesList = {
-    "age-derive": {
-        sort: 34,
-        icon: "fa-lock",
-        //   title: "Chat"
+    "age-encrypt": {
+        sort: 34
+    },
+    "age-decrypt": {
+        sort: 35
     }
 };
 
@@ -28,7 +40,7 @@ module.exports = {
     setup: function(options, imports, register) {
 
         // Deferred to setup-call time, not module-require time - matching
-        // the ./age-derive.page.html require just below. webpack.config.js's
+        // the ./age-*.page.html requires at the bottom. webpack.config.js's
         // getPagesList() requires this whole plugin module directly under
         // plain Node (to read pagesList before any bundling happens), which
         // has no knowledge of the @noble/* resolve.alias entries webpack
@@ -37,8 +49,8 @@ module.exports = {
         var init = false;
         var agePqc = require("../../onlykey-fido2/onlykey/age_pqc.js");
         var ageFile = require("../../onlykey-fido2/onlykey/age_file.js");
+        var modeTabs = require("../pages/mode-tabs.js");
         var page = {
-            view: require("./age-derive.page.html").default,
             init: function(app, $page, pathname) {
                 init = true;
 
@@ -143,7 +155,24 @@ module.exports = {
             }
         };
 
-        pagesList["age-derive"] = page;
+        // One setup for both routes. Every handler binds by id through jQuery,
+        // and a selector that matches nothing binds nothing, so the encrypt
+        // view simply never wires #decrypt_start and vice versa. The crypto
+        // paths are byte-for-byte the ones the hardware brief exercised - the
+        // split is in the markup, not in the handlers.
+        pagesList["age-encrypt"] = {
+            view: modeTabs("encrypt", "age-encrypt") +
+                require("./age-encrypt.page.html").default,
+            init: page.init,
+            setup: page.setup
+        };
+
+        pagesList["age-decrypt"] = {
+            view: modeTabs("decrypt", "age-decrypt") +
+                require("./age-decrypt.page.html").default,
+            init: page.init,
+            setup: page.setup
+        };
 
         register(null, {
             "plugin_age-derive": {
