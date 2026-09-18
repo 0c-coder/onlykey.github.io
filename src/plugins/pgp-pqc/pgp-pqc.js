@@ -1,10 +1,23 @@
 //change   _template_  to your plugin name
 
+// Two routes, not one. The old single "pgp-pqc" page stacked Encrypt,
+// Decrypt, Sign and Verify; those are now the PQC-PGP mode of the Encrypt
+// page (key block + Encrypt + Sign) and of the Decrypt page (Decrypt +
+// Verify). Signing is an outbound act and verifying an inbound one, which is
+// the same split classic PGP already uses on the encrypt and decrypt pages.
+//
+// No icon and no title: app-src.html renders a header link only for entries
+// that have one, so these keep their own /app/<name>.html and their own
+// route while the top nav stays Encrypt | Decrypt | Search.
+//
+// NOTE: /app/pgp-pqc.html is gone. Anything pointing at it wants
+// /app/pqc-encrypt.html or /app/pqc-decrypt.html now.
 var pagesList = {
-    "pgp-pqc": {
-        sort: 33,
-        icon: "fa-lock",
-        //   title: "PGP-PQC"
+    "pqc-encrypt": {
+        sort: 32
+    },
+    "pqc-decrypt": {
+        sort: 33
     }
 };
 
@@ -30,8 +43,8 @@ module.exports = {
         var init = false;
         var openpgp = require("../../onlykey-fido2/onlykey/openpgp_loader.js");
         var compositePgp = require("../../onlykey-fido2/onlykey/composite_pgp.js");
+        var modeTabs = require("../pages/mode-tabs.js");
         var page = {
-            view: require("./pgp-pqc.page.html").default,
             init: function(app, $page, pathname) {
                 init = true;
 
@@ -82,7 +95,11 @@ module.exports = {
                 }
 
                 function currentPublicKey() {
-                    var armored = $("#pgp_public_key").val().trim();
+                    // `|| ""` for the same reason as refreshSetpqcCommand():
+                    // one setup, two views. The message below is the right
+                    // answer either way - no key is no key, whether the field
+                    // is empty or absent.
+                    var armored = ($("#pgp_public_key").val() || "").trim();
                     if (!armored) throw new Error("no public key - generate one, or paste an existing composite public key");
                     return openpgp.readKey({ armoredKey: armored });
                 }
@@ -145,7 +162,14 @@ module.exports = {
                 }
 
                 function refreshSetpqcCommand() {
-                    var hex = $("#pgp_blob_hex").val().trim();
+                    // `|| ""` because this is reachable from a view that has no
+                    // blob field. One setup serves both the PQC-PGP encrypt and
+                    // decrypt views, and the slot input - which triggers this -
+                    // is on both, while #pgp_blob_hex is only on the encrypt
+                    // one. jQuery returns undefined for a missing element, so
+                    // the bare .trim() threw the moment the slot was edited on
+                    // the decrypt view.
+                    var hex = ($("#pgp_blob_hex").val() || "").trim();
                     if (!hex) {
                         $("#pgp_setpqc_cmd").val("");
                         return;
@@ -359,7 +383,24 @@ module.exports = {
             }
         };
 
-        pagesList["pgp-pqc"] = page;
+        // Two routes, one setup - see the note on pagesList at the top of this
+        // file, and the matching split in age-derive.js. Encrypt keeps the key
+        // block, Encrypt and Sign; Decrypt keeps a trimmed key block, Decrypt
+        // and Verify. Every handler binds by id, so each view wires only the
+        // controls it actually has.
+        pagesList["pqc-encrypt"] = {
+            view: modeTabs("encrypt", "pqc-encrypt") +
+                require("./pqc-encrypt.page.html").default,
+            init: page.init,
+            setup: page.setup
+        };
+
+        pagesList["pqc-decrypt"] = {
+            view: modeTabs("decrypt", "pqc-decrypt") +
+                require("./pqc-decrypt.page.html").default,
+            init: page.init,
+            setup: page.setup
+        };
 
         register(null, {
             "plugin_pgp-pqc": {

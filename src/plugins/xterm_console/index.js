@@ -70,12 +70,21 @@ module.exports = {
 
         var appTerm = new Terminal({
             fontFamily: "monospace",
+            // xterm paints to a canvas, so CSS cannot reach any of this - the
+            // theme has to be set here. These are the monochrome theme's own
+            // values (--panel, --text, --muted, --accent in
+            // src/assets/css/onlyagent-theme.css), hard-coded because JS has no
+            // view of the custom properties at construction time. Change them
+            // together with that file or the log panel drifts from the app.
+            //
+            // Was black-on-white, from before the monochrome pass: a glaring
+            // white slab under every dark page.
             theme: { // don't use escape codes here
-                foreground: "black",
-                background: "white",
-                selection: "yellow",
-                cursor: "pink",
-                cursorAccent: "red",
+                foreground: "#f5f5f5",
+                background: "#151515",
+                selection: "rgba(255,255,255,0.22)",
+                cursor: "#f5f5f5",
+                cursorAccent: "#151515",
 
                 /*
                 brightBlack:"",

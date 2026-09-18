@@ -1,13 +1,17 @@
 //change   _template_  to your plugin name  
 
+// "encrypt" is one of the three entries that still earn a top-nav link; the
+// kind of encryption - a message, a file, composite PGP-PQC, derived age - is
+// picked from the selector inside the page instead. "encrypt-file" therefore
+// keeps its route and its /app/encrypt-file.html, but loses its icon so
+// app-src.html stops rendering a header link for it.
 var pagesList = {
     "encrypt": {
         sort: 10,
         icon: "fa-lock"
     },
     "encrypt-file": {
-        sort: 20,
-        icon: "fa-file-archive-o"
+        sort: 20
     }
 };
 
@@ -40,9 +44,12 @@ module.exports = {
 
         var terminal_applied = false;
 
+        var modeTabs = require("../pages/mode-tabs.js");
+
         var page = {};
         var $page = {
-            view: require("./encrypt.page.html").default,
+            view: modeTabs("encrypt", "encrypt") +
+                require("./encrypt.page.html").default,
             init: function(app, $page, pathname) {
                 init = true;
                 page.setup(app, $page, pathname, init);
@@ -434,7 +441,8 @@ module.exports = {
         pagesList["encrypt"] = $page;
 
         pagesList["encrypt-file"] = {
-            view: require("./encrypt-file.page.html").default,
+            view: modeTabs("encrypt", "encrypt-file") +
+                require("./encrypt-file.page.html").default,
             init: $page.init,
             setup: $page.setup
         };

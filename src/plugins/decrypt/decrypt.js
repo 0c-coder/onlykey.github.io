@@ -1,13 +1,15 @@
 //change   _template_  to your plugin name  
 
+// See the matching note in encrypt.js. "decrypt" keeps its top-nav link;
+// "decrypt-file" keeps its route and its /app/decrypt-file.html but loses its
+// icon, so it is reached from the selector inside the Decrypt page.
 var pagesList = {
     "decrypt": {
         sort: 15,
         icon: "fa-unlock"
     },
     "decrypt-file": {
-        sort: 25,
-        icon: "fa-file-text"
+        sort: 25
     }
 };
 
@@ -40,9 +42,12 @@ module.exports = {
 
         var terminal_applied = false;
 
+        var modeTabs = require("../pages/mode-tabs.js");
+
         var page = {};
         var $page = {
-            view: require("./decrypt.page.html").default,
+            view: modeTabs("decrypt", "decrypt") +
+                require("./decrypt.page.html").default,
             init: function(app, $page, pathname) {
                 init = true;
                 page.setup(app, $page, pathname, init);
@@ -386,7 +391,8 @@ module.exports = {
         pagesList["decrypt"] = $page;
 
         pagesList["decrypt-file"] = {
-            view: require("./decrypt-file.page.html").default,
+            view: modeTabs("decrypt", "decrypt-file") +
+                require("./decrypt-file.page.html").default,
             init: $page.init,
             setup: $page.setup
         };
