@@ -276,6 +276,12 @@ button:hover{border-color:var(--accent)}
 .oa-tool h3{font-size:19px;margin-bottom:6px}
 .oa-tool p{color:var(--muted);font-size:14.5px;margin:0}
 .oa-cta-row{display:flex;gap:12px;justify-content:center;flex-wrap:wrap;margin-top:8px}
+/* The hero's CTA row asked for margin-top:26px and its primary button for
+   max-width:260px, both as inline style attributes the CSP refuses (see
+   .oa-challenge). The row was sitting at the 8px default above and the button
+   was running the full width of the row. */
+.oa-hero .oa-cta-row{margin-top:26px}
+.oa-cta-row .oa-btn-primary{max-width:260px}
 
 /* fancy-icons header on tool pages */
 #fancy-icons{margin:8px 0 0;font-size:22px}
@@ -318,6 +324,10 @@ pre code,code{color:var(--text);font-family:var(--mono);background:transparent}
 /* ---------- footer ---------- */
 .oa-footer{border-top:1px solid var(--line);padding:34px 22px;margin-top:30px}
 .oa-footer .inner{max-width:var(--max);margin:0 auto;display:flex;justify-content:space-between;gap:18px;flex-wrap:wrap;color:var(--muted);font-size:14px}
+/* The link group carried style="display:flex;gap:20px;flex-wrap:wrap" in both
+   shells, which the CSP refuses (see .oa-challenge). It was laying out as a
+   plain block, so the footer links stacked instead of sitting in a row. */
+.oa-footer .oa-footer-links{display:flex;gap:20px;flex-wrap:wrap}
 .oa-footer a{color:var(--muted)}.oa-footer a:hover{color:var(--text)}
 
 /* scrollbar */
