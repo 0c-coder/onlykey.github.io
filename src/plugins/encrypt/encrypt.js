@@ -200,10 +200,18 @@ module.exports = {
                     });
                 };
 
-                document.getElementsByTagName('fieldset')[0].style.backgroundColor = app.randomColor({
-                    luminosity: 'bright',
-                    format: 'rgba'
-                });
+                // The fieldset used to get a random 'bright' rgba background on
+                // every render - a different washed-out hue per page and per
+                // visit (olive here, navy on the -file view, something else
+                // tomorrow). It predates the theme and fought it: the panel is
+                // a flat near-black by design, and a translucent colour laid
+                // over it showed as bars wherever the fieldset peeked out
+                // between its children. Removed; the stylesheet decides what
+                // this looks like.
+                //
+                // Note it survived the CSP that refuses style= attributes,
+                // because a CSSOM write is not an inline style. Same mechanism
+                // that makes the challenge box's JS toggle work.
 
                 page.urlinputbox = document.getElementById('pgpkeyurl');
                 page.urlinputbox2 = document.getElementById('pgpkeyurl2');

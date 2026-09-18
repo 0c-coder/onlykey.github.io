@@ -32,11 +32,15 @@
       </div>
     </section>
 
+    <!-- Three cards, matching the app's header: Encrypt, Decrypt, Search.
+         This used to list five, one per page, back when a file and a message
+         were separate destinations. They are methods inside a task now - the
+         selector on each page picks Message, File, PQC-PGP or AGE - so the
+         landing page and the app told different stories until this changed.
+         The -file routes still work; they are just not advertised as tools. -->
     <section class="oa-tools">
-      <a class="oa-tool" href="<%= htmlWebpackPlugin.options.dir_name %>/encrypt"><div class="ic"><i class="fa fa-lock"></i></div><h3>Encrypt &amp; Sign Messages</h3><p>Compose an end-to-end encrypted, signed message for any Keybase or Protonmail user.</p></a>
-      <a class="oa-tool" href="<%= htmlWebpackPlugin.options.dir_name %>/encrypt-file"><div class="ic"><i class="fa fa-file-archive-o"></i></div><h3>Encrypt &amp; Sign Files</h3><p>Encrypt files for a recipient — or for yourself — with your OnlyKey.</p></a>
-      <a class="oa-tool" href="<%= htmlWebpackPlugin.options.dir_name %>/decrypt"><div class="ic"><i class="fa fa-unlock"></i></div><h3>Decrypt &amp; Verify Messages</h3><p>Decrypt incoming PGP messages and verify the sender's signature.</p></a>
-      <a class="oa-tool" href="<%= htmlWebpackPlugin.options.dir_name %>/decrypt-file"><div class="ic"><i class="fa fa-file-text"></i></div><h3>Decrypt &amp; Verify Files</h3><p>Decrypt .gpg files and confirm they came from who you expect.</p></a>
+      <a class="oa-tool" href="<%= htmlWebpackPlugin.options.dir_name %>/encrypt"><div class="ic"><i class="fa fa-lock"></i></div><h3>Encrypt &amp; Sign</h3><p>Messages or files, for any Keybase or Protonmail user — with classic PGP, composite PGP-PQC, or derived age encryption.</p></a>
+      <a class="oa-tool" href="<%= htmlWebpackPlugin.options.dir_name %>/decrypt"><div class="ic"><i class="fa fa-unlock"></i></div><h3>Decrypt &amp; Verify</h3><p>Open incoming messages and files, and confirm they came from who you expect. Your private keys never leave your OnlyKey.</p></a>
       <a class="oa-tool" href="<%= htmlWebpackPlugin.options.dir_name %>/search"><div class="ic"><i class="fa fa-search"></i></div><h3>Find a Recipient</h3><p>Search Keybase and Protonmail for someone to send encrypted messages to.</p></a>
     </section>
 
